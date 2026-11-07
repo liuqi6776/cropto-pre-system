@@ -1,0 +1,9 @@
+{
+  "attachment_sha256": "c1ec0a66205270d0346c7404117cbce3bce3967bc31ee8d716d6963b505031dd",
+  "status": "USER_SUPPLIED_UNVERIFIED_RESEARCH",
+  "files": {
+    "step1_fetch_all_public_data.py": "5a5fd655954615af4e473c7dc91722b9e228f4a1ac52679a38ab00603041552f",
+    "step2_standalone_clean_room_master.py": "0ec3e3889b8c78959457b698f7e5ed84371512dbacb780f4cbb256f26b1cd6da",
+    "coin_specific_v4_divergence.py": "028f686a39e23dd52fbe168fb82ab40831a9ca05eab8f715d49889eaacef7c14"
+  }
+}

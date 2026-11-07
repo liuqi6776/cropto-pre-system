@@ -1,0 +1,2 @@
+# Frozen source SHA256 checks require byte-exact checkout on every OS.
+* -text

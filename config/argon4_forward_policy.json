@@ -1,0 +1,231 @@
+{
+  "status": "CONFIRMED",
+  "version": "argon4-local311-independent65-20261106-v10",
+  "venue": "polymarket",
+  "ranking_source": "USER_EXPLICIT_STAGE1_CAPITAL_PRIORITY; user confirmed ETH_5m > BTC_15m > BTC_5m; remaining four disabled; historical win-rate evidence retained only as context",
+  "ranking_label": "第一阶段：用户指定资金顺序 ETH5 → BTC15 → BTC5",
+  "order": [
+    "ETH_5m",
+    "BTC_15m",
+    "BTC_5m",
+    "SOL_15m",
+    "SOL_5m",
+    "ETH_15m",
+    "BNB_15m"
+  ],
+  "allocation_policy": "RANKED_CAPACITY_WATERFALL",
+  "capacity_policy": "Fresh verified signal-side executable ask depth within 0.515; explicit valid no-signal/not-due or verified price-limit failures skip; missing/stale/invalid evidence blocks",
+  "unlock_policy": "Next eligible rank is released only after actual paper fills reach the current rank approved risk-capped budget; verified skips consume no budget",
+  "execution_policy": "Persist each stream skip, approved target, observed depth and actual fill; partial or unfilled approved targets block lower ranks; never replay old cohorts",
+  "initial_capital_usd": 10000,
+  "single_stream_equity_fraction": 0.015,
+  "tick_equity_fraction": 0.022,
+  "max_tick_budget_usd": 1200,
+  "max_order_usd": 200,
+  "max_open_risk_usd": 1000,
+  "max_underlying_open_risk_usd": 500,
+  "max_buy_price": 0.515,
+  "daily_loss_fraction": 0.055,
+  "risk_limit_note": "200/1000/500 USD are proposed paper safety ceilings, not empirically established market capacity",
+  "paper_trading_active": true,
+  "live_enabled": false,
+  "ranking_confirmed_at": "2026-11-06T08:48:03.824352+00:00",
+  "historical_ranking_evidence": [
+    {
+      "stream": "BTC_15m",
+      "raw_wins": 2485,
+      "signals": 4417,
+      "raw_win_rate_pct": 56.25990491283677
+    },
+    {
+      "stream": "ETH_5m",
+      "raw_wins": 3765,
+      "signals": 6769,
+      "raw_win_rate_pct": 55.62121435958044
+    },
+    {
+      "stream": "SOL_15m",
+      "raw_wins": 1121,
+      "signals": 2029,
+      "raw_win_rate_pct": 55.248891079349434
+    },
+    {
+      "stream": "SOL_5m",
+      "raw_wins": 3521,
+      "signals": 6460,
+      "raw_win_rate_pct": 54.5046439628483
+    },
+    {
+      "stream": "BTC_5m",
+      "raw_wins": 5795,
+      "signals": 10738,
+      "raw_win_rate_pct": 53.96721922145651
+    },
+    {
+      "stream": "ETH_15m",
+      "raw_wins": 1405,
+      "signals": 2606,
+      "raw_win_rate_pct": 53.91404451266308
+    },
+    {
+      "stream": "BNB_15m",
+      "raw_wins": 737,
+      "signals": 1389,
+      "raw_win_rate_pct": 53.059755219582435
+    }
+  ],
+  "ranking_evidence_classification": "LOCAL_311_PLUS_INDEPENDENT_65_NOT_ORIGINAL_374_EXPLORATORY",
+  "previous_author_ranking": {
+    "order": [
+      "BTC_15m",
+      "ETH_5m",
+      "ETH_15m",
+      "SOL_15m",
+      "SOL_5m",
+      "BNB_15m",
+      "BTC_5m"
+    ],
+    "ranking_source": "User attachment e67188c1-66ba-4743-b8d9-791ab31f9c04; V4_FROZEN_TH ALL raw wins/signals; user selected latest V4 raw win rate",
+    "historical_ranking_evidence": [
+      {
+        "stream": "BTC_15m",
+        "raw_wins": 6996,
+        "signals": 12590,
+        "raw_win_rate_pct": 55.56791104050834
+      },
+      {
+        "stream": "ETH_5m",
+        "raw_wins": 8886,
+        "signals": 16233,
+        "raw_win_rate_pct": 54.74034374422473
+      },
+      {
+        "stream": "ETH_15m",
+        "raw_wins": 3998,
+        "signals": 7361,
+        "raw_win_rate_pct": 54.31327265317212
+      },
+      {
+        "stream": "SOL_15m",
+        "raw_wins": 2966,
+        "signals": 5474,
+        "raw_win_rate_pct": 54.183412495432954
+      },
+      {
+        "stream": "SOL_5m",
+        "raw_wins": 10842,
+        "signals": 20120,
+        "raw_win_rate_pct": 53.886679920477135
+      },
+      {
+        "stream": "BNB_15m",
+        "raw_wins": 3050,
+        "signals": 5677,
+        "raw_win_rate_pct": 53.725559274264576
+      },
+      {
+        "stream": "BTC_5m",
+        "raw_wins": 12159,
+        "signals": 22675,
+        "raw_win_rate_pct": 53.62293274531422
+      }
+    ],
+    "version": "argon4-polymarket-forward-20261106-v2"
+  },
+  "ranking_model_scope": "LOCAL_SELF_TRAINED_OOS",
+  "deployment_manifest_sha256": {
+    "BTC_15m": "a1013d7188d879d13331b767fdd88c755cace3c245fc20acd9a45ed38c1f383b",
+    "BTC_5m": "892796c9236a7f82531bd2764250d5455474642182494e2de533334d52aebe71",
+    "ETH_15m": "72dcaa30b92f00665a2af29d69fea9a753f11ec45aecb55fb530f008e2e3c922",
+    "ETH_5m": "045c1df0747e445b6b4357e57ee919e516db8484eb55284feb59569fffb23239",
+    "SOL_15m": "e3763beb9ba1e63b95dbe501b3cc265e1f005069289875af73f4b7e2e531242c",
+    "SOL_5m": "d024c28dbb773a6470b132cbc1ebd152ebdb706d0db8ee3047487493b3f4f822",
+    "BNB_15m": "366484e02b2552e3acd095310b381d216b6f2016a39bd2fe001b1aad3660118f"
+  },
+  "min_decision_delay_seconds": 5,
+  "input_revision_policy": {
+    "scope": "OBSERVED_FUTURES_5M_AND_MARK_1H_VIEWS_ONLY",
+    "confirming_receipts": 2,
+    "minimum_receipt_spacing_seconds": 60,
+    "archive_old_view": true,
+    "current_cohort_skipped": true,
+    "future_windows_only": true,
+    "funding_cashflows_modified": false,
+    "mark_registry_publication_required": true,
+    "skip_effective_cohort": true
+  },
+  "waterfall_semantics": "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1",
+  "previous_execution_version": "argon4-local311-independent65-20261106-v9",
+  "execution_change_authorized_at": "2026-11-06T15:33:06+00:00",
+  "execution_change_note": "User-authorized public client latency optimization: isolated reusable observer/execution connections and exact missing/stale metadata recovery only for reached valid signals. After the observed v9 15:25 UTC missed window, keep six-sample calibration and regular 40s refresh, but allow pre-window refresh when clock age exceeds 20s and the next 5m boundary is within 10s. All 60s clock validity, uncertainty, 2s book and 20s cohort guards remain. Retain taker IOC paper with official fees; unchanged models, thresholds, ETH5/BTC15/BTC5 order, 0.515 limit, risk caps, 0.25s input spacing and no historical replay. No SDK installed or real orders enabled.",
+  "execution_stage": {
+    "id": "stage1-eth5-btc15-btc5-20261106",
+    "status": "CONFIRMED",
+    "enabled_streams": [
+      "ETH_5m",
+      "BTC_15m",
+      "BTC_5m"
+    ],
+    "effective_from": "2026-11-06T08:50:00+00:00"
+  },
+  "previous_local_winrate_ranking": {
+    "version": "argon4-local311-independent65-20261106-v5",
+    "order": [
+      "BTC_15m",
+      "ETH_5m",
+      "SOL_15m",
+      "SOL_5m",
+      "BTC_5m",
+      "ETH_15m",
+      "BNB_15m"
+    ],
+    "ranking_source": "reports/argon4_local_v4_20261106/summary.json; LOCAL_V4_FROZEN; 2026-01-01 to 2026-09-24; historical research period previously inspected",
+    "ranking_label": "本地自训练 V4 · 2026 年样本外原始胜率",
+    "ranking_confirmed_at": "2026-11-06T00:26:20.015083+00:00",
+    "historical_ranking_evidence": [
+      {
+        "stream": "BTC_15m",
+        "raw_wins": 2485,
+        "signals": 4417,
+        "raw_win_rate_pct": 56.25990491283677
+      },
+      {
+        "stream": "ETH_5m",
+        "raw_wins": 3765,
+        "signals": 6769,
+        "raw_win_rate_pct": 55.62121435958044
+      },
+      {
+        "stream": "SOL_15m",
+        "raw_wins": 1121,
+        "signals": 2029,
+        "raw_win_rate_pct": 55.248891079349434
+      },
+      {
+        "stream": "SOL_5m",
+        "raw_wins": 3521,
+        "signals": 6460,
+        "raw_win_rate_pct": 54.5046439628483
+      },
+      {
+        "stream": "BTC_5m",
+        "raw_wins": 5795,
+        "signals": 10738,
+        "raw_win_rate_pct": 53.96721922145651
+      },
+      {
+        "stream": "ETH_15m",
+        "raw_wins": 1405,
+        "signals": 2606,
+        "raw_win_rate_pct": 53.91404451266308
+      },
+      {
+        "stream": "BNB_15m",
+        "raw_wins": 737,
+        "signals": 1389,
+        "raw_win_rate_pct": 53.059755219582435
+      }
+    ]
+  },
+  "input_http_min_spacing_seconds": 0.25
+}

@@ -1,0 +1,4 @@
+# Sparse network candidate and archived WebSocket benchmarks only.
+# Select a PyTorch build appropriate to Python, OS and hardware.
+torch>=2.6
+websockets>=14
