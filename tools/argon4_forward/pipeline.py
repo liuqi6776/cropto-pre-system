@@ -10,12 +10,14 @@ import io
 import json
 import math
 from pathlib import Path
+import sqlite3
 import threading
 import time
 
 from .clock_sync import calibrate, calibrated_now, project_local
 from .stage import stage_profile, disabled_decision
-from .runtime_profile import engineering_profile, minimum_decision_delay, V12_PROFILE_ID
+from .runtime_profile import (engineering_profile, minimum_decision_delay, V12_PROFILE_ID,
+                              revision_fastpath_profile)
 
 ROOT = Path(__file__).resolve().parents[2]
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT")
@@ -124,6 +126,9 @@ class ForwardPipeline:
         self._pending_execution = None
         self._worker_engineering = {}
         self._last_idle_publish = 0.
+        self._revision_fastpath = {"enabled": False}
+        self._same_cohort_revision = None
+        self._blocked_input_maintenance = None
         from .polymarket_transport import PublicPolymarketTransport
         # Clock calibration keeps this CLOB connection warm without additional
         # requests. Background discovery has its own bounded connection pool.
@@ -197,7 +202,27 @@ class ForwardPipeline:
                 # a second proactive request group at this boundary.
                 refresh, reason = True, "PRE_DECISION_WINDOW"
         if refresh:
-            self.clock = calibrate(transport=self.public_transport)
+            kwargs = {}
+            if self._revision_fastpath.get("enabled"):
+                extra_allowed, budget = False, 6.
+                if self.clock and self.clock.get("status") == "CALIBRATED" and age <= 60:
+                    lower, upper = calibrated_now(self.clock, upper=False), calibrated_now(self.clock)
+                    elapsed = (lower-cohort_at(lower)).total_seconds()
+                    until = (cohort_at(lower)+timedelta(minutes=5)-upper).total_seconds()
+                    extra_allowed = (25 < elapsed < 290 and until > 6
+                                     and not self._critical_window())
+                    if reason == "PRE_DECISION_WINDOW":
+                        # A still-valid clock is safer than starting proactive
+                        # collection too late. This does not extend its TTL.
+                        if until <= 2 or self._critical_window():
+                            return self.clock
+                        budget = min(budget, until-.25)
+                        extra_allowed = True
+                    elif 0 < until <= 6:
+                        budget = max(.1, until-.25)
+                kwargs = {"retry_borderline": extra_allowed,
+                          "budget_monotonic": time.monotonic()+budget}
+            self.clock = calibrate(transport=self.public_transport, **kwargs)
             self.clock["refresh_reason"] = reason
             self.observations.save("execution_clock", self.clock)
         if self.clock.get("status") != "CALIBRATED":
@@ -283,6 +308,133 @@ class ForwardPipeline:
         # Obtain fresh evidence after that work, before certifying a new view.
         self.update_clock()
         return calibrated_now(self.clock)
+
+    def _cohort_pristine(self, cohort):
+        """Durable evidence, not the in-memory last_cohort flag, gates repair."""
+        if self._pending_execution is not None:
+            raise ValueError("REVISION_COHORT_ALREADY_PREPARED")
+        stamp = cohort.isoformat()
+        with sqlite3.connect(Path(self.account.path).resolve().as_uri()+"?mode=ro", uri=True,
+                             timeout=.1) as db:
+            for table in ("decision_cohorts", "cohort_streams", "cohort_book_looks"):
+                if db.execute(f"SELECT 1 FROM {table} WHERE cohort_id=? LIMIT 1", (stamp,)).fetchone():
+                    raise ValueError("REVISION_COHORT_ALREADY_USED")
+            for table in ("signals", "orders"):
+                if db.execute("SELECT 1 FROM "+table+" WHERE json_extract(payload,'$.window_start')=? LIMIT 1",
+                              (stamp,)).fetchone():
+                    raise ValueError("REVISION_COHORT_ALREADY_USED")
+            if db.execute("SELECT 1 FROM orders WHERE json_extract(payload,'$.allocation_authorization.cohort_id')=? "
+                          "OR signal_id IN (SELECT signal_id FROM signals WHERE json_extract(payload,'$.window_start')=?) "
+                          "LIMIT 1", (stamp, stamp)).fetchone():
+                raise ValueError("REVISION_COHORT_ALREADY_USED")
+        with sqlite3.connect(Path(self.observations.path).resolve().as_uri()+"?mode=ro", uri=True,
+                             timeout=.1) as db:
+            if db.execute("SELECT 1 FROM snapshots WHERE kind IN ('prediction_decisions','paper_execution',"
+                          "'paper_execution_abandoned') AND json_extract(payload,'$.cohort')=? LIMIT 1",
+                          (stamp,)).fetchone():
+                raise ValueError("REVISION_COHORT_ALREADY_PREDICTED")
+        return {"eligible": True, "cohort": stamp, "evidence": "NO_DURABLE_PREDICTION_SIGNAL_ORDER_OR_LOOK"}
+
+    def _revision_guard(self, policy, cohort, deadline, clock):
+        if self.stop.is_set() or (self.runtime/"verification_pause.json").exists():
+            raise ValueError("REVISION_EXECUTION_CANCELLED")
+        if self.clock != clock:
+            raise ValueError("REVISION_CLOCK_CHANGED")
+        if cohort_at(calibrated_now(clock, upper=False)) != cohort or calibrated_now(clock) >= deadline:
+            raise ValueError("REVISION_INPUT_DEADLINE_EXCEEDED")
+        current = json.loads((ROOT/"config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+        if current != policy:
+            raise ValueError("REVISION_POLICY_CHANGED")
+        evidence = self._cohort_pristine(cohort)
+        evidence.update(clock_evidence_sha256=clock["receipt_sha256"],
+                        policy_sha256=hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest())
+        return evidence
+
+    def reconcile_current_cohort(self, policy, engineering, cohort, inputs):
+        """One bounded aged-bar repair; fresh validation precedes any scoring."""
+        from .revisions import reconcile_confirmed_price_revisions, ensure_view_committed
+        if not self._revision_fastpath.get("enabled"):
+            return inputs, None
+        errors = inputs.get("errors", [])
+        if not errors or any(e.get("error") not in (
+                "CONFLICTING_CLOSED_OBSERVATION", "ValueError:CONFLICTING_CLOSED_OBSERVATION")
+                or not str(e.get("source", "")).startswith("futures:")
+                or not str(e.get("source", "")).endswith(":5m") for e in errors):
+            return inputs, None
+        deadline = cohort+timedelta(seconds=engineering["input_deadline_after_boundary_seconds"])
+        clock = dict(self.clock)
+        guard = lambda: self._revision_guard(policy, cohort, deadline, clock)
+        context = {"profile": self._revision_fastpath["profile"], "cohort": cohort.isoformat(),
+                   "deadline": deadline.isoformat(), "minimum_spacing_seconds": 2.0,
+                   "clock_evidence_sha256": clock["receipt_sha256"]}
+        revision = None
+        self._same_cohort_revision = None
+        try:
+            for attempt in range(2):
+                guard()
+                remaining = (deadline-calibrated_now(clock)).total_seconds()
+                # Retired input jobs must never race the archived working view.
+                if not self.inputs._lock.acquire(timeout=max(0, min(remaining, .1))):
+                    raise ValueError("REVISION_INPUT_WRITER_BUSY")
+                try:
+                    if any(not f.done() for f in getattr(self.inputs, "_outstanding", ())):
+                        raise ValueError("REVISION_INPUT_WORKERS_BUSY")
+                    revision = reconcile_confirmed_price_revisions(self.runtime, inputs["errors"],
+                        now=lambda: calibrated_now(clock), cutover_now=lambda: calibrated_now(clock),
+                        fast_context=context, cohort_guard=guard)
+                finally:
+                    self.inputs._lock.release()
+                self.observations.save("input_revision_reconciliation", revision)
+                if revision.get("status") == "COMMITTED":
+                    break
+                if (attempt or revision.get("status") != "WAITING_CONFIRMATION"
+                        or revision.get("fast_confirmation_eligible") is not True):
+                    return inputs, revision
+                if calibrated_now(clock)+timedelta(seconds=2) >= deadline:
+                    return inputs, revision
+                if self.stop.wait(2):
+                    raise ValueError("STOPPED_DURING_REVISION_CONFIRMATION")
+                guard()
+                inputs = self.refresh_decision_inputs(engineering, cohort, calibrated_now(clock, upper=False))
+                self.observations.save("revision_confirmation_inputs", inputs)
+                if inputs.get("status") in ("READY", "COMPLETE", "OBSERVED"):
+                    # Conflicting responses which reverted do not authorize a
+                    # silent repair or a decision from an unstable source.
+                    raise ValueError("REVISION_RESPONSE_REVERTED_DURING_CONFIRMATION")
+            if not revision or revision.get("same_cohort_eligible") is not True:
+                return inputs, revision
+            guard()
+            view = ensure_view_committed(self.runtime)
+            if any(view.get(k) != revision.get(k) for k in ("revision_id", "manifest_sha256")):
+                raise ValueError("REVISION_VIEW_CHANGED_BEFORE_REFRESH")
+            inputs = self.refresh_decision_inputs(engineering, cohort, calibrated_now(clock, upper=False))
+            self.observations.save("post_revision_inputs", inputs)
+            guard()
+            if inputs.get("status") not in ("READY", "COMPLETE", "OBSERVED"):
+                return inputs, revision
+            effective = datetime.fromisoformat(view["view_effective_at"].replace("Z", "+00:00"))
+            available = datetime.fromisoformat(inputs["feature_available_at"].replace("Z", "+00:00"))
+            inputs = {**inputs, "feature_available_at": max(effective, available).isoformat(),
+                      "revision_id": view["revision_id"], "revision_manifest_sha256": view["manifest_sha256"],
+                      "revision_view_effective_at": view["view_effective_at"]}
+            self._same_cohort_revision = {"cohort": cohort, "revision_id": view["revision_id"],
+                                          "manifest_sha256": view["manifest_sha256"], "clock": clock}
+            return inputs, revision
+        except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
+            self._same_cohort_revision = None
+            blocked = {**inputs, "status": "BLOCKED", "errors": [*inputs.get("errors", []),
+                       {"source": "revision_fastpath", "error": type(exc).__name__+":"+str(exc)[:120]}]}
+            self.observations.save("revision_fastpath_blocked", {"cohort": cohort.isoformat(),
+                "reason": blocked["errors"][-1]["error"]})
+            return blocked, revision or {"status": "BLOCKED", "reason": "FAST_REVISION_NOT_ADMITTED"}
+
+    def _same_cohort_view_admitted(self, view):
+        admission = self._same_cohort_revision
+        if not admission or self.clock != admission["clock"]:
+            return False
+        return (cohort_at(calibrated_now(self.clock, upper=False)) == admission["cohort"]
+                and self.last_cohort == admission["cohort"]
+                and all(view.get(k) == admission[k] for k in ("revision_id", "manifest_sha256")))
 
     def wait_for_window(self, models):
         if (self._worker_engineering.get("profile") == V12_PROFILE_ID
@@ -384,15 +536,172 @@ class ForwardPipeline:
                 decisions[stream].update(status="SIGNAL", signal=signal)
         return decisions
 
-    def set_input_clock(self):
+    def set_input_clock(self, clock=None):
         # A generation receives an immutable calibration. Retired requests must
         # never inherit a subsequent generation's clock or evidence identifier.
-        clock = dict(self.clock)
+        clock = dict(self.clock if clock is None else clock)
         frozen_now = lambda: calibrated_now(clock)
         self.inputs.clock = frozen_now
         self.inputs.client.clock = frozen_now
         self.inputs.clock_evidence_sha256 = clock["receipt_sha256"]
         self.inputs.client.clock_evidence_sha256 = clock["receipt_sha256"]
+        return clock
+
+    def _maintenance_guard(self, policy, cohort, clock, deadline, phase):
+        """Admission proof for maintenance, never an execution authorization."""
+        def permission_check():
+            if (self.stop.is_set() or (self.runtime/"verification_pause.json").exists()
+                    or (self.runtime/"maintenance_pause.json").exists()):
+                raise ValueError("MAINTENANCE_STOPPED_OR_PAUSED")
+            if (self._pending_execution is not None or self.last_cohort != cohort
+                    or self.clock != clock):
+                raise ValueError("MAINTENANCE_COHORT_OR_CLOCK_CHANGED")
+            if json.loads((ROOT/"config/argon4_forward_policy.json").read_text(encoding="utf-8")) != policy:
+                raise ValueError("MAINTENANCE_POLICY_CHANGED")
+        permission_check()
+        lower, upper = calibrated_now(clock, upper=False), calibrated_now(clock)
+        if (cohort_at(lower) != cohort or cohort_at(upper) != cohort
+                or lower < cohort+timedelta(seconds=70) or upper >= cohort+timedelta(seconds=180)
+                or time.monotonic() >= deadline):
+            raise ValueError("MAINTENANCE_PHASE_OR_BUDGET_EXPIRED")
+        if any(not f.done() for f in getattr(self.inputs, "_outstanding", ())):
+            raise ValueError("MAINTENANCE_RETIRED_WORKERS_PENDING")
+        evidence = self._cohort_pristine(cohort)
+        if evidence.get("eligible") is not True:
+            raise ValueError("MAINTENANCE_COHORT_NOT_PRISTINE")
+        permission_check()
+        # Include durable pristine checks in the deadline/phase budget too.
+        lower, upper = calibrated_now(clock, upper=False), calibrated_now(clock)
+        if (cohort_at(lower) != cohort or cohort_at(upper) != cohort
+                or lower < cohort+timedelta(seconds=70) or upper >= cohort+timedelta(seconds=180)
+                or time.monotonic() >= deadline):
+            raise ValueError("MAINTENANCE_PHASE_OR_BUDGET_EXPIRED")
+        return {**evidence, "phase": phase, "lower_at": lower.isoformat(), "upper_at": upper.isoformat(),
+                "clock_evidence_sha256": clock["receipt_sha256"],
+                "policy_sha256": hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest(),
+                "execution_authorized": False}
+
+    def _claim_maintenance(self, policy, cohort, clock, deadline):
+        """Atomically append a bounded per-cohort claim in the observation log."""
+        path = Path(self.observations.path).resolve()
+        payload = {"cohort": cohort.isoformat(), "clock_evidence_sha256": clock["receipt_sha256"],
+                   "claimed_at_upper": calibrated_now(clock).isoformat(),
+                   "policy_sha256": hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest(),
+                   "maximum_attempts": 2, "purpose": "INPUT_MAINTENANCE_NO_EXECUTION"}
+        with sqlite3.connect(path, timeout=max(.001, min(.1, deadline-time.monotonic()))) as db:
+            db.execute("BEGIN IMMEDIATE")
+            count = db.execute("SELECT COUNT(*) FROM snapshots WHERE kind='input_maintenance_claim' "
+                               "AND json_extract(payload,'$.cohort')=?", (cohort.isoformat(),)).fetchone()[0]
+            if count >= 2:
+                return None
+            if count == 1:
+                prior = db.execute("SELECT payload FROM snapshots WHERE kind='input_maintenance_result' "
+                    "AND json_extract(payload,'$.cohort')=? AND json_extract(payload,'$.sequence')=1 "
+                    "ORDER BY id DESC LIMIT 1", (cohort.isoformat(),)).fetchone()
+                if prior is None:
+                    return None
+                prior = json.loads(prior[0])
+                not_before = prior.get("next_eligible_at")
+                if (prior.get("result", {}).get("status") != "WAITING_CONFIRMATION"
+                        or prior.get("policy_sha256") != payload["policy_sha256"] or not not_before
+                        or calibrated_now(clock, upper=False) < datetime.fromisoformat(not_before)):
+                    return None
+            payload["sequence"] = count+1
+            db.execute("INSERT INTO snapshots(kind,saved_at,payload) VALUES(?,?,?)", (
+                "input_maintenance_claim", datetime.now(timezone.utc).isoformat(),
+                json.dumps(payload, sort_keys=True, allow_nan=False)))
+        return payload
+
+    def maintain_blocked_inputs(self, policy, models, cohort):
+        """At most two window-external legacy maintenance attempts; no replay."""
+        from .revisions import ensure_view_committed, reconcile_confirmed_price_revisions
+        pending = self._blocked_input_maintenance
+        if (not self._revision_fastpath.get("enabled") or not pending or pending.get("done")
+                or pending["cohort"] != cohort or pending["policy"] != policy
+                or self.last_cohort != cohort or self._pending_execution is not None):
+            return False
+        clock = deepcopy(self.clock)
+        lower, upper = calibrated_now(clock, upper=False), calibrated_now(clock)
+        if (cohort_at(lower) != cohort or cohort_at(upper) != cohort
+                or lower < cohort+timedelta(seconds=70) or upper >= cohort+timedelta(seconds=180)
+                or (pending.get("next_eligible_at") is not None and lower < pending["next_eligible_at"])):
+            return False
+        # Phase ends at T+180; calibration is immutable for this entire attempt.
+        deadline = min(time.monotonic()+14, clock["calibrated_monotonic"]+59,
+                       time.monotonic()+(cohort+timedelta(seconds=180)-upper).total_seconds())
+        if deadline <= time.monotonic():
+            return False
+        guard = lambda phase: self._maintenance_guard(policy, cohort, clock, deadline, phase)
+        result, claim = None, None
+        locked = False
+        try:
+            guard("BEFORE_CLAIM")
+            ensure_view_committed(self.runtime)
+            claim = self._claim_maintenance(policy, cohort, clock, deadline)
+            if claim is None:
+                pending["done"] = True
+                return False
+            # Claim is durable before network I/O; a failed attempt still counts.
+            pending["attempts"] = claim["sequence"]
+            guard("BEFORE_REFRESH")
+            self.set_input_clock(clock)
+            inputs = self.inputs.refresh(now=calibrated_now(clock, upper=False),
+                deadline_monotonic=deadline,
+                cohort_id="maintenance:"+cohort.isoformat()+":"+str(claim["sequence"]))
+            self.observations.save("input_maintenance_refresh", {"cohort": cohort.isoformat(),
+                "sequence": claim["sequence"], "inputs": inputs, "clock_evidence_sha256": clock["receipt_sha256"]})
+            guard("AFTER_REFRESH")
+            ready = (inputs.get("status") in ("READY", "COMPLETE", "OBSERVED")
+                     and not inputs.get("errors") and not inputs.get("gaps"))
+            if ready:
+                result = {"status": "READY_FOR_FUTURE_WINDOW", "next_cohort_requires_fresh_validation": True}
+            elif any("CONFLICTING_CLOSED_OBSERVATION" in str(e.get("error", ""))
+                     for e in inputs.get("errors", []) if isinstance(e, dict)):
+                # All actual errors are passed unchanged. Never use fast_context
+                # here: confirmation still requires the legacy 60-second rule.
+                locked = self.inputs._lock.acquire(timeout=max(0, min(.1, deadline-time.monotonic())))
+                if not locked:
+                    raise ValueError("MAINTENANCE_WRITER_BUSY")
+                guard("BEFORE_RECONCILIATION")
+                kwargs = ({"mark_registry_path": ROOT/"archive/catalog/mark_candle_registry.json"}
+                          if any(str(e.get("source", "")).startswith("mark:")
+                                 for e in inputs["errors"] if isinstance(e, dict)) else {})
+                result = reconcile_confirmed_price_revisions(self.runtime, inputs["errors"],
+                    now=lambda: calibrated_now(clock), cutover_now=lambda: calibrated_now(clock),
+                    maintenance_guard=guard, **kwargs)
+            else:
+                result = {"status": "BLOCKED", "reason": "NON_REVISION_INPUT_FAILURE",
+                          "errors": deepcopy(inputs.get("errors", [])), "gaps": deepcopy(inputs.get("gaps", []))}
+        except (ValueError, TypeError, KeyError, OSError, sqlite3.Error) as exc:
+            result = {"status": "BLOCKED", "reason": str(exc)[:200]}
+        finally:
+            if locked:
+                self.inputs._lock.release()
+        if claim is None:
+            # Failed admission does not send requests or consume an attempt.
+            return False
+        pending["done"] = True
+        if result.get("status") == "WAITING_CONFIRMATION" and claim["sequence"] < 2:
+            try:
+                guard("AFTER_WAITING_CONFIRMATION")
+                # Completion upper bound is no earlier than any receipt in this
+                # attempt. Next attempt's fresh lower bound must be >= this+60s.
+                pending["next_eligible_at"] = calibrated_now(clock)+timedelta(seconds=60)
+                pending["done"] = pending["next_eligible_at"] >= cohort+timedelta(seconds=180)
+            except (ValueError, TypeError, KeyError):
+                pass
+        observation = {"cohort": cohort.isoformat(), "sequence": claim["sequence"], "result": result,
+                       "policy_sha256": claim["policy_sha256"],
+                       "clock_evidence_sha256": clock["receipt_sha256"], "current_cohort_skipped": True,
+                       "next_eligible_at": (pending["next_eligible_at"].isoformat()
+                                            if not pending["done"] else None),
+                       "next_cohort_requires_fresh_validation": True, "execution_authorized": False}
+        self.observations.save("input_maintenance_result", observation)
+        label = {"COMMITTED": "输入修订已提交", "WAITING_CONFIRMATION": "输入修订仍待独立确认",
+                 "READY_FOR_FUTURE_WINDOW": "输入维护检查已就绪"}.get(result.get("status"), "输入维护未通过")
+        self.publish(status="PAPER_INPUT_MAINTENANCE", active=True, models=models, maintenance=observation,
+                     reason=label+"；本窗口不补单，下个完整窗口重新核验")
+        return True
 
     def prefetch_inputs(self, engineering, now_lower):
         if not engineering["auxiliary_prefetch"]:
@@ -594,6 +903,7 @@ class ForwardPipeline:
             return
         engineering = engineering_profile(policy)
         self._worker_engineering = engineering
+        self._revision_fastpath = revision_fastpath_profile(policy)
         models = {s: {"version": b["manifest"]["model_version"], "sha256": b["manifest"]["model_sha256"]} for s,b in self.bundles.items()}
         if (self.runtime / "verification_pause.json").is_file():
             self.abandon_prepared("VERIFICATION_PAUSE")
@@ -614,7 +924,8 @@ class ForwardPipeline:
             self.update_clock()
             effective = datetime.fromisoformat(revision_view["view_effective_at"].replace("Z", "+00:00"))
             next_window = cohort_at(effective) + timedelta(minutes=5)
-            if cohort_at(calibrated_now(self.clock, upper=False)) < next_window:
+            if (cohort_at(calibrated_now(self.clock, upper=False)) < next_window
+                    and not self._same_cohort_view_admitted(revision_view)):
                 self.abandon_prepared("REVISION_CUTOVER_WINDOW")
                 self.publish(status="REVISION_WAITING_FUTURE_WINDOW", active=False, models=models,
                              revision=revision_view, decisions={},
@@ -625,12 +936,27 @@ class ForwardPipeline:
             if time.monotonic()-self.last_warmup < 60:
                 return
             self.last_warmup = time.monotonic()
-            # Cold preparation can take over a minute: retain raw system receive
-            # times, do not perform decisions, then obtain a fresh calibrated
-            # input refresh at a subsequent live decision boundary.
-            collector = OnlineInputs(self.runtime)
+            # Legacy cold preparation retains raw system times. The v13 path
+            # uses one immutable calibrated epoch, bounded below its TTL: a
+            # skewed host clock must not indefinitely prevent price-revision
+            # maintenance. Never relabel old receipts or suppress diagnostics.
+            collector_kwargs, refresh_kwargs = {}, {}
+            if self._revision_fastpath.get("enabled"):
+                self.update_clock()
+                warmup_clock = deepcopy(self.clock)
+                calibrated_now(warmup_clock)
+                warmup_deadline = min(time.monotonic()+30,
+                                      warmup_clock["calibrated_monotonic"]+59)
+                if warmup_deadline <= time.monotonic():
+                    raise ValueError("warmup clock budget exhausted")
+                collector_kwargs = {"clock": lambda: calibrated_now(warmup_clock),
+                    "time_basis": "CALIBRATED_UTC_UPPER_BOUND",
+                    "clock_evidence_sha256": warmup_clock["receipt_sha256"]}
+                refresh_kwargs = {"now": calibrated_now(warmup_clock, upper=False),
+                                  "deadline_monotonic": warmup_deadline}
+            collector = OnlineInputs(self.runtime, **collector_kwargs)
             try:
-                warmup = collector.refresh()
+                warmup = collector.refresh(**refresh_kwargs)
             finally:
                 close = getattr(collector, "close", None)
                 if close:
@@ -639,6 +965,13 @@ class ForwardPipeline:
             self.warmup_complete = not warmup.get("gaps") and all(
                 e.get("source") == "clock" and e.get("error") == "CLOCK_SKEW_OR_LATENCY"
                 for e in warmup.get("errors", []))
+            if self._revision_fastpath.get("enabled"):
+                self.warmup_complete = (warmup.get("status") in ("READY", "COMPLETE", "OBSERVED")
+                                       and not warmup.get("errors") and not warmup.get("gaps"))
+                if self.warmup_complete:
+                    # Cold collection is maintenance, never a late entry into
+                    # the window it finishes in. Refresh again next window.
+                    self.last_cohort = cohort_at(calibrated_now(warmup_clock))
             revision = self.reconcile_inputs(collector, warmup) if not self.warmup_complete else None
             self.publish(status="PAPER_WARMUP", active=False, models=models, inputs=warmup,
                          revision=revision, decisions={},
@@ -672,20 +1005,43 @@ class ForwardPipeline:
         elapsed = (now_lower-cohort).total_seconds()
         earliest = minimum_decision_delay(policy, engineering)
         if not earliest <= elapsed <= 18 or self.last_cohort == cohort:
+            if self.maintain_blocked_inputs(policy, models, cohort):
+                return
             self.prefetch_inputs(engineering, now_lower)
             self.wait_for_window(models)
             return
         self.last_cohort = cohort
+        self._blocked_input_maintenance = None
+        self._same_cohort_revision = None
         self._decision_timing = {}
         self._pending_timing = {"cohort": cohort.isoformat(), "deadline_seconds": 20,
             "started_at": calibrated_now(self.clock).isoformat(), "started_monotonic": time.perf_counter(),
             "http_min_spacing_seconds": spacing, "policy_version": policy["version"]}
         started = time.perf_counter()
         inputs = self.refresh_decision_inputs(engineering, cohort, now_lower)
+        revision = None
+        if inputs.get("status") not in ("READY", "COMPLETE", "OBSERVED"):
+            inputs, revision = self.reconcile_current_cohort(policy, engineering, cohort, inputs)
         self._pending_timing["input_refresh_seconds"] = time.perf_counter()-started
         self.observations.save("model_inputs", inputs)
         if inputs.get("status") not in ("READY", "COMPLETE", "OBSERVED"):
-            revision = self.reconcile_inputs(self.inputs, inputs)
+            self._blocked_input_maintenance = {"cohort": cohort, "policy": deepcopy(policy),
+                "trigger": "INPUTS_NOT_VALIDATED", "attempts": 0, "done": False}
+            if revision is None:
+                revision = self.reconcile_inputs(self.inputs, inputs)
+            elif (revision.get("status") != "COMMITTED" and self._revision_fastpath.get("enabled")
+                    and not self.stop.is_set() and not (self.runtime/"verification_pause.json").exists()
+                    and json.loads((ROOT/"config/argon4_forward_policy.json").read_text(encoding="utf-8")) == policy):
+                # This cohort is already abandoned. Preserve legacy 60-second
+                # maintenance when a large audit archive cannot fit the fast
+                # budget, so it cannot repeatedly stall every future window.
+                # Keep ALL latest real errors; discard only our own diagnostic.
+                maintenance = {**inputs, "errors": [e for e in inputs.get("errors", [])
+                    if e.get("source") != "revision_fastpath"]}
+                ensure_view_committed(self.runtime)  # never overwrite PREPARED
+                repaired = self.reconcile_inputs(self.inputs, maintenance)
+                if repaired is not None:
+                    revision = repaired
             self.publish(status="PAPER_DATA_BLOCKED", active=True, inputs=inputs, models=models,
                          revision=revision, decisions={}, last_attempt_cohort=cohort.isoformat(),
                          timing=self.finish_timing("INPUTS_NOT_VALIDATED"),

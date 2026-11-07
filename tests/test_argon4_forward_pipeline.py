@@ -21,6 +21,7 @@ from tools.argon4_forward import model as model
 from tools.argon4_forward import pipeline as pipeline
 from tools.argon4_forward.account import Account, STREAMS
 from tools.argon4_forward.execution import PaperExecutor
+from test_argon4_forward_revisions import runtime as revision_runtime
 
 
 BOUNDARY = datetime(2026, 11, 6, tzinfo=timezone.utc)
@@ -906,6 +907,226 @@ def enable_v12(h, monkeypatch):
     return active
 
 
+def enable_v13_fixture(h, monkeypatch):
+    from tools.argon4_forward.monitor import ObservationStore
+    from tools.argon4_forward.runtime_profile import AGED_REVISION_FASTPATH
+    active = enable_v12(h, monkeypatch)
+    h.policy["min_decision_delay_seconds"] = 4.0
+    h.policy["input_revision_policy"] = {"aged_futures_fastpath": deepcopy(AGED_REVISION_FASTPATH)}
+    h.policy_path.write_text(json.dumps(h.policy))
+    store = ObservationStore(h.p.runtime/"observations.sqlite3")
+    fixture_observations = h.observations
+    store.save("polymarket", fixture_observations.latest("polymarket"))
+    saved_latest = store.latest
+    # The fixture clock is fixed in the past; production latest() correctly
+    # expires those markets against today's wall time. Keep this explicit
+    # fixture's market reader while exercising real durable decision records.
+    monkeypatch.setattr(store, "latest", lambda kind: fixture_observations.latest(kind)
+                        if kind == "polymarket" else saved_latest(kind))
+    h.p.observations = h.observations = store
+    h.state.upper = BOUNDARY+timedelta(seconds=4.2)
+    return active
+
+
+def install_fast_revision_fixture(h, monkeypatch, *, refreshed_status="READY", committed=True,
+                                  late=False, price_high=False):
+    from tools.argon4_forward import revisions, online
+    enable_v13_fixture(h, monkeypatch)
+    calls, marker = [], {"status": "NO_REVISIONS"}
+    h.state.input_status = "BLOCKED"
+    h.state.input_errors = [{"source": "futures:ETHUSDT:5m", "error": "ValueError:CONFLICTING_CLOSED_OBSERVATION"}]
+    original_refresh = online.OnlineInputs.refresh
+    def refresh(self, now=None, **kwargs):
+        if marker["status"] == "COMMITTED":
+            h.state.input_status, h.state.input_errors = refreshed_status, []
+            if late:
+                h.state.upper = BOUNDARY+timedelta(seconds=14)
+        return original_refresh(self, now, **kwargs)
+    monkeypatch.setattr(online.OnlineInputs, "refresh", refresh)
+    monkeypatch.setattr(revisions, "ensure_view_committed", lambda runtime: deepcopy(marker))
+    def reconcile(runtime, errors, now=None, *, fast_context=None, cohort_guard=None, cutover_now):
+        if fast_context is None:
+            return {"status": "WAITING_CONFIRMATION", "reason": "LEGACY_MAINTENANCE_FIXTURE"}
+        evidence = cohort_guard()
+        assert evidence["eligible"] and not h.state.feature_calls
+        assert h.account.overview()["order_count"] == 0
+        assert fast_context["clock_evidence_sha256"] == h.clock["receipt_sha256"]
+        calls.append(h.state.upper)
+        if len(calls) == 1 or not committed:
+            return {"status": "WAITING_CONFIRMATION", "fast_confirmation_eligible": True}
+        marker.update(status="COMMITTED", revision_id="offline-fast", manifest_sha256="b"*64,
+                      view_effective_at=cutover_now().isoformat())
+        return {**marker, "same_cohort_eligible": True}
+    monkeypatch.setattr(revisions, "reconcile_confirmed_price_revisions", reconcile)
+    if price_high:
+        original_book = h.p.refresh_book
+        def high(market, side):
+            result = original_book(market, side)
+            result["asks"][0]["price"] = .52
+            return result
+        monkeypatch.setattr(h.p, "refresh_book", high)
+    return calls, marker
+
+
+def test_v13_confirmed_old_revision_refreshes_every_source_before_same_cohort_prediction(harness, monkeypatch):
+    h = harness
+    calls, marker = install_fast_revision_fixture(h, monkeypatch)
+    h.p.cycle()
+    assert len(calls) == 2 and (calls[1]-calls[0]).total_seconds() >= 2
+    assert h.state.refreshes == 3
+    assert h.p.status()["status"] == "PAPER_CYCLE_COMPLETE"
+    assert h.account.overview()["order_count"] > 0, h.p.status()["execution"]
+    assert h.p.status()["inputs"]["feature_available_at"] >= marker["view_effective_at"]
+    before = h.account.overview()["order_count"]
+    h.p.cycle()
+    assert h.account.overview()["order_count"] == before
+    assert h.state.refreshes == 3 and len(calls) == 2
+
+
+@pytest.mark.parametrize("status,late", [("BLOCKED", False), ("READY", True)])
+def test_v13_post_revision_input_failure_or_deadline_never_predicts(harness, monkeypatch, status, late):
+    h = harness
+    install_fast_revision_fixture(h, monkeypatch, refreshed_status=status, late=late)
+    h.p.cycle()
+    assert not h.state.feature_calls and h.account.overview()["order_count"] == 0
+    assert h.p.status()["status"] == "PAPER_DATA_BLOCKED"
+    assert h.p._same_cohort_revision is None
+
+
+def test_v13_unconfirmed_revision_only_retries_once_within_cohort(harness, monkeypatch):
+    h = harness
+    calls, _ = install_fast_revision_fixture(h, monkeypatch, committed=False)
+    h.p.cycle()
+    h.p.cycle()
+    assert len(calls) == 2 and h.state.refreshes == 2
+    assert not h.state.feature_calls and h.account.overview()["order_count"] == 0
+
+
+def test_v13_same_process_price_rechecks_survive_admitted_view_but_restart_cannot_replay(harness, monkeypatch):
+    h = harness
+    calls, marker = install_fast_revision_fixture(h, monkeypatch, price_high=True)
+    h.p.cycle()
+    assert h.p._pending_execution, h.p.status().get("execution")
+    request_count = len(h.state.book_calls)
+    h.state.upper += timedelta(seconds=3)
+    h.p.cycle()
+    assert len(h.state.book_calls) > request_count
+    assert len(calls) == 2 and h.state.refreshes == 3
+    restarted = pipeline.ForwardPipeline(h.account, h.p.runtime, h.observations)
+    restarted.clock, restarted.stop = h.clock, h.p.stop
+    monkeypatch.setattr(restarted, "update_clock", lambda: h.clock)
+    restarted.cycle()
+    assert restarted.status()["status"] == "REVISION_WAITING_FUTURE_WINDOW"
+    assert restarted._pending_execution is None and restarted._same_cohort_revision is None
+
+
+@pytest.mark.parametrize("prior", ["prediction", "signal", "booklook", "pending", "isolated_order"])
+def test_v13_durable_or_pending_cohort_use_prevents_any_fast_repair(harness, monkeypatch, prior):
+    h = harness
+    calls, _ = install_fast_revision_fixture(h, monkeypatch)
+    if prior == "prediction":
+        h.observations.save("prediction_decisions", {"cohort": BOUNDARY.isoformat(), "decisions": {}})
+    elif prior == "signal":
+        with h.account._connection() as db:
+            db.execute("INSERT INTO signals VALUES(?,?,?)", ("offline-prior",
+                       json.dumps({"window_start": BOUNDARY.isoformat()}), h.state.upper.isoformat()))
+    elif prior == "booklook":
+        with h.account._connection() as db:
+            db.execute("INSERT INTO cohort_book_looks VALUES(?,?,?,?,?,?,?,?,?)",
+                (BOUNDARY.isoformat(), "ETH_5m", 0, h.state.upper.isoformat(), None,
+                 "REQUESTED", None, "a"*64, "{}"))
+    elif prior == "isolated_order":
+        with h.account._connection() as db:
+            db.execute("INSERT INTO orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "offline-isolated", "absent-signal", "123", "ETH", "UP", "1", 500000, 0,
+                "FILLED", h.state.upper.isoformat(), (BOUNDARY+timedelta(minutes=5)).isoformat(),
+                json.dumps({"allocation_authorization": {"cohort_id": BOUNDARY.isoformat()}})))
+    else:
+        h.p._pending_execution = {"offline": True}
+    with pytest.raises(ValueError, match="REVISION_COHORT_ALREADY"):
+        h.p._cohort_pristine(BOUNDARY)
+    if prior != "pending":
+        h.p.cycle()
+        assert not calls and not h.state.feature_calls
+
+
+def test_v13_inputs_start_at_four_second_lower_bound(harness, monkeypatch):
+    h = harness
+    enable_v13_fixture(h, monkeypatch)
+    h.state.upper -= timedelta(microseconds=1)
+    h.p.cycle()
+    assert h.state.refreshes == 0
+    h.state.upper += timedelta(microseconds=1)
+    h.p.cycle()
+    assert h.state.refreshes == 1 and h.state.feature_calls
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_v13_failed_fast_budget_keeps_legacy_maintenance_but_respects_pause(harness, monkeypatch, pause):
+    from tools.argon4_forward import revisions
+    h = harness
+    enable_v13_fixture(h, monkeypatch)
+    h.state.input_status = "BLOCKED"
+    h.state.input_errors = [{"source": "futures:ETHUSDT:5m", "error": "ValueError:CONFLICTING_CLOSED_OBSERVATION"}]
+    calls = []
+    def reconcile(runtime, errors, now=None, **kwargs):
+        calls.append("fast" if kwargs.get("fast_context") else "maintenance")
+        if kwargs.get("fast_context"):
+            h.state.upper = BOUNDARY+timedelta(seconds=14.5)
+            if pause:
+                (h.p.runtime/"verification_pause.json").write_text("{}")
+            return {"status": "BLOCKED", "reason": "FAST_REVISION_COHORT_GUARD_FAILED:ValueError"}
+        assert h.state.upper >= BOUNDARY+timedelta(seconds=14)
+        assert errors == h.state.input_errors
+        return {"status": "COMMITTED", "current_cohort_must_be_skipped": True}
+    monkeypatch.setattr(revisions, "reconcile_confirmed_price_revisions", reconcile)
+    h.p.cycle()
+    assert calls == (["fast"] if pause else ["fast", "maintenance"])
+    assert not h.state.feature_calls and h.account.overview()["order_count"] == 0
+    assert h.p.status()["status"] == "PAPER_DATA_BLOCKED"
+
+
+def test_v13_real_revision_archive_to_saved_model_and_paper_ledger(harness, revision_runtime, monkeypatch):
+    """Real revision/SQLite protocol with explicit offline provider fixtures."""
+    from tools.argon4_forward import online, revisions
+    from test_argon4_forward_revisions import NOW, NEW, _add_receipt
+    h = harness
+    enable_v13_fixture(h, monkeypatch)
+    assert h.p.runtime == revision_runtime
+    h.state.boundary = NOW.to_pydatetime()
+    h.state.upper = h.state.boundary+timedelta(seconds=4.2)
+    h.clock.update(receipt_sha256="c"*64, observed_at=NOW.isoformat())
+    h.refresh_markets()
+    original_refresh = online.OnlineInputs.refresh
+    source = revision_runtime/"features/raw_data/intraday/BTCUSDT_5m_futures.parquet"
+    old_bytes = source.read_bytes()
+    def refresh(self, now=None, **kwargs):
+        h.state.upper += timedelta(seconds=.4)
+        repaired = pd.read_parquet(source).iloc[-1]["count"] == NEW[8]
+        if repaired:
+            h.state.input_status, h.state.input_errors = "READY", []
+        else:
+            _add_receipt(revision_runtime, h.state.upper)
+            h.state.input_status = "BLOCKED"
+            h.state.input_errors = [{"source": "futures:BTCUSDT:5m",
+                                     "error": "ValueError:CONFLICTING_CLOSED_OBSERVATION"}]
+        return original_refresh(self, now, **kwargs)
+    monkeypatch.setattr(online.OnlineInputs, "refresh", refresh)
+    h.p.cycle()
+    assert h.p.status()["status"] == "PAPER_CYCLE_COMPLETE", h.p.status()
+    assert h.account.overview()["order_count"] > 0
+    assert h.state.refreshes == 3
+    marker = revisions.ensure_view_committed(revision_runtime)
+    archive = revision_runtime/"features/revisions"/marker["revision_id"]
+    assert (archive/"raw_data/intraday/BTCUSDT_5m_futures.parquet").read_bytes() == old_bytes
+    assert source.read_bytes() != old_bytes
+    manifest = json.loads((archive/"manifest.json").read_text())
+    assert manifest["same_cohort_admission"]["eligible"]
+    assert h.observations.latest("prediction_decisions")["cohort"] == NOW.isoformat()
+    assert h.p.status()["inputs"]["feature_available_at"] >= marker["view_effective_at"]
+    assert h.account.overview()["live_enabled"] is False
+
+
 def test_v12_starts_at_lower_bound_2_5_and_scores_five_pinned_streams_once(harness, monkeypatch):
     h = harness
     active = enable_v12(h, monkeypatch)
@@ -1319,6 +1540,106 @@ def test_cold_warmup_keeps_default_pacing_and_closes_collector(harness, monkeypa
     assert calls == [{}] and closed == [True]
     assert h.account.overview()["order_count"] == 0
     assert h.p.status()["status"] == "PAPER_WARMUP"
+
+
+@pytest.mark.parametrize("clock_age", [0, 39])
+def test_v13_cold_warmup_pins_one_clock_and_bounds_collection_below_ttl(harness, monkeypatch, clock_age):
+    from tools.argon4_forward import online
+    h = harness
+    enable_v13_fixture(h, monkeypatch)
+    h.p.warmup_complete = False
+    h.clock["calibrated_monotonic"] = time.monotonic()-clock_age
+    captured, closed = {}, []
+
+    def projected(clock, *, upper=True):
+        captured["projected_clock"] = deepcopy(clock)
+        return h.state.upper if upper else h.state.upper-timedelta(seconds=.2)
+
+    monkeypatch.setattr(pipeline, "calibrated_now", projected)
+
+    class Collector:
+        def __init__(self, runtime, **kwargs):
+            captured["constructor"] = kwargs
+
+        def refresh(self, **kwargs):
+            captured["refresh"] = kwargs
+            # A later shared-clock update must not change this batch's epoch.
+            h.clock["receipt_sha256"] = "f"*64
+            h.clock["server_minus_local_seconds"] = 999
+            captured["constructor"]["clock"]()
+            return {"status": "READY", "errors": [], "gaps": []}
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(online, "OnlineInputs", Collector)
+    started = time.monotonic()
+    h.p.cycle()
+    kwargs = captured["constructor"]
+    assert kwargs["clock_evidence_sha256"] == "d"*64
+    assert kwargs["time_basis"] == "CALIBRATED_UTC_UPPER_BOUND"
+    assert "http_min_spacing_seconds" not in kwargs
+    assert captured["projected_clock"]["receipt_sha256"] == "d"*64
+    assert captured["projected_clock"]["server_minus_local_seconds"] == 5
+    deadline = captured["refresh"]["deadline_monotonic"]
+    assert started < deadline <= time.monotonic()+30
+    assert deadline <= captured["projected_clock"]["calibrated_monotonic"]+59
+    assert captured["refresh"]["now"] == h.state.upper-timedelta(seconds=.2)
+    assert h.p.warmup_complete is True and closed == [True]
+    assert h.p.last_cohort == BOUNDARY and h.state.feature_calls == []
+    assert h.account.overview()["order_count"] == 0
+
+
+def test_v13_cold_warmup_keeps_all_clock_and_data_errors_for_maintenance(harness, monkeypatch):
+    from tools.argon4_forward import online
+    h = harness
+    enable_v13_fixture(h, monkeypatch)
+    h.p.warmup_complete = False
+    errors = [{"source": "clock", "error": "CLOCK_SKEW_OR_LATENCY"},
+              {"source": "futures:ETHUSDT:1h", "error": "ValueError:CONFLICTING_CLOSED_OBSERVATION"}]
+    h.state.input_errors = errors
+    h.state.input_gaps = ["missing bar"]
+    captured = []
+    monkeypatch.setattr(h.p, "reconcile_inputs", lambda collector, inputs:
+                        captured.append(deepcopy(inputs)) or {"status": "BLOCKED"})
+    h.p.cycle()
+    assert captured[0]["errors"] == errors
+    assert h.p.warmup_complete is False
+    assert h.p.last_cohort is None and h.state.feature_calls == []
+    assert h.account.overview()["order_count"] == 0
+
+
+@pytest.mark.parametrize("errors,status", [
+    ([{"source": "clock", "error": "CLOCK_SKEW_OR_LATENCY"}], "BLOCKED"),
+    ([{"source": "refresh", "error": "INPUT_DEADLINE_EXCEEDED"}], "BLOCKED"),
+    ([], "BLOCKED"),
+])
+def test_v13_cold_warmup_requires_ready_and_no_errors(harness, monkeypatch, errors, status):
+    h = harness
+    enable_v13_fixture(h, monkeypatch)
+    h.p.warmup_complete = False
+    h.state.input_errors, h.state.input_status, h.state.input_gaps = errors, status, []
+    h.p.cycle()
+    assert h.p.warmup_complete is False and h.p.last_cohort is None
+    assert h.state.feature_calls == [] and h.account.overview()["order_count"] == 0
+
+
+def test_v13_warmup_completion_cannot_enter_same_cohort_and_next_cohort_refreshes(harness, monkeypatch):
+    h = harness
+    enable_v13_fixture(h, monkeypatch)
+    h.p.warmup_complete = False
+    h.p.cycle()
+    assert h.p.warmup_complete and h.state.refreshes == 1
+    h.p.cycle()
+    assert h.state.refreshes == 1 and h.state.feature_calls == []
+    assert h.account.overview()["order_count"] == 0
+    h.state.boundary = BOUNDARY+timedelta(minutes=5)
+    h.state.upper = h.state.boundary+timedelta(seconds=4.2)
+    h.refresh_markets()
+    h.p.cycle()
+    assert h.state.refreshes == 2 and h.state.feature_calls
+    assert h.p.last_cohort == h.state.boundary
+    assert h.p.status()["status"] == "PAPER_CYCLE_COMPLETE"
 
 
 @pytest.mark.parametrize("phase", ["features", "inference"])

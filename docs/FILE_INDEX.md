@@ -39,9 +39,13 @@
 - [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)
 - [docs/ARGON4_EXECUTION_V12.md](../docs/ARGON4_EXECUTION_V12.md)
 - [docs/ARGON4_LATENCY_V11.md](../docs/ARGON4_LATENCY_V11.md)
+- [docs/ARGON4_RESEARCH11.md](../docs/ARGON4_RESEARCH11.md)
+- [docs/ARGON4_REVISION_V13.md](../docs/ARGON4_REVISION_V13.md)
 - [docs/EXPORT_VALIDATION.md](../docs/EXPORT_VALIDATION.md)
 - [docs/EXPORT_VALIDATION_V11.md](../docs/EXPORT_VALIDATION_V11.md)
+- [docs/EXPORT_VALIDATION_V12R1.md](../docs/EXPORT_VALIDATION_V12R1.md)
 - [docs/EXPORT_VALIDATION_V12_INITIAL.md](../docs/EXPORT_VALIDATION_V12_INITIAL.md)
+- [docs/EXPORT_VALIDATION_V13R1.md](../docs/EXPORT_VALIDATION_V13R1.md)
 - [docs/FILE_INDEX.md](../docs/FILE_INDEX.md)
 - [docs/RESTORE.md](../docs/RESTORE.md)
 - [docs/SOURCE_MANIFEST.json](../docs/SOURCE_MANIFEST.json)
@@ -131,8 +135,10 @@
 ## tests
 
 - [tests/conftest.py](../tests/conftest.py)
+- [tests/test_argon4_abort_unapplied_revision.py](../tests/test_argon4_abort_unapplied_revision.py)
 - [tests/test_argon4_book_telemetry_analysis.py](../tests/test_argon4_book_telemetry_analysis.py)
 - [tests/test_argon4_clean_room.py](../tests/test_argon4_clean_room.py)
+- [tests/test_argon4_clock_budget.py](../tests/test_argon4_clock_budget.py)
 - [tests/test_argon4_forward_account.py](../tests/test_argon4_forward_account.py)
 - [tests/test_argon4_forward_allocation.py](../tests/test_argon4_forward_allocation.py)
 - [tests/test_argon4_forward_book_telemetry.py](../tests/test_argon4_forward_book_telemetry.py)
@@ -142,9 +148,12 @@
 - [tests/test_argon4_forward_deadline_publication.py](../tests/test_argon4_forward_deadline_publication.py)
 - [tests/test_argon4_forward_execution.py](../tests/test_argon4_forward_execution.py)
 - [tests/test_argon4_forward_feature_cache.py](../tests/test_argon4_forward_feature_cache.py)
+- [tests/test_argon4_forward_hourly_revisions.py](../tests/test_argon4_forward_hourly_revisions.py)
 - [tests/test_argon4_forward_input_deadlines.py](../tests/test_argon4_forward_input_deadlines.py)
 - [tests/test_argon4_forward_late_backoff.py](../tests/test_argon4_forward_late_backoff.py)
 - [tests/test_argon4_forward_latency_registry.py](../tests/test_argon4_forward_latency_registry.py)
+- [tests/test_argon4_forward_maintenance_pipeline.py](../tests/test_argon4_forward_maintenance_pipeline.py)
+- [tests/test_argon4_forward_maintenance_revisions.py](../tests/test_argon4_forward_maintenance_revisions.py)
 - [tests/test_argon4_forward_mark_revisions.py](../tests/test_argon4_forward_mark_revisions.py)
 - [tests/test_argon4_forward_market_refresh.py](../tests/test_argon4_forward_market_refresh.py)
 - [tests/test_argon4_forward_model.py](../tests/test_argon4_forward_model.py)
@@ -155,6 +164,7 @@
 - [tests/test_argon4_forward_polymarket_transport.py](../tests/test_argon4_forward_polymarket_transport.py)
 - [tests/test_argon4_forward_public_refresh.py](../tests/test_argon4_forward_public_refresh.py)
 - [tests/test_argon4_forward_recovery_cli.py](../tests/test_argon4_forward_recovery_cli.py)
+- [tests/test_argon4_forward_revision_fastpath.py](../tests/test_argon4_forward_revision_fastpath.py)
 - [tests/test_argon4_forward_revisions.py](../tests/test_argon4_forward_revisions.py)
 - [tests/test_argon4_forward_risk_view.py](../tests/test_argon4_forward_risk_view.py)
 - [tests/test_argon4_forward_runtime_profile.py](../tests/test_argon4_forward_runtime_profile.py)
@@ -169,6 +179,8 @@
 - [tests/test_argon4_mark_revision_registry.py](../tests/test_argon4_mark_revision_registry.py)
 - [tests/test_argon4_multilook.py](../tests/test_argon4_multilook.py)
 - [tests/test_argon4_prepared_revision_recovery.py](../tests/test_argon4_prepared_revision_recovery.py)
+- [tests/test_argon4_public_transport_deadline.py](../tests/test_argon4_public_transport_deadline.py)
+- [tests/test_argon4_research11.py](../tests/test_argon4_research11.py)
 
 ## tools
 
@@ -196,4 +208,5 @@
 - [tools/argon4_forward/risk_view.py](../tools/argon4_forward/risk_view.py)
 - [tools/argon4_forward/runtime_profile.py](../tools/argon4_forward/runtime_profile.py)
 - [tools/argon4_forward/stage.py](../tools/argon4_forward/stage.py)
+- [tools/argon4_research11.py](../tools/argon4_research11.py)
 

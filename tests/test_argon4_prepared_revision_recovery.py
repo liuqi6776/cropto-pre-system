@@ -165,3 +165,51 @@ def test_mark_registry_must_be_exact_already_published_proposal(mark_runtime, ca
                 assert revisions._sha(runtime / relative) == digest
     else:
         assert verified["status"] == "BLOCKED", verified
+
+
+def test_prepared_recovery_reproduces_verified_append_baseline_proof(mark_runtime):
+    from copy import deepcopy
+    import pandas as pd
+    from test_argon4_forward_mark_revisions import (
+        bar, _row, MARK_PATH, OPEN, NEW_MARK,
+    )
+    runtime = mark_runtime
+    registry = runtime/"fixture_mark_registry.json"
+    mark_receipt(runtime)
+    mark_receipt(runtime, received=SECOND)
+    first = revisions.reconcile_confirmed_price_revisions(
+        runtime, [mark_error()], MARK_NOW, mark_registry_path=registry)
+    assert first["status"] == "COMMITTED", first
+    registry_before_append = registry.read_bytes()
+    # A later real-observation fixture appends one closed hour. The registry's
+    # prior digest remains an immutable committed anchor, not the new full file.
+    appended_bar = bar(OPEN+pd.Timedelta(hours=1))
+    appended_receipt = mark_receipt(runtime, appended_bar, received=MARK_NOW+pd.Timedelta(minutes=5))
+    path = runtime/"features/raw_data"/MARK_PATH
+    frame = pd.read_parquet(path)
+    pd.concat([frame, pd.DataFrame([_row(appended_bar, appended_receipt)])], ignore_index=True).to_parquet(path, index=False)
+    assert registry.read_bytes() == registry_before_append
+    revised = deepcopy(NEW_MARK)
+    revised[4], revised[8] = "2226.0", 3601
+    mark_receipt(runtime, revised, received=MARK_NOW+pd.Timedelta(minutes=10))
+    mark_receipt(runtime, revised, received=MARK_NOW+pd.Timedelta(minutes=15))
+    def expired(): raise ValueError("synthetic post-publication clock expiry")
+    pending = revisions.reconcile_confirmed_price_revisions(
+        runtime, [mark_error()], MARK_NOW+pd.Timedelta(minutes=20),
+        mark_registry_path=registry, cutover_now=expired)
+    assert pending["status"] == "BLOCKED" and pending["reason"] == "synthetic post-publication clock expiry", pending
+    archive = Path(pending["archive_path"])
+    assert (archive/"mark_append_baseline_proofs.json").is_file()
+    before = revisions._inventory(runtime)
+    checked = revisions.recover_prepared_price_revision(runtime, mark_registry_path=registry)
+    assert checked["status"] == "VERIFIED_PREPARED_CUTOVER", checked
+    assert revisions._inventory(runtime) == before
+    result = revisions.recover_prepared_price_revision(runtime, mark_registry_path=registry,
+        apply=True, cutover_now=lambda: MARK_NOW+pd.Timedelta(hours=1))
+    assert result["status"] == "COMMITTED", result
+    manifest = json.loads(Path(result["manifest_path"]).read_text())
+    proof_receipt = manifest["mark_registry_update"]
+    assert len(proof_receipt["append_baseline_proofs"]) == 1
+    assert proof_receipt["append_baseline_proof_archive"]["sha256"] == revisions._sha(archive/"mark_append_baseline_proofs.json")
+    assert result["current_cohort_must_be_skipped"] and result.get("same_cohort_eligible") is not True
+    assert revisions.ensure_view_committed(runtime)["status"] == "COMMITTED"

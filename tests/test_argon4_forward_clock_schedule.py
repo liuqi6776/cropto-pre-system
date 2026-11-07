@@ -68,3 +68,39 @@ def test_clock_step_detected_during_scheduling_is_not_ignored(schedule,monkeypat
     with pytest.raises(ValueError,match="local clock changed"):
         p.update_clock()
     assert not state.calls
+
+
+@pytest.mark.parametrize("before,expected_calls", [(5, 1), (1, 0), (.1, 0)])
+def test_v13_proactive_sampling_budget_stops_before_boundary(schedule, monkeypatch, before, expected_calls):
+    from tools.argon4_forward.runtime_profile import V12_ENGINEERING
+    p, state = schedule
+    p._revision_fastpath = {"enabled": True}
+    p._worker_engineering = dict(V12_ENGINEERING)
+    state.lower = BOUNDARY-timedelta(seconds=before)
+    calls = []
+    def calibrate(**kwargs):
+        calls.append(kwargs)
+        return {"status": "CALIBRATED", "calibrated_monotonic": state.monotonic}
+    monkeypatch.setattr(pipeline, "calibrate", calibrate)
+    p.update_clock()
+    assert len(calls) == expected_calls
+    if calls:
+        assert calls[0]["retry_borderline"]
+        assert calls[0]["budget_monotonic"] < state.monotonic+before
+
+
+def test_v13_periodic_clock_inside_decision_window_never_adds_samples(schedule, monkeypatch):
+    from tools.argon4_forward.runtime_profile import V12_ENGINEERING
+    p, state = schedule
+    p._revision_fastpath = {"enabled": True}
+    p._worker_engineering = dict(V12_ENGINEERING)
+    state.lower = BOUNDARY+timedelta(seconds=5)
+    p.clock["calibrated_monotonic"] = state.monotonic-41
+    calls = []
+    def calibrate(**kwargs):
+        calls.append(kwargs)
+        return {"status": "CALIBRATED", "calibrated_monotonic": state.monotonic}
+    monkeypatch.setattr(pipeline, "calibrate", calibrate)
+    p.update_clock()
+    assert len(calls) == 1 and not calls[0]["retry_borderline"]
+    assert calls[0]["budget_monotonic"] <= state.monotonic+6

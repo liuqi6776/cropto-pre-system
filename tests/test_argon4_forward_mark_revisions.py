@@ -304,7 +304,7 @@ def test_mixed_mark_and_futures_batch_is_atomic_until_both_sources_are_confirmed
 
 
 @pytest.mark.parametrize("unsupported", ["ETHUSDT:funding", "funding:ETHUSDT:8h", "mark:ETHUSDT:5m",
-                                         "mark:ETHUSDT:4h", "futures:ETHUSDT:1h", "index:ETHUSDT:1h"])
+                                         "mark:ETHUSDT:4h", "futures:ETHUSDT:4h", "index:ETHUSDT:1h"])
 def test_unsupported_source_or_interval_blocks_the_entire_otherwise_confirmed_batch(runtime, unsupported):
     _receipt(runtime)
     _receipt(runtime, received=SECOND)

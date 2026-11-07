@@ -2,6 +2,8 @@
 from copy import deepcopy
 import hashlib
 import json
+import sqlite3
+from urllib.parse import urlencode
 
 import pandas as pd
 import pytest
@@ -160,3 +162,157 @@ def test_atomic_publish_failure_preserves_old_registry_and_archive(fixture, monk
     assert f["registry"].read_bytes() == before
     assert registry.verify_registry_archive(f["archive"], receipt)["status"] == "VERIFIED"
     assert not list(f["registry"].parent.glob("*.tmp"))
+
+
+@pytest.fixture
+def append_fixture(fixture):
+    """Explicit synthetic observations; no workspace data or registry is used."""
+    f = fixture
+    plan = f["plans"][0]
+    relative = plan["relative_path"]
+    old = pd.read_parquet(plan["path"])
+    old["open_time"] = old.date
+    old["close_time"] = old.date+pd.Timedelta(hours=1)-pd.Timedelta(milliseconds=1)
+    for col in ("quote_volume", "taker_buy_base_volume", "taker_buy_quote_volume"):
+        old[col] = 0.
+    old["count"] = 3600.
+    old_archive = f["raw"].parent/"revisions/previous-committed-fixture"
+    old_path = old_archive/"raw_data"/relative
+    old_path.parent.mkdir(parents=True)
+    old.to_parquet(old_path, index=False)
+    old_hash = digest(old_path)
+    old_prepared = {"status": "PREPARED", "revision_id": old_archive.name, "archive_path": str(old_archive),
+                    "data_root": str(f["raw"]), "validation_at": "2026-11-06T02:10:00Z", "before_files": {relative: old_hash}}
+    (old_archive/"prepared.json").write_text(json.dumps(old_prepared), encoding="utf8")
+    old_manifest = {**old_prepared, "status": "COMMITTED", "view_effective_at": "2026-11-06T02:10:00Z",
+                    "prepared_sha256": digest(old_archive/"prepared.json"), "after_files": {relative: old_hash}}
+    (old_archive/"manifest.json").write_text(json.dumps(old_manifest), encoding="utf8")
+    added = old.copy()
+    added["date"] += pd.Timedelta(hours=1)
+    added["open_time"] = added.date
+    added["close_time"] += pd.Timedelta(hours=1)
+    added["first_received_at"] = pd.Timestamp("2026-11-06T03:00:05Z")
+    opened = int(added.date.iloc[0].timestamp()*1000)
+    raw_bar = [opened, "100", "110", "90", "101", "0", opened+3599999, "0", 3600, "0", "0", "0"]
+    raw = json.dumps([raw_bar], separators=(",", ":")).encode()
+    added["receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+    baseline = pd.concat([old, added], ignore_index=True)
+    for column in ("date", "open_time", "close_time", "first_received_at"):
+        baseline[column] = pd.to_datetime(baseline[column], utc=True).astype("datetime64[ns, UTC]")
+    baseline.to_parquet(plan["path"], index=False)
+    before_path = f["archive"]/"raw_data"/relative
+    before_path.parent.mkdir(parents=True)
+    baseline.to_parquet(before_path, index=False)
+    plan["before_sha256"] = digest(plan["path"])
+    prepared = {"status": "PREPARED", "revision_id": f["archive"].name, "archive_path": str(f["archive"]),
+                "data_root": str(f["raw"]), "validation_at": "2026-11-06T03:10:00Z",
+                "before_files": {relative: plan["before_sha256"]}}
+    (f["archive"]/"prepared.json").write_text(json.dumps(prepared), encoding="utf8")
+    proposal = baseline.copy()
+    proposal.loc[1, "close"] = 102.
+    proposal.loc[1, "receipt_sha256"] = "b"*64
+    proposal.loc[1, "first_received_at"] = pd.Timestamp("2026-11-06T03:05:05Z")
+    proposal["first_received_at"] = pd.to_datetime(proposal.first_received_at, utc=True).astype("datetime64[ns, UTC]")
+    proposed_path = f["archive"]/"proposed_raw_data"/relative
+    proposal.to_parquet(proposed_path, index=False)
+    plan["frame"] = proposal
+    f["after"][relative] = digest(proposed_path)
+    f["document"]["research_references"][0]["sha256"] = old_hash
+    f["registry"].write_text(json.dumps(f["document"]), encoding="utf8")
+    db_path = f["archive"]/"receipts.sqlite3"
+    with sqlite3.connect(db_path) as db:
+        db.execute("CREATE TABLE receipts(id INTEGER PRIMARY KEY,url TEXT,requested_at TEXT,received_at TEXT,sha256 TEXT,http_status INTEGER,raw BLOB,time_basis TEXT,clock_evidence_sha256 TEXT)")
+        url = registry.ENDPOINT+"?"+urlencode({"symbol": "ETHUSDT", "interval": "1h", "startTime": opened,
+                                              "endTime": opened+3599999, "limit": 1000})
+        db.execute("INSERT INTO receipts VALUES(1,?,?,?,?,?,?,?,?)", (url, "2026-11-06T03:00:04.8Z",
+                   "2026-11-06T03:00:05Z", hashlib.sha256(raw).hexdigest(), 200, raw,
+                   "CALIBRATED_UTC_UPPER_BOUND", "c"*64))
+    return {**f, "old_path": old_path, "old_archive": old_archive, "before_path": before_path,
+            "baseline": baseline, "receipt_db": db_path}
+
+
+def _append_proof(f):
+    return registry.prove_append_baseline(f["document"]["research_references"][0], f["raw"], "ETHUSDT",
+                                         f["plans"][0]["before_sha256"], f["archive"])
+
+
+def _rewrite_fixture_before(f, frame):
+    frame.to_parquet(f["before_path"], index=False)
+    f["plans"][0]["before_sha256"] = digest(f["before_path"])
+    p = f["archive"]/"prepared.json"
+    value = json.loads(p.read_text())
+    value["before_files"][f["plans"][0]["relative_path"]] = digest(f["before_path"])
+    p.write_text(json.dumps(value), encoding="utf8")
+
+
+def test_verified_append_archives_old_registry_and_proof_in_single_publication(append_fixture):
+    f = append_fixture
+    before = f["registry"].read_bytes()
+    proof = _append_proof(f)
+    assert proof["old_rows"] == 1 and proof["before_rows"] == 2 and proof["appended_rows"] == 1
+    assert proof["registered_sha256"] == digest(f["old_path"])
+    assert proof["added_observations"][0]["original_receipt"]["raw_bar"][4] == "101"
+    assert _append_proof(f) == proof
+    assert not (f["archive"]/registry.APPEND_PROOF_FILE).exists()  # helper is read-only
+    receipt = prepare(f)
+    assert f["registry"].read_bytes() == before
+    assert (f["archive"]/registry.SNAPSHOTS[0]).read_bytes() == before
+    assert receipt["append_baseline_proofs"] == [proof]
+    proposed = json.loads((f["archive"]/registry.SNAPSHOTS[1]).read_text())
+    updated = proposed["research_references"][0]
+    assert updated["revision_provenance"]["append_baseline_proof"] == proof
+    assert updated["sha256"] == f["after"][f["plans"][0]["relative_path"]]
+    assert proposed["research_references"][1] == f["document"]["research_references"][1]
+    assert registry.publish_registry_update(receipt)["status"] == "PUBLISHED"
+    assert registry.verify_registry_archive(f["archive"], receipt)["status"] == "VERIFIED"
+    (f["archive"]/registry.APPEND_PROOF_FILE).write_text("[]")
+    with pytest.raises(ValueError, match="APPEND_PROOF_ARCHIVE"):
+        registry.verify_registry_archive(f["archive"], receipt)
+
+
+@pytest.mark.parametrize("case", ["missing_snapshot", "bare_snapshot", "wrong_manifest_binding", "changed_snapshot",
+                                 "changed_old_value", "float_epsilon", "float_sign_zero", "changed_dtype", "columns_reordered",
+                                 "no_append", "duplicate_date", "fake_new_value", "wrong_clock", "unclosed_new_row",
+                                 "bad_receipt_hash", "wrong_receipt_endpoint", "wrong_receipt_time"])
+def test_append_baseline_never_accepts_unproven_or_changed_observations(append_fixture, case):
+    f = append_fixture
+    frame = f["baseline"].copy()
+    rewrite = True
+    if case == "missing_snapshot": f["old_path"].unlink(); rewrite = False
+    elif case == "bare_snapshot": (f["old_archive"]/"manifest.json").unlink(); rewrite = False
+    elif case == "wrong_manifest_binding":
+        p = f["old_archive"]/"manifest.json"; doc = json.loads(p.read_text())
+        doc["before_files"][f["plans"][0]["relative_path"]] = "f"*64; p.write_text(json.dumps(doc)); rewrite = False
+    elif case == "changed_snapshot": f["old_path"].write_bytes(b"changed"); rewrite = False
+    elif case == "changed_old_value": frame.loc[0, "close"] = 101.01
+    elif case == "float_epsilon": frame.loc[0, "close"] += 1e-12
+    elif case == "float_sign_zero": frame.loc[0, "volume"] = -0.0
+    elif case == "changed_dtype": frame["count"] = frame["count"].astype("int64")
+    elif case == "columns_reordered": frame = frame[list(reversed(frame.columns))]
+    elif case == "no_append": frame = frame.iloc[:1]
+    elif case == "duplicate_date": frame.loc[1, "date"] = frame.loc[0, "date"]
+    elif case == "fake_new_value": frame.loc[1, "close"] = 102.
+    elif case == "wrong_clock": frame.loc[1, "clock_evidence_sha256"] = "e"*64
+    elif case == "unclosed_new_row": frame.loc[1, "first_received_at"] = pd.Timestamp("2026-11-06T02:59:59Z")
+    else:
+        with sqlite3.connect(f["receipt_db"]) as db:
+            if case == "bad_receipt_hash": db.execute("UPDATE receipts SET sha256=?", ("f"*64,))
+            elif case == "wrong_receipt_endpoint": db.execute("UPDATE receipts SET url=replace(url,'markPriceKlines','klines')")
+            elif case == "wrong_receipt_time": db.execute("UPDATE receipts SET received_at='2026-11-06T03:00:06Z'")
+        rewrite = False
+    if rewrite:
+        _rewrite_fixture_before(f, frame)
+    original_registry = f["registry"].read_bytes()
+    with pytest.raises((ValueError, OSError)):
+        _append_proof(f)
+    assert f["registry"].read_bytes() == original_registry
+    assert not (f["archive"]/registry.APPEND_PROOF_FILE).exists()
+
+
+def test_append_proof_does_not_relax_other_registry_identity_fields(append_fixture):
+    f = append_fixture
+    f["document"]["research_references"][0]["installed"] = True
+    f["registry"].write_text(json.dumps(f["document"]))
+    with pytest.raises(ValueError, match="REFERENCE_IDENTITY"):
+        prepare(f)
+    assert not (f["archive"]/registry.SNAPSHOTS[0]).exists()

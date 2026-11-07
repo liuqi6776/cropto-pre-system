@@ -11,13 +11,15 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tools.argon4_forward.revisions import recover_prepared_price_revision
+from tools.argon4_forward.revisions import recover_prepared_price_revision, abort_unapplied_price_revision
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-dir", type=Path, default=ROOT / "paper_runtime/argon4_forward_20261105")
     parser.add_argument("--apply", action="store_true", help="requires verification pause and stopped local service")
+    parser.add_argument("--abort-unapplied", action="store_true",
+        help="verify an entirely unapplied transaction and its prior committed view; never roll back raw data")
     args = parser.parse_args()
     runtime = args.runtime_dir.resolve()
     if not runtime.is_relative_to((ROOT / "paper_runtime").resolve()):
@@ -50,20 +52,26 @@ def main():
             ObservationStore(runtime / "observations.sqlite3").save("revision_recovery_clock", clock)
             return calibrated_now(clock)
     try:
-        result = recover_prepared_price_revision(runtime,
-            mark_registry_path=ROOT / "archive/catalog/mark_candle_registry.json",
-            cutover_now=callback, apply=args.apply)
+        if args.abort_unapplied:
+            result = abort_unapplied_price_revision(runtime, abort_now=callback, apply=args.apply)
+        else:
+            result = recover_prepared_price_revision(runtime,
+                mark_registry_path=ROOT / "archive/catalog/mark_candle_registry.json",
+                cutover_now=callback, apply=args.apply)
     finally:
         if transport is not None:
             transport.close()
         if listener_guard is not None:
             listener_guard.close()
-    report = ROOT / "reports/argon4_latency_v11_20261107" / ("prepared_revision_apply.json" if args.apply else "prepared_revision_check.json")
+    report_name = ("unapplied_revision_" if args.abort_unapplied else "prepared_revision_")+(
+        "apply.json" if args.apply else "check.json")
+    report = ROOT / "reports/argon4_latency_v11_20261107" / report_name
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     print(json.dumps({"status": result.get("status"), "reason": result.get("reason"),
         "view_effective_at": result.get("view_effective_at"), "report": str(report)}, ensure_ascii=False))
-    return 0 if result.get("status") in {"VERIFIED_PREPARED_CUTOVER", "COMMITTED"} else 1
+    return 0 if result.get("status") in {"VERIFIED_PREPARED_CUTOVER", "COMMITTED",
+                                         "VERIFIED_UNAPPLIED_REVISION", "ABORTED_UNAPPLIED"} else 1
 
 
 if __name__ == "__main__":

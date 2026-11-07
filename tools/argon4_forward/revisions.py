@@ -1,9 +1,11 @@
-"""Evidence-backed versions of observed 5m futures and 1h mark working views.
+"""Evidence-backed versions of observed 5m/1h futures and 1h mark working views.
 
 No network, model changes, orders, funding corrections or synthetic bars. The
 caller is the single managed input writer, holds OnlineInputs._lock, and has
-finished refresh. Every recovery skips that decision cohort; the next cohort
-must refresh and validate inputs again. Historical replay must select the old
+finished refresh. Every interrupted recovery skips that decision cohort; the next cohort
+must refresh and validate inputs again. An explicit, guarded aged-bar fast path
+may admit only the untouched current cohort in the caller's live process.
+Historical replay must select the old
 archived view, never the current view before its recorded effective time.
 """
 from __future__ import annotations
@@ -32,9 +34,11 @@ PRICE_FIELDS = {1: "open", 2: "high", 3: "low", 4: "close", 5: "volume",
                 7: "quote_volume", 8: "count", 9: "taker_buy_base_volume", 10: "taker_buy_quote_volume"}
 REVISION_SPECS = {
     ("futures", "5m"): {"endpoint": "/fapi/v1/klines", "directory": "intraday", "step_ms": 300000},
+    ("futures", "1h"): {"endpoint": "/fapi/v1/klines", "directory": "auxiliary", "step_ms": 3600000},
     ("mark", "1h"): {"endpoint": "/fapi/v1/markPriceKlines", "directory": "auxiliary", "step_ms": 3600000},
 }
 SAFE_ERROR = "REVISION_VIEW_NOT_COMMITTED"
+FAST_PROFILE = "argon4-aged-revision-v13"
 _RECOVERY_LOCK = threading.Lock()
 
 
@@ -93,14 +97,10 @@ def _paths(runtime):
     return runtime, features, features / "raw_data", features / "revisions"
 
 
-def ensure_view_committed(runtime):
-    """Raise a fixed safety error for any incomplete/corrupt recovery marker."""
+def _verified_committed_state(runtime, state):
+    """Verify a supplied committed identity without publishing it as active."""
     _, _, _, revisions = _paths(runtime)
-    marker = revisions / "view_state.json"
-    if not marker.exists():
-        return {"status": "NO_REVISIONS"}
     try:
-        state = json.loads(marker.read_text(encoding="utf-8"))
         if state.get("status") != "COMMITTED" or state.get("schema_version") != 1:
             raise ValueError(SAFE_ERROR)
         folder = (revisions / state["revision_id"]).resolve()
@@ -137,6 +137,19 @@ def ensure_view_committed(runtime):
         return state
     except (OSError, ValueError, KeyError, TypeError):
         raise RevisionSafetyError(SAFE_ERROR) from None
+
+
+def ensure_view_committed(runtime):
+    """Raise a fixed safety error for any incomplete/corrupt recovery marker."""
+    _, _, _, revisions = _paths(runtime)
+    marker = revisions / "view_state.json"
+    if not marker.exists():
+        return {"status": "NO_REVISIONS"}
+    try:
+        state = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        raise RevisionSafetyError(SAFE_ERROR) from None
+    return _verified_committed_state(runtime, state)
 
 
 def _error_sources(errors):
@@ -227,16 +240,31 @@ def _raw_bar(raw, start, end, received, now, step_ms=300000):
     return opened, numbers
 
 
-def _receipts(path, symbol, now, needed_opens, kind="futures", interval="5m"):
+def _receipts(path, symbol, now, needed_opens, kind="futures", interval="5m", *,
+              cohort_since=None, original_identity=None):
     if not path.is_file():
         raise ValueError("RECEIPTS_DATABASE_MISSING")
     observations = {opened: [] for opened in needed_opens}
     spec = REVISION_SPECS[(kind, interval)]
     with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT id,url,requested_at,received_at,sha256,http_status,raw,time_basis,clock_evidence_sha256 "
-                            "FROM receipts WHERE http_status=200 AND url LIKE ? AND url LIKE ? AND url LIKE ? ORDER BY id DESC",
-                            (f"%symbol={symbol}%", f"%interval={interval}%", f"%{spec['endpoint']}?%"))
+        query = ("SELECT id,url,requested_at,received_at,sha256,http_status,raw,time_basis,clock_evidence_sha256 "
+                 "FROM receipts WHERE http_status=200 AND url LIKE ? AND url LIKE ? AND url LIKE ?")
+        parameters = [f"%symbol={symbol}%", f"%interval={interval}%", f"%{spec['endpoint']}?%"]
+        if cohort_since is not None:
+            # Include every current receipt, even a different clock identity or
+            # contradictory raw value. UTC-aware SQL comparison also handles Z
+            # and explicit offsets. Invalid times must be validated, not hidden.
+            query += (" AND (julianday(requested_at)>=julianday(?) OR julianday(received_at)>=julianday(?)"
+                      " OR julianday(requested_at) IS NULL OR julianday(received_at) IS NULL)")
+            parameters.extend([_time(cohort_since).isoformat()]*2)
+        if original_identity is not None:
+            digest, received_at = original_identity
+            # SQL narrows candidates; _plans still requires exact parsed time.
+            # Never let SQLite's millisecond rounding establish receipt identity.
+            query += " AND sha256=? AND julianday(received_at)=julianday(?)"
+            parameters.extend([digest, _time(received_at).isoformat()])
+        rows = conn.execute(query+" ORDER BY id DESC", parameters)
         for source in rows:
             source = dict(source)
             start, end = _query(source["url"], symbol, kind, interval)
@@ -275,7 +303,45 @@ def _public_receipt(receipt):
     return {k: v for k, v in receipt.items() if k != "numbers"}
 
 
-def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_override=None):
+def _fast_context(context, validation_at):
+    """Validate an explicit, bounded opt-in; age is eligibility, never proof."""
+    if context is None:
+        return None
+    if (not isinstance(context, dict)
+            or set(context) != {"profile", "cohort", "deadline", "minimum_spacing_seconds", "clock_evidence_sha256"}
+            or context["profile"] != FAST_PROFILE
+            or isinstance(context["minimum_spacing_seconds"], bool)
+            or context["minimum_spacing_seconds"] != 2.0):
+        raise ValueError("INVALID_FAST_REVISION_CONTEXT")
+    clock_hash = context["clock_evidence_sha256"]
+    if not isinstance(clock_hash, str) or re.fullmatch(r"[0-9a-f]{64}", clock_hash) is None:
+        raise ValueError("INVALID_FAST_REVISION_CLOCK_IDENTITY")
+    cohort, deadline = _time(context["cohort"]), _time(context["deadline"])
+    if (cohort != cohort.floor("5min") or deadline != cohort+pd.Timedelta(seconds=14)
+            or not cohort <= validation_at <= deadline):
+        raise ValueError("FAST_REVISION_OUTSIDE_INPUT_BUDGET")
+    return {"profile": FAST_PROFILE, "cohort": cohort.isoformat(), "deadline": deadline.isoformat(),
+            "minimum_spacing_seconds": 2.0, "clock_evidence_sha256": clock_hash}
+
+
+def _guard_evidence(guard, phase, context):
+    if not callable(guard):
+        raise ValueError("FAST_REVISION_COHORT_GUARD_REQUIRED")
+    try:
+        evidence = guard()
+    except Exception as exc:
+        raise ValueError("FAST_REVISION_COHORT_GUARD_FAILED:"+type(exc).__name__) from None
+    if (not isinstance(evidence, dict) or evidence.get("eligible") is not True
+            or evidence.get("clock_evidence_sha256") != context["clock_evidence_sha256"]
+            or not isinstance(evidence.get("policy_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", evidence["policy_sha256"]) is None):
+        raise ValueError("FAST_REVISION_COHORT_ALREADY_USED_OR_UNVERIFIED")
+    # Freeze a JSON value rather than retaining mutable caller-owned evidence.
+    return {"phase": phase, "evidence": json.loads(_bytes_json(evidence))}
+
+
+def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_override=None,
+           fast_context=None):
     _, features, raw_root, _ = _paths(runtime)
     raw_root = Path(raw_root_override) if raw_root_override is not None else raw_root
     receipts_path = Path(receipts_path_override) if receipts_path_override is not None else features / "http_receipts.sqlite3"
@@ -286,7 +352,9 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
         path = raw_root / spec["directory"] / f"{symbol}_{interval}_{kind}.parquet"
         old = _read_cache(path, spec["step_ms"])
         opens = (pd.to_datetime(old.date, utc=True).astype("int64") // 1_000_000).tolist()
-        evidence = _receipts(receipts_path, symbol, now, opens, kind, interval)
+        evidence = _receipts(receipts_path, symbol, now, opens, kind, interval,
+                             cohort_since=fast_context["cohort"] if fast_context is not None else None)
+        originals = {}
         updated, changes = old.copy(deep=True), []
         seen = False
         for index, opened in zip(old.index, opens):
@@ -301,6 +369,13 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
                 continue
             original = next((r for r in receipts if r["sha256"] == old.at[index, "receipt_sha256"]
                              and _time(r["received_at"]) == _time(old.at[index, "first_received_at"])), None)
+            if original is None and fast_context is not None:
+                identity = (str(old.at[index, "receipt_sha256"]), _time(old.at[index, "first_received_at"]).isoformat())
+                if identity not in originals:
+                    originals[identity] = _receipts(receipts_path, symbol, now, opens, kind, interval,
+                                                    original_identity=identity)
+                original = next((r for r in originals[identity][opened]
+                                 if _time(r["received_at"]) == _time(identity[1])), None)
             if original is None:
                 raise ValueError("CACHE_ORIGINAL_RECEIPT_MISSING")
             if any(float(old.at[index, field]) != float(original["numbers"][raw_index])
@@ -311,18 +386,41 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
             if (old.at[index, "receipt_time_basis"] != original["time_basis"]
                     or old_clock_hash != original["clock_evidence_sha256"]):
                 raise ValueError("CACHE_ORIGINAL_RECEIPT_PROVENANCE_MISMATCH")
+            fast = fast_context is not None
+            if fast:
+                cohort = _time(fast_context["cohort"])
+                aged = (kind == "futures" and interval == "5m"
+                        and pd.to_datetime(opened+spec["step_ms"], unit="ms", utc=True)
+                        <= cohort-pd.Timedelta(minutes=5))
+                current_receipt = (cohort <= _time(latest["requested_at"])
+                                   and latest["time_basis"] == "CALIBRATED_UTC_UPPER_BOUND"
+                                   and latest["clock_evidence_sha256"] == fast_context["clock_evidence_sha256"])
+                if not aged or not current_receipt:
+                    pending.append({"source": source_name, "bar_open": _time(old.at[index, "date"]).isoformat(),
+                                    "reason": "NOT_AN_AGED_5M_CURRENT_CALIBRATED_RECEIPT",
+                                    "fast_confirmation_eligible": False})
+                    continue
             confirm = None
             for earlier in receipts[1:]:
                 if earlier["numbers"] != latest["numbers"]:
                     break
                 if (earlier["id"] != latest["id"] and earlier["requested_at"] != latest["requested_at"]
                         and _time(latest["requested_at"]) >= _time(earlier["received_at"])
-                        and (_time(latest["received_at"]) - _time(earlier["received_at"])).total_seconds() >= 60):
+                        and ((_time(latest["received_at"]) - _time(earlier["received_at"])).total_seconds() >= 60
+                             if not fast else
+                             (_time(latest["requested_at"]) - _time(earlier["received_at"])).total_seconds() >= 2
+                             and _time(earlier["requested_at"]) >= cohort
+                             and earlier["time_basis"] == "CALIBRATED_UTC_UPPER_BOUND"
+                             and earlier["clock_evidence_sha256"] == latest["clock_evidence_sha256"])):
                     confirm = earlier
                     break
             if confirm is None:
                 pending.append({"source": source_name, "bar_open": _time(old.at[index, "date"]).isoformat(),
-                                "reason": "TWO_INDEPENDENT_MATCHING_RECEIPTS_60S_APART_REQUIRED"})
+                                "reason": ("TWO_CURRENT_MATCHING_CALIBRATED_RECEIPTS_REQUEST_2S_AFTER_RECEIPT_REQUIRED"
+                                           if fast else "TWO_INDEPENDENT_MATCHING_RECEIPTS_60S_APART_REQUIRED"),
+                                **({"fast_confirmation_eligible": True,
+                                    "next_confirmation_request_at": (_time(latest["received_at"])+pd.Timedelta(seconds=2)).isoformat()}
+                                   if fast else {})})
                 continue
             before = {field: float(old.at[index, field]) for field in PRICE_FIELDS.values()}
             after = {field: float(latest["numbers"][i]) for i, field in PRICE_FIELDS.items()}
@@ -461,7 +559,7 @@ def _recovery_registry_receipt(registry_path, raw_root, plans, after_files, arch
     entries = expected.get("research_references")
     if not isinstance(entries, list) or any(not isinstance(e, dict) for e in entries):
         raise ValueError("RECOVERY_MARK_REGISTRY_SCHEMA")
-    updates = []
+    updates, append_proofs = [], []
     for plan in selected:
         symbol, relative = plan["symbol"], plan["relative_path"]
         target = (raw_root / relative).resolve()
@@ -477,13 +575,20 @@ def _recovery_registry_receipt(registry_path, raw_root, plans, after_files, arch
                 or entry.get("candle_type") != "mark" or entry.get("source_endpoint") != ENDPOINT
                 or entry.get("verification_status") != "VERIFIED_PERPETUAL_LABEL"
                 or entry.get("installed") is not False or entry.get("research_only") is not True
-                or entry.get("gate_effect") != "NONE" or entry.get("sha256") != plan["before_sha256"]):
+                or entry.get("gate_effect") != "NONE"):
             raise ValueError("RECOVERY_MARK_REGISTRY_IDENTITY")
+        append_proof = None
+        if entry.get("sha256") != plan["before_sha256"]:
+            from .mark_revision_registry import prove_append_baseline
+            append_proof = prove_append_baseline(entry, raw_root, symbol, plan["before_sha256"], archive)
+            append_proofs.append(append_proof)
         after = after_files[relative]
         entry.update(_frame_metadata(plan["frame"]), sha256=after)
         entry["revision_provenance"] = {"revision_id": archive.name, "manifest_path": str(archive / "manifest.json"),
             "before_sha256": plan["before_sha256"], "after_sha256": after, "source_endpoint": ENDPOINT,
             "future_cohorts_only": True, "confirmation_policy": "TWO_INDEPENDENT_MATCHING_RAW_RECEIPTS_AT_LEAST_60_SECONDS_APART"}
+        if append_proof is not None:
+            entry["revision_provenance"]["append_baseline_proof"] = append_proof
         updates.append({"dataset_id": identifier, "symbol": symbol, "relative_path": relative,
                         "before_sha256": plan["before_sha256"], "after_sha256": after})
     if expected != proposed or _sha(registry) != _sha(proposed_path):
@@ -492,6 +597,10 @@ def _recovery_registry_receipt(registry_path, raw_root, plans, after_files, arch
                "before_sha256": _sha(before_path), "after_sha256": _sha(proposed_path),
                "before_snapshot": SNAPSHOTS[0], "proposed_snapshot": SNAPSHOTS[1],
                "updates": updates, "canonical_entries_modified": False}
+    if append_proofs:
+        proof_path = archive / "mark_append_baseline_proofs.json"
+        receipt["append_baseline_proofs"] = append_proofs
+        receipt["append_baseline_proof_archive"] = {"filename": proof_path.name, "sha256": _sha(proof_path)}
     verify_registry_archive(archive, receipt)
     return receipt
 
@@ -543,7 +652,8 @@ def recover_prepared_price_revision(runtime, *, mark_registry_path=None, cutover
         backups = [_audit_sqlite_backup(features / "http_receipts.sqlite3", archive / "receipts.sqlite3"),
                    _audit_sqlite_backup(runtime / "observations.sqlite3", archive / "observations.sqlite3")]
         plans, pending = _plans(runtime, sources, validation_at, raw_root_override=archive / "raw_data",
-                                receipts_path_override=archive / "receipts.sqlite3")
+                                receipts_path_override=archive / "receipts.sqlite3",
+                                fast_context=_fast_context(prepared.get("fast_confirmation_context"), validation_at))
         if pending or [c for plan in plans for c in plan["changes"]] != changes:
             raise ValueError("RECOVERY_RECEIPT_PROOF_DOES_NOT_REPRODUCE_PLAN")
         proposed = _inventory(archive / "proposed_raw_data")
@@ -605,8 +715,137 @@ def recover_prepared_price_revision(runtime, *, mark_registry_path=None, cutover
         _RECOVERY_LOCK.release()
 
 
+def abort_unapplied_price_revision(runtime, *, apply=False, abort_now=None):
+    """Retire only an exact-before interrupted transaction, without rollback.
+
+    The caller must stop every input writer before applying. Default operation
+    is read-only. No raw view, registry, receipt, prediction or account changes;
+    a verified previous COMMITTED identity is restored only after a write-once
+    abort record. Any partial publication, registry proposal, corrupt archive
+    or absent prior committed identity is refused.
+    """
+    if not _RECOVERY_LOCK.acquire(blocking=False):
+        return {"status": "BLOCKED", "reason": "REVISION_RECOVERY_BUSY"}
+    archive = None
+    try:
+        runtime, features, raw_root, revisions = _paths(runtime)
+        marker_path = revisions / "view_state.json"
+        marker_bytes = marker_path.read_bytes()
+        marker = json.loads(marker_bytes)
+        if marker.get("status") != "PREPARED" or marker.get("schema_version") != 1:
+            raise ValueError("ABORT_REQUIRES_PREPARED_TRANSACTION")
+        archive = (revisions / marker["revision_id"]).resolve()
+        if archive.parent != revisions.resolve() or archive.is_symlink():
+            raise ValueError("ABORT_ARCHIVE_IDENTITY")
+        if any((archive / name).exists() for name in
+               ("manifest.json", "mark_registry_before.json", "mark_registry_proposed.json", "mark_append_baseline_proofs.json")):
+            raise ValueError("ABORT_PUBLICATION_OR_REGISTRY_PROPOSAL_PRESENT")
+        prepared_path = archive / "prepared.json"
+        if prepared_path.is_symlink():
+            raise ValueError("ABORT_PREPARED_SYMLINK")
+        prepared_bytes = prepared_path.read_bytes()
+        prepared = json.loads(prepared_bytes)
+        if (prepared.get("status") != "PREPARED" or prepared.get("schema_version") != 1
+                or prepared.get("revision_id") != marker["revision_id"]
+                or prepared.get("validation_at") != marker.get("validation_at")
+                or Path(prepared["data_root"]).resolve() != raw_root
+                or Path(prepared["archive_path"]).resolve() != archive
+                or prepared.get("current_cohort_must_be_skipped") is not True
+                or prepared.get("next_cohort_requires_fresh_validation") is not True):
+            raise ValueError("ABORT_PREPARED_IDENTITY")
+        validation_at = _time(prepared["validation_at"])
+        prior = prepared.get("prior_view")
+        if (not isinstance(prior, dict) or set(prior) != {
+                "schema_version", "status", "revision_id", "view_effective_at", "manifest_sha256"}
+                or prior.get("revision_id") == archive.name):
+            raise ValueError("ABORT_PRIOR_COMMITTED_IDENTITY_REQUIRED")
+        _verified_committed_state(runtime, prior)
+        if _time(prior["view_effective_at"]) > validation_at:
+            raise ValueError("ABORT_PRIOR_VIEW_FROM_FUTURE")
+        before_files = prepared["before_files"]
+        if _inventory(archive / "raw_data") != before_files:
+            raise ValueError("ABORT_BEFORE_ARCHIVE_HASH_MISMATCH")
+        if _inventory(raw_root) != before_files:
+            raise ValueError("ABORT_CURRENT_VIEW_NOT_EXACT_BEFORE")
+        backups = [_audit_sqlite_backup(features / "http_receipts.sqlite3", archive / "receipts.sqlite3"),
+                   _audit_sqlite_backup(runtime / "observations.sqlite3", archive / "observations.sqlite3")]
+        changes = prepared["changes"]
+        sources = _error_sources([{"source": f"{c['kind']}:{c['symbol']}:{c['interval']}",
+                                   "error": "CONFLICTING_CLOSED_OBSERVATION"} for c in changes])
+        if not sources:
+            raise ValueError("ABORT_NO_SUPPORTED_CHANGES")
+        plans, pending = _plans(runtime, sources, validation_at,
+                                raw_root_override=archive / "raw_data",
+                                receipts_path_override=archive / "receipts.sqlite3",
+                                fast_context=_fast_context(prepared.get("fast_confirmation_context"), validation_at))
+        if pending or [c for p in plans for c in p["changes"]] != changes:
+            raise ValueError("ABORT_RECEIPT_PROOF_DOES_NOT_REPRODUCE_PLAN")
+        proposed = _inventory(archive / "proposed_raw_data")
+        if set(proposed) != {p["relative_path"] for p in plans}:
+            raise ValueError("ABORT_PROPOSED_FILE_SET")
+        for plan in plans:
+            frame = pd.read_parquet(archive / "proposed_raw_data" / plan["relative_path"])
+            pd.testing.assert_frame_equal(plan["frame"], frame, check_exact=True)
+            fields = list(PRICE_FIELDS.values())
+            if not np.array_equal(plan["frame"][fields].to_numpy(dtype=np.float64).view(np.uint64),
+                                  frame[fields].to_numpy(dtype=np.float64).view(np.uint64)):
+                raise ValueError("ABORT_PROPOSED_PRICE_BITS_DIFFER_FROM_RECEIPTS")
+        result = {"status": "VERIFIED_UNAPPLIED_REVISION", "revision_id": archive.name,
+                  "archive_path": str(archive), "prepared_sha256": hashlib.sha256(prepared_bytes).hexdigest(),
+                  "prepared_marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
+                  "restored_prior_view": prior, "before_files": before_files,
+                  "proposed_files": proposed, "sqlite_backups": backups,
+                  "current_view_exactly_matches_before": True, "raw_registry_and_observations_modified": False,
+                  "same_cohort_eligible": False, "next_cohort_requires_fresh_validation": True}
+        if not apply:
+            return result
+        if not callable(abort_now):
+            raise ValueError("ABORT_FRESH_TIME_CALLBACK_REQUIRED")
+        if marker_path.read_bytes() != marker_bytes or prepared_path.read_bytes() != prepared_bytes:
+            raise ValueError("ABORT_EVIDENCE_CHANGED")
+        if _inventory(raw_root) != before_files or _inventory(archive / "raw_data") != before_files:
+            raise ValueError("ABORT_VIEW_CHANGED_BEFORE_PUBLICATION")
+        if _inventory(archive / "proposed_raw_data") != proposed:
+            raise ValueError("ABORT_PROPOSAL_CHANGED_BEFORE_PUBLICATION")
+        _verified_committed_state(runtime, prior)
+        aborted_at = _now(abort_now)
+        if aborted_at < validation_at:
+            raise ValueError("ABORT_CLOCK_REVERSED")
+        # Fresh clock acquisition may perform network I/O. Recheck every
+        # publication identity afterwards; a slow callback grants no write lease.
+        if marker_path.read_bytes() != marker_bytes or prepared_path.read_bytes() != prepared_bytes:
+            raise ValueError("ABORT_EVIDENCE_CHANGED_DURING_CLOCK_CALLBACK")
+        if _inventory(raw_root) != before_files or _inventory(archive / "raw_data") != before_files:
+            raise ValueError("ABORT_VIEW_CHANGED_DURING_CLOCK_CALLBACK")
+        if _inventory(archive / "proposed_raw_data") != proposed:
+            raise ValueError("ABORT_PROPOSAL_CHANGED_DURING_CLOCK_CALLBACK")
+        if any((archive / name).exists() for name in
+               ("manifest.json", "mark_registry_before.json", "mark_registry_proposed.json", "mark_append_baseline_proofs.json")):
+            raise ValueError("ABORT_PUBLICATION_APPEARED_DURING_CLOCK_CALLBACK")
+        for backup in backups:
+            checked = _audit_sqlite_backup(Path(backup["source_path"]), Path(backup["snapshot_path"]))
+            if checked != backup:
+                raise ValueError("ABORT_SQLITE_EVIDENCE_CHANGED_DURING_CLOCK_CALLBACK")
+        _verified_committed_state(runtime, prior)
+        evidence_path = archive / ("abort_unapplied_validation_"+uuid.uuid4().hex+".json")
+        evidence = {**result, "status": "ABORTED_UNAPPLIED", "aborted_at": aborted_at.isoformat(),
+                    "abort_policy": "EXACT_BEFORE_NO_ROLLBACK_RESTORE_VERIFIED_PRIOR_COMMITTED_MARKER"}
+        _new_json(evidence_path, evidence)
+        # If publication fails the PREPARED barrier remains. Repeated explicit
+        # verification can complete it; the failure archive is never deleted.
+        _atomic_json(marker_path, prior)
+        return {**evidence, "abort_evidence_path": str(evidence_path),
+                "abort_evidence_sha256": _sha(evidence_path)}
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, AssertionError) as exc:
+        return {"status": "BLOCKED", "reason": str(exc) if isinstance(exc, ValueError) else type(exc).__name__,
+                "archive_path": str(archive) if archive else None}
+    finally:
+        _RECOVERY_LOCK.release()
+
+
 def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_registry_path=None,
-                                       cutover_now=None):
+                                       cutover_now=None, fast_context=None, cohort_guard=None,
+                                       maintenance_guard=None):
     """All-or-nothing *validation*, followed by an audited, crash-gated cutover.
 
     Returns COMMITTED / WAITING_CONFIRMATION / NO_CHANGE / BLOCKED. PREPARED
@@ -618,6 +857,21 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
         return {"status": "BLOCKED", "reason": "REVISION_RECOVERY_BUSY"}
     archive = None
     try:
+        maintenance_checks = []
+        def check_maintenance(phase):
+            if maintenance_guard is None:
+                return
+            evidence = maintenance_guard(phase)
+            if not isinstance(evidence, dict) or evidence.get("eligible") is not True:
+                raise ValueError("MAINTENANCE_GUARD_REFUSED:"+phase)
+            if evidence.get("execution_authorized") is not False:
+                raise ValueError("MAINTENANCE_CANNOT_AUTHORIZE_EXECUTION")
+            maintenance_checks.append({"phase": phase, "evidence": deepcopy(evidence)})
+        if maintenance_guard is not None:
+            if (not callable(maintenance_guard) or not callable(now) or not callable(cutover_now)
+                    or fast_context is not None):
+                raise ValueError("MAINTENANCE_REQUIRES_EXCLUSIVE_CALIBRATED_LEGACY_PATH")
+            check_maintenance("BEFORE_VALIDATION")
         prior_view = ensure_view_committed(runtime)
         sources = _error_sources(errors)
         if not sources:
@@ -626,11 +880,25 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
             raise ValueError("MARK_REGISTRY_REQUIRED")
         validation_at = _now(now)
         validation_monotonic = time.monotonic()
+        fast = _fast_context(fast_context, validation_at)
+        guards = []
+        if fast is not None:
+            if not callable(now) or not callable(cutover_now):
+                raise ValueError("FAST_REVISION_CALIBRATED_CLOCK_CALLBACKS_REQUIRED")
+            guards.append(_guard_evidence(cohort_guard, "BEFORE_VALIDATION", fast))
+            if any((kind, interval) != ("futures", "5m") for kind, _, interval in sources):
+                fast = None
         runtime, features, raw_root, revisions = _paths(runtime)
         before_files = _inventory(raw_root)
-        plans, pending = _plans(runtime, sources, validation_at)
+        plans, pending = _plans(runtime, sources, validation_at, fast_context=fast)
+        if fast is not None and any(p.get("fast_confirmation_eligible") is not True for p in pending):
+            # One young/non-futures/unverifiable source excludes the entire
+            # batch from fast admission. The original slow rule still applies.
+            fast = None
+            plans, pending = _plans(runtime, sources, validation_at)
         if pending:
-            return {"status": "WAITING_CONFIRMATION", "pending": pending, "changes": [], "data_root": str(raw_root)}
+            return {"status": "WAITING_CONFIRMATION", "pending": pending, "changes": [], "data_root": str(raw_root),
+                    "fast_confirmation_eligible": fast is not None}
         if not plans:
             return {"status": "NO_CHANGE", "reason": "LATEST_OBSERVED_VALUES_ALREADY_MATCH", "data_root": str(raw_root)}
         if not (runtime / "observations.sqlite3").is_file():
@@ -640,6 +908,7 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
             return {"status": "BLOCKED", "reason": "INSUFFICIENT_SNAPSHOT_DISK_SPACE", "disk_budget": disk_budget}
         if _inventory(raw_root) != before_files or any(before_files[p["relative_path"]] != p["before_sha256"] for p in plans):
             raise ValueError("WORKING_VIEW_CHANGED_DURING_VALIDATION")
+        check_maintenance("BEFORE_ARCHIVE")
         revision_id = validation_at.strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid.uuid4().hex
         revisions.mkdir(parents=True, exist_ok=True)
         archive = revisions / revision_id
@@ -655,8 +924,14 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
                     "model_weights_modified_by_this_operation": False,
                     "collector_model_strategy_source_modified": False,
                     "current_cohort_must_be_skipped": True, "next_cohort_requires_fresh_validation": True}
-        _atomic_json(revisions / "view_state.json", {"schema_version": 1, "status": "PREPARED",
-                      "revision_id": revision_id, "validation_at": validation_at.isoformat()})
+        if fast is not None:
+            prepared.update(fast_confirmation_context=fast, fast_cohort_guards=deepcopy(guards),
+                            fast_confirmation_policy="TWO_CURRENT_CALIBRATED_MATCHING_RAW_RECEIPTS_SECOND_REQUEST_AT_LEAST_2S_AFTER_FIRST_RECEIPT")
+        if maintenance_guard is not None:
+            prepared.update(maintenance_guards=deepcopy(maintenance_checks),
+                            maintenance_policy="WINDOW_EXTERNAL_LEGACY_60S_FUTURE_COHORTS_ONLY")
+        prepared_marker = {"schema_version": 1, "status": "PREPARED", "revision_id": revision_id,
+                           "validation_at": validation_at.isoformat()}
         _new_json(archive / "prepared.json", prepared)
         for relative, digest in before_files.items():
             original, target = raw_root / relative, archive / "raw_data" / relative
@@ -681,6 +956,15 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
             mark_registry_update = prepare_registry_update(mark_registry_path, raw_root, plans, after_files, archive)
         if _inventory(raw_root) != before_files:
             raise ValueError("WORKING_VIEW_CHANGED_BEFORE_CUTOVER")
+        if fast is not None:
+            guards.append(_guard_evidence(cohort_guard, "BEFORE_CUTOVER", fast))
+            if guards[-1]["evidence"]["policy_sha256"] != guards[0]["evidence"]["policy_sha256"]:
+                raise ValueError("FAST_REVISION_COHORT_POLICY_CHANGED")
+        check_maintenance("BEFORE_CUTOVER")
+        # Both paths publish the barrier only after immutable archives and all
+        # registry proposals pass. Until this point the active view is intact;
+        # a preparation failure must not strand it behind a PREPARED marker.
+        _atomic_json(revisions / "view_state.json", prepared_marker)
         for plan in plans:
             target = plan["path"]
             temporary = target.with_name(target.name + "." + revision_id + ".tmp")
@@ -696,6 +980,42 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
                         validation_at + pd.Timedelta(seconds=time.monotonic()-validation_monotonic))
         if effective_at < validation_at:
             raise ValueError("CLOCK_REVERSED_DURING_RECOVERY")
+        same_cohort = False
+        admission_reason = "LEGACY_FUTURE_COHORTS_ONLY"
+        maintenance_postcutover = None
+        if maintenance_guard is not None:
+            try:
+                check_maintenance("AFTER_CUTOVER")
+                maintenance_postcutover = {"status": "VERIFIED", "execution_authorized": False}
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
+                # The view has already changed. Permission/phase cancellation
+                # cannot undo that fact or grant any current-window admission.
+                maintenance_postcutover = {"status": "REFUSED_AFTER_APPLIED_CUTOVER",
+                    "reason": str(exc), "execution_authorized": False}
+            # A cancelled phase is distinct from missing time evidence. Never
+            # backfill effective_at if the immutable clock has since expired.
+            audited_at = _now(cutover_now)
+            if audited_at < effective_at:
+                raise ValueError("CLOCK_REVERSED_DURING_RECOVERY")
+            effective_at = audited_at
+        if fast is not None:
+            admission_reason = "FAST_REVISION_INPUT_BUDGET_EXPIRED"
+            if effective_at <= _time(fast["deadline"]):
+                try:
+                    guards.append(_guard_evidence(cohort_guard, "AFTER_CUTOVER_BEFORE_ADMISSION", fast))
+                    if guards[-1]["evidence"]["policy_sha256"] != guards[0]["evidence"]["policy_sha256"]:
+                        raise ValueError("FAST_REVISION_COHORT_POLICY_CHANGED")
+                    # Include guard work in the input budget; never backdate
+                    # the effective time to before the final eligibility check.
+                    admission_at = _now(cutover_now)
+                    if admission_at < effective_at:
+                        raise ValueError("CLOCK_REVERSED_DURING_RECOVERY")
+                    effective_at = admission_at
+                    same_cohort = effective_at <= _time(fast["deadline"])
+                    admission_reason = ("AGED_5M_CONFIRMED_BEFORE_UNTOUCHED_COHORT_DECISION"
+                                        if same_cohort else "FAST_REVISION_INPUT_BUDGET_EXPIRED")
+                except (ValueError, TypeError, KeyError) as exc:
+                    admission_reason = "FAST_REVISION_ADMISSION_REFUSED:"+str(exc)
         manifest = {**prepared, "status": "COMMITTED", "view_effective_at": effective_at.isoformat(),
                     "after_files": after_files, "sqlite_backups": backups,
                     "mark_registry_update": mark_registry_update,
@@ -704,13 +1024,36 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
                                            "CALLABLE_CURRENT_UTC" if callable(now) else "PROVIDED_UTC_PLUS_MONOTONIC_ELAPSED"),
                     "working_view_for_future_cohorts_only": True,
                     "current_view_must_not_replay_as_of_before": effective_at.isoformat()}
+        if fast is not None:
+            manifest.update(fast_cohort_guards=guards,
+                            same_cohort_admission={"eligible": same_cohort, "reason": admission_reason,
+                                "cohort": fast["cohort"], "deadline": fast["deadline"],
+                                "process_local_only": True, "restart_or_recovery_must_skip": True,
+                                "eligibility_is_not_an_execution_authorization": True})
+        if maintenance_guard is not None:
+            manifest.update(maintenance_guards=maintenance_checks,
+                            maintenance_postcutover=maintenance_postcutover)
         _new_json(archive / "manifest.json", manifest)
         marker = {"schema_version": 1, "status": "COMMITTED", "revision_id": revision_id,
                   "view_effective_at": effective_at.isoformat(), "manifest_sha256": _sha(archive / "manifest.json")}
         _atomic_json(revisions / "view_state.json", marker)
+        if same_cohort:
+            # Durable publication itself can consume the remaining budget. A
+            # recorded eligible check is not a reusable execution permit.
+            try:
+                published_at = _now(cutover_now)
+                if not effective_at <= published_at <= _time(fast["deadline"]):
+                    same_cohort = False
+                    admission_reason = "FAST_REVISION_PUBLICATION_OUTSIDE_INPUT_BUDGET"
+            except (ValueError, TypeError, KeyError):
+                same_cohort = False
+                admission_reason = "FAST_REVISION_PUBLICATION_CLOCK_UNVERIFIED"
         return {**marker, "archive_path": str(archive), "manifest_path": str(archive / "manifest.json"),
                 "data_root": str(raw_root), "changes": changes, "current_cohort_must_be_skipped": True,
-                "next_cohort_requires_fresh_validation": True}
+                "next_cohort_requires_fresh_validation": True,
+                "same_cohort_eligible": same_cohort, "same_cohort_admission_reason": admission_reason,
+                **({"maintenance_postcutover": maintenance_postcutover} if maintenance_guard is not None else {}),
+                **({"same_cohort": fast["cohort"], "fast_confirmation_context": fast} if fast is not None else {})}
     except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, AssertionError) as exc:
         return {"status": "BLOCKED", "reason": str(exc) if isinstance(exc, ValueError) else type(exc).__name__,
                 "archive_path": str(archive) if archive else None}

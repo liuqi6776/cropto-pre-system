@@ -7,7 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from .runtime_profile import engineering_profile, minimum_decision_delay
+from .runtime_profile import engineering_profile, minimum_decision_delay, revision_fastpath_profile
 from .stage import stage_profile
 from .account import multi_look_settings
 
@@ -17,6 +17,7 @@ def preparation_status(policy, config):
     stage = stage_profile(policy)
     earliest = minimum_decision_delay(policy, engineering)
     multi_look = multi_look_settings(policy)
+    revision_profile = revision_fastpath_profile(policy)
     disabled = (policy.get("live_enabled") is False and
                 config.get("live_enabled") is False and
                 config.get("mode") == "disabled" and
@@ -28,6 +29,7 @@ def preparation_status(policy, config):
             "configuration_safe": disabled, "risk_limits_match": limits_match,
             "engineering": engineering, "policy_version": policy.get("version"),
             "min_decision_delay_seconds": earliest, "multi_look_ioc": multi_look,
+            "aged_revision_fastpath": revision_profile,
             "price_limit_basis": "ASK_PRICE_EXCLUDING_FEE_FEES_INCLUDED_IN_CAPITAL_LIMITS",
             "execution_stage": stage, "execution_style": "TAKER_IOC_PAPER_ONLY",
             "max_buy_price": policy.get("max_buy_price"),

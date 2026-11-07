@@ -17,6 +17,31 @@ def test_recovery_command_defaults_to_readonly_without_network(tmp_path, monkeyp
     assert not (tmp_path / "paper_runtime").exists()
 
 
+def test_unapplied_command_is_separate_readonly_verification_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "ROOT", tmp_path)
+    monkeypatch.setattr(cli.sys, "argv", ["recover_argon4_prepared_revision.py", "--abort-unapplied"])
+    monkeypatch.setattr(cli.socket, "socket", lambda *a, **k: pytest.fail("readonly reserved network"))
+    monkeypatch.setattr(cli, "recover_prepared_price_revision", lambda *a, **k: pytest.fail("wrong recovery mode"))
+    calls = []
+    def check(runtime, **kwargs):
+        calls.append(kwargs)
+        assert kwargs == {"apply": False, "abort_now": None}
+        return {"status": "VERIFIED_UNAPPLIED_REVISION"}
+    monkeypatch.setattr(cli, "abort_unapplied_price_revision", check)
+    assert cli.main() == 0 and len(calls) == 1
+    assert not (tmp_path / "paper_runtime").exists()
+
+
+def test_unapplied_apply_requires_pause_before_touching_network_or_recovery(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "ROOT", tmp_path)
+    monkeypatch.setattr(cli.sys, "argv", ["recover_argon4_prepared_revision.py", "--abort-unapplied", "--apply"])
+    monkeypatch.setattr(cli.socket, "socket", lambda *a, **k: pytest.fail("missing pause reserved network"))
+    monkeypatch.setattr(cli, "abort_unapplied_price_revision", lambda *a, **k: pytest.fail("missing pause aborted"))
+    with pytest.raises(SystemExit) as stopped:
+        cli.main()
+    assert stopped.value.code == 2
+
+
 def test_apply_requires_pause_before_touching_network_or_recovery(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "ROOT", tmp_path)
     monkeypatch.setattr(cli.sys, "argv", ["recover_argon4_prepared_revision.py", "--apply"])

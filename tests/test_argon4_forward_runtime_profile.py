@@ -82,3 +82,30 @@ def test_preflight_checks_bytes_without_deserializing_or_connecting(tmp_path):
     report = verify_artifacts(tmp_path, p, c)
     assert not report["preparation_checks_passed"]
     assert report["artifacts"]["ETH_5m"]["status"] == "BLOCKED"
+
+
+@pytest.mark.parametrize("mutation", ["age", "spacing", "late_budget", "switch_type", "legacy"])
+def test_v13_revision_contract_rejects_unsupported_scope(mutation):
+    from tools.argon4_forward.runtime_profile import AGED_REVISION_FASTPATH, revision_fastpath_profile
+    p = fixture_policy()
+    p["engineering"] = deepcopy(V12_ENGINEERING)
+    p["input_revision_policy"] = {"aged_futures_fastpath": deepcopy(AGED_REVISION_FASTPATH)}
+    value = p["input_revision_policy"]["aged_futures_fastpath"]
+    if mutation == "age": value["minimum_bar_age_seconds"] = 60
+    if mutation == "spacing": value["minimum_receipt_spacing_seconds"] = 0
+    if mutation == "late_budget": p["engineering"]["input_deadline_after_boundary_seconds"] = 10
+    if mutation == "switch_type": value["enabled"] = 1
+    if mutation == "legacy": p["engineering"] = deepcopy(V11_ENGINEERING)
+    with pytest.raises(ValueError): revision_fastpath_profile(p)
+
+
+def test_v13_preparation_reports_guarded_revision_scope_without_live_authority():
+    from tools.argon4_forward.runtime_profile import AGED_REVISION_FASTPATH, revision_fastpath_profile
+    assert revision_fastpath_profile({}) == {"enabled": False}
+    p = fixture_policy()
+    p.update(engineering=deepcopy(V12_ENGINEERING), min_decision_delay_seconds=4.,
+             input_revision_policy={"aged_futures_fastpath": deepcopy(AGED_REVISION_FASTPATH)})
+    report = preparation_status(p, fixture_config())
+    assert report["aged_revision_fastpath"]["same_cohort_before_prediction_only"]
+    assert report["min_decision_delay_seconds"] == 4.
+    assert not report["ready_for_live"] and not report["live_enabled"]

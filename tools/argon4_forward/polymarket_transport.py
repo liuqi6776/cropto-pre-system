@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import re
 import threading
 import time
@@ -16,6 +17,7 @@ from urllib.parse import urlencode
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.util import Timeout
 
 
 SOURCE = "POLYMARKET_PUBLIC_READ_ONLY"
@@ -48,6 +50,26 @@ def _utc_now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+class PublicRequestDeadline(ValueError):
+    """A local request budget expired; never a successful provider response."""
+
+
+def _remaining(deadline):
+    remaining = deadline-time.monotonic()
+    if remaining <= 0:
+        raise PublicRequestDeadline("DEADLINE_EXCEEDED")
+    return remaining
+
+
+def _empty_receipt(url, queued_seconds):
+    return {"source": SOURCE, "url": url, "method": "GET",
+            "requested_at": None, "received_at": None, "http_status": None,
+            "sha256": None, "raw_text": None, "body_complete": False,
+            "transport_timing": {"basis": "MONOTONIC", "queue_wait_seconds": queued_seconds,
+                                 "request_elapsed_seconds": None, "headers_elapsed_seconds": None,
+                                 "body_elapsed_seconds": None}}
+
+
 class PublicPolymarketTransport:
     """A terminal-close pool of one execution or four observation Sessions.
 
@@ -76,13 +98,15 @@ class PublicPolymarketTransport:
     def __exit__(self, *args):
         self.close()
 
-    def _acquire(self):
+    def _acquire(self, deadline_monotonic=None):
         queued = time.monotonic()
         with self._condition:
             while not self._available and not self._closing:
-                self._condition.wait()
+                self._condition.wait(None if deadline_monotonic is None else _remaining(deadline_monotonic))
             if self._closing:
                 raise ValueError("PUBLIC_TRANSPORT_CLOSED")
+            if deadline_monotonic is not None:
+                _remaining(deadline_monotonic)
             index = self._available.pop()
             self._active += 1
         return index, time.monotonic() - queued
@@ -136,42 +160,74 @@ class PublicPolymarketTransport:
         session.cert = None
         return session
 
-    def get(self, kind, value=None):
-        """Return (decoded JSON or None, raw receipt, safe error code or None)."""
+    def get(self, kind, value=None, *, deadline_monotonic=None):
+        """Return a raw receipt; optional deadlines also bound lease waiting.
+
+        Socket/DNS operations cannot provide a hard scheduling guarantee. An
+        over-budget response is retained as evidence but never accepted.
+        """
         url = public_url(kind, value)
-        index, queued_seconds = self._acquire()
+        if deadline_monotonic is not None and (isinstance(deadline_monotonic, bool)
+                or not isinstance(deadline_monotonic, (int, float)) or not math.isfinite(deadline_monotonic)):
+            raise ValueError("invalid public request deadline")
+        queued_at = time.monotonic()
         try:
-            return self._get_leased(index, kind, url, queued_seconds)
+            index, queued_seconds = self._acquire(deadline_monotonic)
+        except PublicRequestDeadline:
+            return None, _empty_receipt(url, time.monotonic()-queued_at), "DEADLINE_EXCEEDED"
+        try:
+            result = self._get_leased(index, kind, url, queued_seconds, deadline_monotonic)
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                self._discard(index)
+                return None, result[1], "DEADLINE_EXCEEDED"
+            return result
         finally:
             self._release(index)
 
-    def _get_leased(self, index, kind, url, queued_seconds):
-        receipt = {"source": SOURCE, "url": url, "method": "GET",
-                   "requested_at": None, "received_at": None, "http_status": None,
-                   "sha256": None, "raw_text": None, "body_complete": False,
-                   "transport_timing": {"basis": "MONOTONIC",
-                       "queue_wait_seconds": queued_seconds,
-                       "request_elapsed_seconds": None, "headers_elapsed_seconds": None,
-                       "body_elapsed_seconds": None}}
+    def _get_leased(self, index, kind, url, queued_seconds, deadline_monotonic=None):
+        receipt = _empty_receipt(url, queued_seconds)
         timing = receipt["transport_timing"]
         begin = None
         session = None
         failed = False
         try:
+            if deadline_monotonic is not None:
+                _remaining(deadline_monotonic)
             session = self._session(index)
             headers = {"Accept": "application/json", "User-Agent": "argon4-forward-public/1.0"}
             if kind == "time":
                 headers["Cache-Control"] = "no-cache"
+            timeout = (2, 2) if kind == "time" else (2, 3)
+            if deadline_monotonic is not None:
+                _remaining(deadline_monotonic)
             # These timestamps bracket the actual GET, excluding lease waiting.
             receipt["requested_at"] = _utc_now()
             begin = time.monotonic()
-            with session.get(url, timeout=(2, 2) if kind == "time" else (2, 3),
+            if deadline_monotonic is not None:
+                remaining = _remaining(deadline_monotonic)
+                # urllib3 subtracts connection time from the total when setting
+                # the initial read timeout. Body progress is checked separately.
+                timeout = Timeout(total=remaining, connect=min(2, remaining),
+                                  read=min(timeout[1], remaining))
+            with session.get(url, timeout=timeout,
                              allow_redirects=False, stream=True, headers=headers) as response:
                 receipt["http_status"] = response.status_code
                 headers_at = time.monotonic()
                 timing["headers_elapsed_seconds"] = headers_at - begin
+                if deadline_monotonic is not None:
+                    _remaining(deadline_monotonic)
                 raw = bytearray()
-                for chunk in response.iter_content(64 if kind == "time" else 32768):
+                chunk_size = 1 if kind == "time" and deadline_monotonic is not None else (64 if kind == "time" else 32768)
+                chunks = iter(response.iter_content(chunk_size))
+                while True:
+                    if deadline_monotonic is not None:
+                        _remaining(deadline_monotonic)
+                    try:
+                        chunk = next(chunks)
+                    except StopIteration:
+                        break
+                    if deadline_monotonic is not None:
+                        _remaining(deadline_monotonic)
                     raw.extend(chunk)
                     if ((kind == "time" and len(raw) >= 64)
                             or (kind != "time" and len(raw) > MAX_RESPONSE_BYTES)
@@ -181,21 +237,27 @@ class PublicPolymarketTransport:
                 finished = time.monotonic()
                 timing["request_elapsed_seconds"] = finished - begin
                 timing["body_elapsed_seconds"] = finished - headers_at
+                if deadline_monotonic is not None:
+                    _remaining(deadline_monotonic)
                 # A failed UTF-8 decode cannot claim a complete text receipt.
                 text = bytes(raw).decode("utf-8")
                 receipt.update(body_complete=True, sha256=hashlib.sha256(raw).hexdigest(), raw_text=text)
                 if response.status_code != 200:
                     failed = True
                     return None, receipt, f"HTTP_{response.status_code}"
-                return json.loads(text), receipt, None
+                data = json.loads(text)
+                if deadline_monotonic is not None:
+                    _remaining(deadline_monotonic)
+                return data, receipt, None
         except (requests.RequestException, ValueError, UnicodeError) as exc:
             failed = True
-            if receipt["received_at"] is None:
+            if begin is not None and receipt["received_at"] is None:
                 receipt["received_at"] = _utc_now()
             if begin is not None and timing["request_elapsed_seconds"] is None:
                 timing["request_elapsed_seconds"] = time.monotonic() - begin
             # Do not stringify arbitrary errors: their text may contain secrets.
-            code = "RESPONSE_LIMIT" if type(exc) is ValueError and exc.args == ("RESPONSE_LIMIT",) else type(exc).__name__
+            code = ("DEADLINE_EXCEEDED" if isinstance(exc, PublicRequestDeadline) else
+                    "RESPONSE_LIMIT" if type(exc) is ValueError and exc.args == ("RESPONSE_LIMIT",) else type(exc).__name__)
             return None, receipt, code
         except BaseException:
             failed = True

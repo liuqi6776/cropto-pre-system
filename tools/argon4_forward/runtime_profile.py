@@ -21,6 +21,39 @@ V12_ENGINEERING = {
     "telemetry_sampling_profile": "clock_center_v12",
 }
 
+AGED_REVISION_PROFILE = "argon4-aged-revision-v13"
+AGED_REVISION_FASTPATH = {
+    "profile": AGED_REVISION_PROFILE,
+    "enabled": True,
+    "minimum_bar_age_seconds": 300,
+    "minimum_receipt_spacing_seconds": 2.0,
+    "same_cohort_before_prediction_only": True,
+}
+
+
+def revision_fastpath_profile(policy):
+    """An explicit, narrow exception to the legacy future-window-only repair."""
+    revision = policy.get("input_revision_policy", {})
+    if not isinstance(revision, dict):
+        raise ValueError("invalid input revision policy")
+    value = revision.get("aged_futures_fastpath")
+    if value is None:
+        return {"enabled": False}
+    if not isinstance(value, dict) or set(value) != set(AGED_REVISION_FASTPATH):
+        raise ValueError("invalid aged revision profile")
+    for key, expected in AGED_REVISION_FASTPATH.items():
+        if isinstance(expected, bool):
+            valid = type(value[key]) is bool and value[key] is expected
+        else:
+            valid = not isinstance(value[key], bool) and value[key] == expected
+        if not valid:
+            raise ValueError("unsupported aged revision profile")
+    engineering = engineering_profile(policy)
+    if (engineering["profile"] != V12_PROFILE_ID
+            or engineering["input_deadline_after_boundary_seconds"] != 14):
+        raise ValueError("aged revision requires bounded opportunity profile")
+    return deepcopy(value)
+
 
 def engineering_profile(policy):
     """Legacy policies stay legacy; explicitly enabled profiles fail closed."""

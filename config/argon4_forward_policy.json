@@ -1,6 +1,6 @@
 {
   "status": "CONFIRMED",
-  "version": "argon4-local311-independent65-20261107-v12r1",
+  "version": "argon4-local311-independent65-20261107-v13r2",
   "venue": "polymarket",
   "ranking_source": "USER_CONFIRMED_STAGE2_LOCAL_FROZEN_RAW_WIN_RATE; same saved local models; historical research evidence remains exploratory",
   "ranking_label": "第二阶段：本地原始胜率 BTC15 → ETH5 → SOL15 → SOL5 → BTC5",
@@ -142,9 +142,9 @@
     "SOL_5m": "d024c28dbb773a6470b132cbc1ebd152ebdb706d0db8ee3047487493b3f4f822",
     "BNB_15m": "366484e02b2552e3acd095310b381d216b6f2016a39bd2fe001b1aad3660118f"
   },
-  "min_decision_delay_seconds": 2.5,
+  "min_decision_delay_seconds": 4.0,
   "input_revision_policy": {
-    "scope": "OBSERVED_FUTURES_5M_AND_MARK_1H_VIEWS_ONLY",
+    "scope": "OBSERVED_FUTURES_5M_1H_AND_MARK_1H_VIEWS_ONLY",
     "confirming_receipts": 2,
     "minimum_receipt_spacing_seconds": 60,
     "archive_old_view": true,
@@ -152,14 +152,21 @@
     "future_windows_only": true,
     "funding_cashflows_modified": false,
     "mark_registry_publication_required": true,
-    "skip_effective_cohort": true
+    "skip_effective_cohort": true,
+    "aged_futures_fastpath": {
+      "profile": "argon4-aged-revision-v13",
+      "enabled": true,
+      "minimum_bar_age_seconds": 300,
+      "minimum_receipt_spacing_seconds": 2.0,
+      "same_cohort_before_prediction_only": true
+    }
   },
   "waterfall_semantics": "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1",
-  "previous_execution_version": "argon4-local311-independent65-20261107-v12",
-  "execution_change_authorized_at": "2026-11-07T07:11:56.924576+00:00",
-  "execution_change_note": "Authorized v12 future-only paper: earliest +2.5s, 0.2s critical polling, latest-5m-publication-only input retries within +14s, same-score bounded multi-look IOC within +20s, center-dispatched explicitly classified telemetry, unchanged paid-risk accounting. User confirmed Stage2 local raw-win-rate order BTC15/ETH5/SOL15/SOL5/BTC5. Ask-price 0.515 and all capital caps unchanged. Models/thresholds unchanged. No historical orders or live execution.; v12r1：修订完成后的未来窗口等待也使用关键窗口0.2秒轮询；保留最低等待、模型、排序、价格和资金限制。",
+  "previous_execution_version": "argon4-local311-independent65-20261107-v13r1",
+  "execution_change_authorized_at": "2026-11-07T11:29:43.444766+00:00",
+  "execution_change_note": "v13 user-authorized paper input repair: earliest +4s; aged futures 5m only, two independent same-clock current-cohort receipts with second request >= first receipt +2s, preserved archives and same-cohort admission only before any decision and within +14s; fresh all-input validation before scoring; legacy 60s maintenance remains fallback after abandoning current execution. Restart/recovery never inherits same-cohort admission. Clock may add two budgeted samples outside critical window while retaining 0.5s hard bound. Five-stream order, saved models/thresholds, 0.515 ask cap and capital caps unchanged. Eleven-stream research remains separate. No backfill or live orders. v13r1 fixes observed cold-start blockers: immutable calibrated warmup epoch, lower-bound cutoff and <=30s/TTL-1 budget with all diagnostics retained; completed warmup cohort is skipped. Legacy observed futures 1h price corrections use the existing 60s confirmation/archive/future-only path, never the 5m fast path. v13r2 adds bounded window-external maintenance after failed input validation; at most two attempts in T+70..180, legacy 60-second independent confirmation, fresh frozen calibrated clock per attempt, durable attempt claims, future-window-only publication. No scoring, execution, historical replay or threshold/risk changes.",
   "execution_stage": {
-    "id": "stage2-local-winrate-v12r1-20261107",
+    "id": "stage2-local-winrate-v13r2-20261107",
     "status": "CONFIRMED",
     "enabled_streams": [
       "BTC_15m",
@@ -168,7 +175,7 @@
       "SOL_5m",
       "BTC_5m"
     ],
-    "effective_from": "2026-11-07T08:20:00+00:00"
+    "effective_from": "2026-11-07T11:40:00+00:00"
   },
   "previous_local_winrate_ranking": {
     "version": "argon4-local311-independent65-20261106-v5",
@@ -250,7 +257,7 @@
     "last_recheck_start_after_boundary_seconds": 18.5
   },
   "previous_execution_stage": {
-    "id": "stage2-local-winrate-v12-20261107",
+    "id": "stage2-local-winrate-v12r1-20261107",
     "status": "CONFIRMED",
     "enabled_streams": [
       "BTC_15m",
@@ -259,6 +266,6 @@
       "SOL_5m",
       "BTC_5m"
     ],
-    "effective_from": "2026-11-07T07:20:00+00:00"
+    "effective_from": "2026-11-07T08:20:00+00:00"
   }
 }
