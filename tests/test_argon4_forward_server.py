@@ -11,6 +11,42 @@ from tools.argon4_forward.monitor import ObservationStore, public_get
 from tools.argon4_forward import monitor
 
 
+def test_duplicate_listener_fails_before_creating_account(tmp_path, monkeypatch):
+    from scripts import argon4_forward_server as server_module
+    monkeypatch.setattr(server_module, "ROOT", tmp_path)
+    monkeypatch.setattr(server_module.sys, "argv", ["argon4_forward_server.py", "--runtime-dir",
+        str(tmp_path / "paper_runtime/test"), "--enable-paper"])
+    def occupied(*args, **kwargs):
+        raise OSError("address already in use")
+    monkeypatch.setattr(server_module, "ThreadingHTTPServer", occupied)
+    monkeypatch.setattr(server_module, "Application", lambda *args, **kwargs: pytest.fail("duplicate process touched account"))
+    with pytest.raises(OSError, match="address already in use"):
+        server_module.main()
+    assert not (tmp_path / "paper_runtime").exists()
+
+
+def test_invalid_engineering_cannot_report_stale_active_status(tmp_path, monkeypatch):
+    from scripts import argon4_forward_server as server_module
+    app = Application(tmp_path / "run", enable_paper=True)
+    original = server_module.load_json
+    def invalid(path, default):
+        value = original(path, default)
+        if path.name == "argon4_forward_policy.json":
+            value["engineering"] = {"profile": "invalid"}
+        return value
+    monkeypatch.setattr(server_module, "load_json", invalid)
+    app.pipeline.state["active"] = True
+    try:
+        status = app.status()
+        assert status["paper_trading_active"] is False
+        assert status["engineering"]["profile"] == "INVALID"
+    finally:
+        app.pipeline.close()
+        app.market_transport.close()
+        if app.telemetry:
+            app.telemetry.close()
+
+
 def test_initial_account_is_new_and_no_order_adapter(tmp_path):
     app = Application(tmp_path / "run")
     status = app.status()

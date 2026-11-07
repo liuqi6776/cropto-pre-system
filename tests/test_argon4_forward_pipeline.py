@@ -46,6 +46,89 @@ def test_save_json_preserves_mtime_only_when_serialized_content_is_unchanged(tmp
     assert not path.with_suffix(".tmp").exists()
 
 
+def test_v11_uses_one_snapshot_for_exact_saved_predictions_and_budgeted_inputs(harness, monkeypatch):
+    from tools.argon4_forward import online, feature_cache
+    from tools.argon4_forward.runtime_profile import V11_ENGINEERING
+    h = harness
+    enable_v5(h)
+    h.policy["engineering"] = deepcopy(V11_ENGINEERING)
+    h.policy_path.write_text(json.dumps(h.policy))
+    captured = []
+    old_refresh = online.OnlineInputs.refresh
+    def budgeted(self, now=None, **kwargs):
+        captured.append(kwargs)
+        return old_refresh(self, now)
+    monkeypatch.setattr(online.OnlineInputs, "refresh", budgeted)
+    snapshots = []
+    class Snapshot:
+        def __init__(self, root, *, as_of, expected_sources):
+            self.root, self.cutoff = root, as_of
+            self.builds, self.closed = [], False
+            snapshots.append(self)
+        def build(self, symbol, tail_rows):
+            self.builds.append(symbol)
+            return model.build_feature_frames(self.root, symbol, as_of=self.cutoff, tail_rows=tail_rows)
+        @property
+        def stats(self):
+            return {"symbols": self.builds[:]}
+        def close(self):
+            self.closed = True
+    monkeypatch.setattr(feature_cache, "FeatureSnapshot", Snapshot)
+    before = time.monotonic()
+    h.p.cycle()
+    assert len(captured) == 1
+    assert captured[0]["cohort_id"] == BOUNDARY.isoformat()
+    assert before+6.5 < captured[0]["deadline_monotonic"] < time.monotonic()+7.1
+    assert len(snapshots) == 1 and snapshots[0].closed
+    assert len(snapshots[0].builds) == len(set(snapshots[0].builds)) == 4
+    assert h.p.status()["status"] == "PAPER_CYCLE_COMPLETE"
+    for stream, decision in h.p.status()["decisions"].items():
+        assert decision["prediction"]["z_v4"] == pytest.approx(h.trained.scores[stream]["score"], abs=1e-12)
+    assert h.account.overview()["live_enabled"] is False
+
+
+def test_v11_deadline_failure_never_scores_or_replays_same_cohort(harness, monkeypatch):
+    from tools.argon4_forward import online
+    from tools.argon4_forward.runtime_profile import V11_ENGINEERING
+    h = harness
+    h.policy["engineering"] = deepcopy(V11_ENGINEERING)
+    h.policy_path.write_text(json.dumps(h.policy))
+    calls = []
+    def late(self, now=None, **kwargs):
+        calls.append(kwargs)
+        return {"status": "BLOCKED", "errors": [{"source": "batch", "error": "INPUT_DEADLINE_EXCEEDED"}]}
+    monkeypatch.setattr(online.OnlineInputs, "refresh", late)
+    h.p.cycle()
+    h.p.cycle()
+    assert len(calls) == 1
+    assert h.state.feature_calls == []
+    assert h.account.overview()["order_count"] == 0
+    assert "时间预算" in h.p.status()["reason"]
+
+
+def test_v11_prefetch_is_before_boundary_once_and_never_executes(harness, monkeypatch):
+    from tools.argon4_forward import online
+    from tools.argon4_forward.runtime_profile import V11_ENGINEERING
+    h = harness
+    h.policy["engineering"] = deepcopy(V11_ENGINEERING)
+    h.policy_path.write_text(json.dumps(h.policy))
+    h.state.upper = BOUNDARY+timedelta(seconds=292)
+    calls = []
+    def prefetch(self, now=None, **kwargs):
+        calls.append((now, kwargs))
+        return {"status": "PREFETCH_COMPLETE", "cohort_id": kwargs["cohort_id"]}
+    monkeypatch.setattr(online.OnlineInputs, "prefetch_auxiliary", prefetch, raising=False)
+    before = time.monotonic()
+    h.p.cycle()
+    h.p.cycle()
+    assert len(calls) == 1
+    assert calls[0][0] < BOUNDARY+timedelta(minutes=5)
+    assert calls[0][1]["cohort_id"] == "prefetch:"+(BOUNDARY+timedelta(minutes=5)).isoformat()
+    assert before+2.5 < calls[0][1]["deadline_monotonic"] <= time.monotonic()+3
+    assert h.state.refreshes == 0 and h.state.feature_calls == []
+    assert h.account.overview()["order_count"] == 0
+
+
 @pytest.fixture(autouse=True)
 def forbid_network(monkeypatch):
     import requests
@@ -496,11 +579,12 @@ def test_committed_revision_skips_current_cohort_and_only_refreshes_next_window(
     from tools.argon4_forward import revisions
     h = harness
     reconciliations = []
-    def reconcile(runtime, errors, now):
+    def reconcile(runtime, errors, now, *, cutover_now):
         assert h.p.inputs._lock._is_owned()
         assert runtime == h.p.runtime
         assert errors == h.state.input_errors
         assert now() == h.state.upper
+        assert cutover_now() == h.state.upper
         reconciliations.append(deepcopy(errors))
         return {"status": "COMMITTED", "revision_id": "offline-fixture-revision"}
     monkeypatch.setattr(revisions, "reconcile_confirmed_price_revisions", reconcile)
@@ -563,6 +647,7 @@ def test_revision_reconciliation_supplies_explicit_registry_only_for_mark(harnes
         assert runtime == h.p.runtime and actual_errors == errors and now() == h.state.upper
         expected = ({"mark_registry_path": pipeline.ROOT / "archive/catalog/mark_candle_registry.json"}
                     if source.startswith("mark:") else {})
+        expected["cutover_now"] = h.p.revision_cutover_now
         assert kwargs == expected
         return {"status": "WAITING_CONFIRMATION"}
     monkeypatch.setattr(revisions, "reconcile_confirmed_price_revisions", reconcile)

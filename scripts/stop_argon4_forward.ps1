@@ -1,11 +1,22 @@
 $ErrorActionPreference = 'Stop'
 $workspacePath = Split-Path -Parent $PSScriptRoot
-$statePath = Join-Path $workspacePath 'paper_runtime\argon4_forward_20261105\service.json'
-if (-not (Test-Path -LiteralPath $statePath)) { Write-Output 'No service state.'; exit 0 }
-$serviceState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-$serviceProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($serviceState.pid)" -ErrorAction SilentlyContinue
-if (-not $serviceProcess) { Write-Output 'Already stopped.'; exit 0 }
 $expectedScript = Join-Path $PSScriptRoot 'argon4_forward_server.py'
-if (-not $serviceProcess.CommandLine.Contains($expectedScript)) { throw 'PID identity mismatch; refusing to stop another process.' }
-Stop-Process -Id $serviceState.pid
+$escapedScript = [regex]::Escape($expectedScript)
+$scriptArgument = '(?i)(?:^|[\s"])' + $escapedScript + '(?:[\s"]|$)'
+# A failed legacy duplicate launch could overwrite service.json with a dead
+# PID. Resolve only Python processes with this exact absolute script argument.
+$matchingProcesses = @(Get-CimInstance Win32_Process | Where-Object {
+    ($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and
+    $_.CommandLine -and $_.CommandLine -match $scriptArgument
+})
+if ($matchingProcesses.Count -eq 0) { Write-Output 'Already stopped.'; exit 0 }
+$matchingIds = @($matchingProcesses | ForEach-Object { $_.ProcessId })
+# Stop worker children before the venv launcher; never touch unrelated Python.
+$orderedProcesses = @($matchingProcesses | Sort-Object @{Expression={if ($matchingIds -contains $_.ParentProcessId) {0} else {1}}})
+foreach ($serviceProcess in $orderedProcesses) {
+    $current = Get-CimInstance Win32_Process -Filter "ProcessId=$($serviceProcess.ProcessId)" -ErrorAction SilentlyContinue
+    if ($current -and $current.CreationDate -eq $serviceProcess.CreationDate -and $current.CommandLine -match $scriptArgument) {
+        Stop-Process -Id $current.ProcessId -ErrorAction Stop
+    }
+}
 Write-Output 'Paper observation stopped. Account records retained.'

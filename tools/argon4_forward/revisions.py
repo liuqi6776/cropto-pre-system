@@ -8,12 +8,14 @@ archived view, never the current view before its recorded effective time.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import threading
@@ -127,6 +129,10 @@ def ensure_view_committed(runtime):
         if evidence.get("mark_registry_update"):
             from .mark_revision_registry import verify_registry_archive
             verify_registry_archive(folder, evidence["mark_registry_update"])
+        if evidence.get("recovery_validation_file"):
+            recovery = folder / evidence["recovery_validation_file"]
+            if recovery.resolve().parent != folder or recovery.is_symlink() or _sha(recovery) != evidence["recovery_validation_sha256"]:
+                raise ValueError(SAFE_ERROR)
         _time(state["view_effective_at"])
         return state
     except (OSError, ValueError, KeyError, TypeError):
@@ -269,8 +275,10 @@ def _public_receipt(receipt):
     return {k: v for k, v in receipt.items() if k != "numbers"}
 
 
-def _plans(runtime, sources, now):
+def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_override=None):
     _, features, raw_root, _ = _paths(runtime)
+    raw_root = Path(raw_root_override) if raw_root_override is not None else raw_root
+    receipts_path = Path(receipts_path_override) if receipts_path_override is not None else features / "http_receipts.sqlite3"
     plans, pending = [], []
     for kind, symbol, interval in sources:
         spec = REVISION_SPECS[(kind, interval)]
@@ -278,7 +286,7 @@ def _plans(runtime, sources, now):
         path = raw_root / spec["directory"] / f"{symbol}_{interval}_{kind}.parquet"
         old = _read_cache(path, spec["step_ms"])
         opens = (pd.to_datetime(old.date, utc=True).astype("int64") // 1_000_000).tolist()
-        evidence = _receipts(features / "http_receipts.sqlite3", symbol, now, opens, kind, interval)
+        evidence = _receipts(receipts_path, symbol, now, opens, kind, interval)
         updated, changes = old.copy(deep=True), []
         seen = False
         for index, opened in zip(old.index, opens):
@@ -387,7 +395,218 @@ def _disk_budget(runtime, raw_root, before_files, plans):
             "proposed_and_temporary_bytes": proposed_bytes, "reserve_bytes": reserve}
 
 
-def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_registry_path=None):
+def _audit_sqlite_backup(source, snapshot):
+    """Read-only proof that an archived database is an intact live prefix."""
+    if not source.is_file() or not snapshot.is_file() or source.is_symlink() or snapshot.is_symlink():
+        raise ValueError("RECOVERY_SQLITE_BACKUP_MISSING_OR_SYMLINK")
+    counts = {}
+    with sqlite3.connect(snapshot.as_uri()+"?mode=ro", uri=True) as archived, \
+            sqlite3.connect(source.as_uri()+"?mode=ro", uri=True) as current:
+        if archived.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise ValueError("RECOVERY_SQLITE_CORRUPT")
+        schemas = dict(archived.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+        live_schemas = dict(current.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+        if not schemas or schemas != live_schemas:
+            raise ValueError("RECOVERY_SQLITE_SCHEMA_MISMATCH")
+        if snapshot.name == "receipts.sqlite3":
+            columns = {row[1] for row in archived.execute("PRAGMA table_info(receipts)")}
+            if not {"id", "url", "requested_at", "received_at", "sha256", "http_status", "raw",
+                    "time_basis", "clock_evidence_sha256"}.issubset(columns):
+                raise ValueError("RECOVERY_SQLITE_RECEIPT_SCHEMA")
+        for name in schemas:
+            # Only known append-only observation tables are recoverable. A
+            # backoff table is mutable; validate its schema/integrity but never
+            # treat it as an observation prefix or restore it into the live DB.
+            if name == "backoff" and snapshot.name == "receipts.sqlite3":
+                continue
+            if name not in ("receipts", "snapshots", "decisions"):
+                raise ValueError("RECOVERY_SQLITE_UNSUPPORTED_TABLE")
+            primary = [row[1] for row in archived.execute('PRAGMA table_info("'+name+'")') if row[5]]
+            if primary != ["id"]:
+                raise ValueError("RECOVERY_SQLITE_PRIMARY_KEY")
+            maximum = archived.execute('SELECT MAX(id) FROM "'+name+'"').fetchone()[0]
+            old_rows = archived.execute('SELECT * FROM "'+name+'" ORDER BY id')
+            live_rows = current.execute('SELECT * FROM "'+name+'" WHERE id<=? ORDER BY id', (maximum,))
+            count = 0
+            while True:
+                old_part, live_part = old_rows.fetchmany(128), live_rows.fetchmany(128)
+                if old_part != live_part:
+                    raise ValueError("RECOVERY_SQLITE_OBSERVATION_PREFIX_MISMATCH")
+                count += len(old_part)
+                if not old_part:
+                    break
+            counts[name] = count
+    return {"source_path": str(source), "snapshot_path": str(snapshot), "sha256": _sha(snapshot),
+            "verified_append_only_prefix_rows": counts}
+
+
+def _recovery_registry_receipt(registry_path, raw_root, plans, after_files, archive):
+    """Reconstruct exactly the existing registry proposal without writing it."""
+    from .mark_revision_registry import ENDPOINT, ROOT, SNAPSHOTS, _frame_metadata, verify_registry_archive
+    selected = [p for p in plans if p["kind"] == "mark"]
+    if not selected:
+        if any((archive / name).exists() for name in SNAPSHOTS):
+            raise ValueError("RECOVERY_UNEXPECTED_MARK_REGISTRY")
+        return None
+    if registry_path is None:
+        raise ValueError("MARK_REGISTRY_REQUIRED")
+    registry = Path(registry_path).resolve()
+    if not registry.is_file() or registry.is_symlink() or registry.is_relative_to(archive):
+        raise ValueError("RECOVERY_MARK_REGISTRY_PATH")
+    before_path, proposed_path = [archive / name for name in SNAPSHOTS]
+    if before_path.is_symlink() or proposed_path.is_symlink():
+        raise ValueError("RECOVERY_MARK_REGISTRY_ARCHIVE_SYMLINK")
+    before, proposed = [json.loads(path.read_text(encoding="utf-8")) for path in (before_path, proposed_path)]
+    expected = deepcopy(before)
+    entries = expected.get("research_references")
+    if not isinstance(entries, list) or any(not isinstance(e, dict) for e in entries):
+        raise ValueError("RECOVERY_MARK_REGISTRY_SCHEMA")
+    updates = []
+    for plan in selected:
+        symbol, relative = plan["symbol"], plan["relative_path"]
+        target = (raw_root / relative).resolve()
+        matches = [e for e in entries if isinstance(e.get("local_path"), str) and
+                   (Path(e["local_path"]) if Path(e["local_path"]).is_absolute() else ROOT / e["local_path"]).resolve() == target]
+        if len(matches) != 1:
+            raise ValueError("RECOVERY_MARK_REGISTRY_IDENTITY")
+        entry = matches[0]
+        identifier = entry.get("dataset_id")
+        if (not isinstance(identifier, str) or re.fullmatch("argon4_local_v4_online_mark_"+symbol+r"_\d{8}", identifier) is None
+                or sum(e.get("dataset_id") == identifier for e in entries) != 1
+                or entry.get("pair") != symbol[:-4]+"/USDT:USDT" or entry.get("timeframe") != "1h"
+                or entry.get("candle_type") != "mark" or entry.get("source_endpoint") != ENDPOINT
+                or entry.get("verification_status") != "VERIFIED_PERPETUAL_LABEL"
+                or entry.get("installed") is not False or entry.get("research_only") is not True
+                or entry.get("gate_effect") != "NONE" or entry.get("sha256") != plan["before_sha256"]):
+            raise ValueError("RECOVERY_MARK_REGISTRY_IDENTITY")
+        after = after_files[relative]
+        entry.update(_frame_metadata(plan["frame"]), sha256=after)
+        entry["revision_provenance"] = {"revision_id": archive.name, "manifest_path": str(archive / "manifest.json"),
+            "before_sha256": plan["before_sha256"], "after_sha256": after, "source_endpoint": ENDPOINT,
+            "future_cohorts_only": True, "confirmation_policy": "TWO_INDEPENDENT_MATCHING_RAW_RECEIPTS_AT_LEAST_60_SECONDS_APART"}
+        updates.append({"dataset_id": identifier, "symbol": symbol, "relative_path": relative,
+                        "before_sha256": plan["before_sha256"], "after_sha256": after})
+    if expected != proposed or _sha(registry) != _sha(proposed_path):
+        raise ValueError("RECOVERY_MARK_REGISTRY_NOT_EXACT_PROPOSAL")
+    receipt = {"schema_version": 1, "registry_path": str(registry), "archive_path": str(archive),
+               "before_sha256": _sha(before_path), "after_sha256": _sha(proposed_path),
+               "before_snapshot": SNAPSHOTS[0], "proposed_snapshot": SNAPSHOTS[1],
+               "updates": updates, "canonical_entries_modified": False}
+    verify_registry_archive(archive, receipt)
+    return receipt
+
+
+def recover_prepared_price_revision(runtime, *, mark_registry_path=None, cutover_now=None, apply=False):
+    """Finish only a fully applied, evidence-matched PREPARED cutover.
+
+    The caller must stop the managed writer. Default operation is read-only.
+    No raw file, registry, receipt, decision or order is replaced. Every partial
+    cutover is refused; the original archive remains immutable. Applying needs
+    a fresh calibrated-time callback invoked AFTER lengthy evidence checks.
+    """
+    if not _RECOVERY_LOCK.acquire(blocking=False):
+        return {"status": "BLOCKED", "reason": "REVISION_RECOVERY_BUSY"}
+    archive = None
+    try:
+        runtime, features, raw_root, revisions = _paths(runtime)
+        marker_path = revisions / "view_state.json"
+        marker_bytes = marker_path.read_bytes()
+        marker = json.loads(marker_bytes)
+        if marker.get("status") == "COMMITTED":
+            return {**ensure_view_committed(runtime), "recovery_action": "NONE_ALREADY_COMMITTED"}
+        if marker.get("status") != "PREPARED" or marker.get("schema_version") != 1:
+            raise ValueError("RECOVERY_NOT_PREPARED")
+        archive = (revisions / marker["revision_id"]).resolve()
+        if archive.parent != revisions.resolve() or archive.is_symlink() or (archive / "manifest.json").exists():
+            raise ValueError("RECOVERY_ARCHIVE_OR_MANIFEST_AMBIGUOUS")
+        prepared_path = archive / "prepared.json"
+        if prepared_path.is_symlink():
+            raise ValueError("RECOVERY_PREPARED_SYMLINK")
+        prepared_bytes = prepared_path.read_bytes()
+        prepared = json.loads(prepared_bytes)
+        if (prepared.get("status") != "PREPARED" or prepared.get("schema_version") != 1
+                or prepared.get("revision_id") != marker["revision_id"]
+                or prepared.get("validation_at") != marker.get("validation_at")
+                or Path(prepared["data_root"]).resolve() != raw_root
+                or Path(prepared["archive_path"]).resolve() != archive
+                or prepared.get("current_cohort_must_be_skipped") is not True
+                or prepared.get("next_cohort_requires_fresh_validation") is not True):
+            raise ValueError("RECOVERY_PREPARED_IDENTITY")
+        validation_at = _time(prepared["validation_at"])
+        if _inventory(archive / "raw_data") != prepared["before_files"]:
+            raise ValueError("RECOVERY_BEFORE_ARCHIVE_HASH_MISMATCH")
+        changes = prepared["changes"]
+        sources = _error_sources([{"source": f"{c['kind']}:{c['symbol']}:{c['interval']}",
+                                   "error": "CONFLICTING_CLOSED_OBSERVATION"} for c in changes])
+        if not sources:
+            raise ValueError("RECOVERY_NO_SUPPORTED_CHANGES")
+        backups = [_audit_sqlite_backup(features / "http_receipts.sqlite3", archive / "receipts.sqlite3"),
+                   _audit_sqlite_backup(runtime / "observations.sqlite3", archive / "observations.sqlite3")]
+        plans, pending = _plans(runtime, sources, validation_at, raw_root_override=archive / "raw_data",
+                                receipts_path_override=archive / "receipts.sqlite3")
+        if pending or [c for plan in plans for c in plan["changes"]] != changes:
+            raise ValueError("RECOVERY_RECEIPT_PROOF_DOES_NOT_REPRODUCE_PLAN")
+        proposed = _inventory(archive / "proposed_raw_data")
+        if set(proposed) != {plan["relative_path"] for plan in plans}:
+            raise ValueError("RECOVERY_PROPOSED_FILE_SET")
+        after_files = dict(prepared["before_files"])
+        for plan in plans:
+            relative = plan["relative_path"]
+            proposed_frame = pd.read_parquet(archive / "proposed_raw_data" / relative)
+            pd.testing.assert_frame_equal(plan["frame"], proposed_frame, check_exact=True)
+            fields = list(PRICE_FIELDS.values())
+            if not np.array_equal(plan["frame"][fields].to_numpy(dtype=np.float64).view(np.uint64),
+                                  proposed_frame[fields].to_numpy(dtype=np.float64).view(np.uint64)):
+                raise ValueError("RECOVERY_PROPOSED_PRICE_BITS_DIFFER_FROM_RECEIPTS")
+            after_files[relative] = proposed[relative]
+        if _inventory(raw_root) != after_files:
+            raise ValueError("RECOVERY_CURRENT_VIEW_NOT_FULLY_APPLIED_PROPOSAL")
+        registry_update = _recovery_registry_receipt(mark_registry_path, raw_root, plans, after_files, archive)
+        result = {"status": "VERIFIED_PREPARED_CUTOVER", "revision_id": archive.name,
+                  "archive_path": str(archive), "prepared_sha256": hashlib.sha256(prepared_bytes).hexdigest(),
+                  "after_files": after_files, "sqlite_backups": backups, "mark_registry_update": registry_update,
+                  "current_cohort_must_be_skipped": True, "next_cohort_requires_fresh_validation": True,
+                  "raw_registry_and_observations_modified": False}
+        if not apply:
+            return result
+        if not callable(cutover_now):
+            raise ValueError("RECOVERY_FRESH_CUTOVER_CLOCK_CALLBACK_REQUIRED")
+        # Revalidate publication identities before obtaining fresh time; no
+        # historical effective time is inferred from the interrupted attempt.
+        if marker_path.read_bytes() != marker_bytes or prepared_path.read_bytes() != prepared_bytes:
+            raise ValueError("RECOVERY_EVIDENCE_CHANGED")
+        if _inventory(raw_root) != after_files:
+            raise ValueError("RECOVERY_CURRENT_VIEW_CHANGED")
+        if registry_update and _sha(Path(registry_update["registry_path"])) != registry_update["after_sha256"]:
+            raise ValueError("RECOVERY_MARK_REGISTRY_CHANGED")
+        effective_at = _now(cutover_now)
+        if effective_at < validation_at:
+            raise ValueError("CLOCK_REVERSED_DURING_RECOVERY")
+        recovery_name = "recovery_validation_"+uuid.uuid4().hex+".json"
+        _new_json(archive / recovery_name, {**result, "view_effective_at": effective_at.isoformat(),
+                  "recovery_policy": "FINISH_EXACTLY_APPLIED_PROPOSAL_AT_FRESH_TIME_NO_RETROACTIVE_USE"})
+        manifest = {**prepared, "status": "COMMITTED", "view_effective_at": effective_at.isoformat(),
+                    "after_files": after_files, "sqlite_backups": backups, "mark_registry_update": registry_update,
+                    "prepared_sha256": result["prepared_sha256"],
+                    "cutover_clock_mode": "FRESH_CALIBRATED_PREPARED_RECOVERY_CALLBACK",
+                    "working_view_for_future_cohorts_only": True,
+                    "current_view_must_not_replay_as_of_before": effective_at.isoformat(),
+                    "recovery_validation_file": recovery_name,
+                    "recovery_validation_sha256": _sha(archive / recovery_name)}
+        _new_json(archive / "manifest.json", manifest)
+        committed = {"schema_version": 1, "status": "COMMITTED", "revision_id": archive.name,
+                     "view_effective_at": effective_at.isoformat(), "manifest_sha256": _sha(archive / "manifest.json")}
+        _atomic_json(marker_path, committed)
+        return {**result, **committed, "manifest_path": str(archive / "manifest.json")}
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, AssertionError) as exc:
+        return {"status": "BLOCKED", "reason": str(exc) if isinstance(exc, ValueError) else type(exc).__name__,
+                "archive_path": str(archive) if archive else None}
+    finally:
+        _RECOVERY_LOCK.release()
+
+
+def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_registry_path=None,
+                                       cutover_now=None):
     """All-or-nothing *validation*, followed by an audited, crash-gated cutover.
 
     Returns COMMITTED / WAITING_CONFIRMATION / NO_CHANGE / BLOCKED. PREPARED
@@ -473,7 +692,7 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
             from .mark_revision_registry import publish_registry_update
             publish_registry_update(mark_registry_update)
         # This is the actual view cutover time, not the time copying started.
-        effective_at = (_now(now) if callable(now) else
+        effective_at = (_now(cutover_now) if cutover_now is not None else _now(now) if callable(now) else
                         validation_at + pd.Timedelta(seconds=time.monotonic()-validation_monotonic))
         if effective_at < validation_at:
             raise ValueError("CLOCK_REVERSED_DURING_RECOVERY")
@@ -481,7 +700,8 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
                     "after_files": after_files, "sqlite_backups": backups,
                     "mark_registry_update": mark_registry_update,
                     "prepared_sha256": _sha(archive / "prepared.json"),
-                    "cutover_clock_mode": "CALLABLE_CURRENT_UTC" if callable(now) else "PROVIDED_UTC_PLUS_MONOTONIC_ELAPSED",
+                    "cutover_clock_mode": ("FRESH_CALIBRATED_CUTOVER_CALLBACK" if cutover_now is not None else
+                                           "CALLABLE_CURRENT_UTC" if callable(now) else "PROVIDED_UTC_PLUS_MONOTONIC_ELAPSED"),
                     "working_view_for_future_cohorts_only": True,
                     "current_view_must_not_replay_as_of_before": effective_at.isoformat()}
         _new_json(archive / "manifest.json", manifest)

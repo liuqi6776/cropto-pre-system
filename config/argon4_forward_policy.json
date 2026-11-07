@@ -1,6 +1,6 @@
 {
   "status": "CONFIRMED",
-  "version": "argon4-local311-independent65-20261106-v10",
+  "version": "argon4-local311-independent65-20261106-v11",
   "venue": "polymarket",
   "ranking_source": "USER_EXPLICIT_STAGE1_CAPITAL_PRIORITY; user confirmed ETH_5m > BTC_15m > BTC_5m; remaining four disabled; historical win-rate evidence retained only as context",
   "ranking_label": "第一阶段：用户指定资金顺序 ETH5 → BTC15 → BTC5",
@@ -155,9 +155,9 @@
     "skip_effective_cohort": true
   },
   "waterfall_semantics": "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1",
-  "previous_execution_version": "argon4-local311-independent65-20261106-v9",
-  "execution_change_authorized_at": "2026-11-06T15:33:06+00:00",
-  "execution_change_note": "User-authorized public client latency optimization: isolated reusable observer/execution connections and exact missing/stale metadata recovery only for reached valid signals. After the observed v9 15:25 UTC missed window, keep six-sample calibration and regular 40s refresh, but allow pre-window refresh when clock age exceeds 20s and the next 5m boundary is within 10s. All 60s clock validity, uncertainty, 2s book and 20s cohort guards remain. Retain taker IOC paper with official fees; unchanged models, thresholds, ETH5/BTC15/BTC5 order, 0.515 limit, risk caps, 0.25s input spacing and no historical replay. No SDK installed or real orders enabled.",
+  "previous_execution_version": "argon4-local311-independent65-20261106-v10",
+  "execution_change_authorized_at": "2026-11-07T05:18:51.658328+00:00",
+  "execution_change_note": "Authorized v11 engineering only: bounded parallel public input deadlines, immutable full-history cohort feature snapshots and compile cache, conservative auxiliary prefetch, separate proactive dual-side book telemetry. Models, thresholds, stream order, 0.515, capital limits, min +5s and +20s IOC cutoff unchanged. No historical orders or live order capability.",
   "execution_stage": {
     "id": "stage1-eth5-btc15-btc5-20261106",
     "status": "CONFIRMED",
@@ -227,5 +227,14 @@
       }
     ]
   },
-  "input_http_min_spacing_seconds": 0.25
+  "input_http_min_spacing_seconds": 0.25,
+  "engineering": {
+    "profile": "argon4-latency-v11",
+    "input_deadline_after_boundary_seconds": 14.0,
+    "feature_snapshot_cache": true,
+    "auxiliary_prefetch": true,
+    "prefetch_lead_seconds": 10.0,
+    "prefetch_budget_seconds": 3.0,
+    "book_telemetry": true
+  }
 }

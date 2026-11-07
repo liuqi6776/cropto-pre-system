@@ -20,6 +20,8 @@ sys.path.insert(0, str(ROOT))
 from tools.argon4_forward.account import Account
 from tools.argon4_forward.monitor import ObservationStore, collect_reference_snapshot, utcnow
 from tools.argon4_forward.stage import stage_profile, StageRejected, DISABLED
+from tools.argon4_forward.runtime_profile import engineering_profile
+from tools.argon4_forward.live_preflight import preparation_status
 
 STREAMS = ["BTC_15m", "ETH_5m", "SOL_15m", "ETH_15m", "SOL_5m", "BTC_5m", "BNB_15m"]
 BLOCKERS = [
@@ -52,9 +54,17 @@ class Application:
         from tools.argon4_forward.polymarket_transport import PublicPolymarketTransport
         self.market_transport = PublicPolymarketTransport(pool_size=4)
         self.pipeline = None
+        self.telemetry = None
         if enable_paper:
             from tools.argon4_forward.pipeline import ForwardPipeline
             self.pipeline = ForwardPipeline(self.account, self.runtime, self.observations)
+            policy_provider = lambda: load_json(ROOT / "config/argon4_forward_policy.json", {})
+            if engineering_profile(policy_provider())["book_telemetry"]:
+                from tools.argon4_forward.book_telemetry import BookTelemetry
+                self.telemetry = BookTelemetry(self.runtime, policy_provider=policy_provider,
+                    market_provider=lambda: self.observations.latest("polymarket"),
+                    clock_provider=lambda: dict(self.pipeline.clock or {}),
+                    decision_provider=self.pipeline.status)
         self.account.heartbeat("WAITING_FOR_MODEL", BLOCKERS[0]["message"])
 
     def status(self):
@@ -67,13 +77,21 @@ class Application:
                     if self.pipeline and pipeline.get("reason") else ([] if pipeline.get("active") else BLOCKERS))
         try:
             stage = stage_profile(allocation)
+            engineering = engineering_profile(allocation)
+            live_preparation = preparation_status(allocation, live)
         except StageRejected:
             stage = {"configured": True, "status": "INVALID", "enabled_streams": [],
                      "disabled_streams": list(STREAMS), "live_enabled": False}
             blockers = [{"code": "INVALID_EXECUTION_STAGE", "message": "阶段配置未通过检查，暂停新模拟单"}]
+            engineering = {"enabled": False, "profile": "INVALID"}
+            live_preparation = {"ready_for_live": False, "configuration_safe": False}
+        except ValueError:
+            engineering = {"enabled": False, "profile": "INVALID"}
+            live_preparation = {"ready_for_live": False, "configuration_safe": False}
+            blockers = [{"code": "INVALID_ENGINEERING_PROFILE", "message": "采集配置未通过检查，暂停新模拟单"}]
         return {"schema_version": 1, "now": utcnow(), "service_started_at": self.started_at,
                 "service_status": pipeline["status"] if self.pipeline else "OBSERVING_ONLY",
-                "paper_trading_active": pipeline.get("active", False) and stage["status"] != "INVALID", "live_enabled": False,
+                "paper_trading_active": pipeline.get("active", False) and stage["status"] != "INVALID" and engineering["profile"] != "INVALID", "live_enabled": False,
                 "strategy": "ARGON4_SEVEN_STREAM_PRIORITY_WATERFALL",
                 "account": self.account.overview(), "blockers": blockers,
                 "last_cycle": self.last_cycle, "last_error": self.last_error,
@@ -83,10 +101,13 @@ class Application:
                 "stage": stage,
                 "training": training,
                 "pipeline": pipeline,
+                "engineering": engineering,
+                "book_telemetry": self.telemetry.status() if self.telemetry else {"status": "DISABLED"},
                 "backtest": load_json(ROOT / "reports/argon4_local_v4_20261106/summary.json", {}),
                 "streams": [{"stream": s, "status": DISABLED if s in stage["disabled_streams"] else "LOCAL_MODEL_LOADED" if s in models else "WAITING_FOR_MODEL",
                              "stage_enabled": s in stage["enabled_streams"], "model": models.get(s)} for s in allocation.get("order", STREAMS)],
                 "live_preflight": {"venue": "polymarket", "status": "DISABLED", "signer_connected": False,
+                                   "preparation": live_preparation,
                                    "execution_stage": stage, "live_enabled": False,
                                    "wallet_configured": False, "residency_confirmed": live.get("residency_confirmed", False),
                                    "residency_country": live.get("residency_country"),
@@ -192,7 +213,15 @@ def main():
         parser.error("Runtime must stay inside this workspace's paper_runtime")
     if not 1024 <= args.port <= 65535 or args.interval < 30:
         parser.error("Invalid port or polling interval")
-    app = Application(runtime, args.capital, enable_paper=args.enable_paper)
+    # Reserve the listener before constructing any account/worker. A duplicate
+    # startup must fail before it can touch the paper account or input files.
+    server = None if args.once else ThreadingHTTPServer(("127.0.0.1", args.port), BaseHTTPRequestHandler)
+    try:
+        app = Application(runtime, args.capital, enable_paper=args.enable_paper)
+    except BaseException:
+        if server is not None:
+            server.server_close()
+        raise
     if args.once:
         try:
             app.cycle()
@@ -201,8 +230,10 @@ def main():
             app.market_transport.close()
             if app.pipeline:
                 app.pipeline.close()
+            if app.telemetry:
+                app.telemetry.close(wait=False)
         return
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(app, args.port))
+    server.RequestHandlerClass = handler_for(app, args.port)
     (runtime / "service.json").write_text(json.dumps({"pid": os.getpid(), "started_at": app.started_at,
         "url": f"http://127.0.0.1:{args.port}", "mode": "LOCAL_MODEL_PAPER" if args.enable_paper else "OBSERVING_ONLY", "live_enabled": False}), encoding="utf-8")
     worker = threading.Thread(target=app.worker, args=(args.interval,), daemon=True)
@@ -211,6 +242,10 @@ def main():
     if app.pipeline:
         pipeline_worker = threading.Thread(target=app.pipeline.worker, daemon=True)
         pipeline_worker.start()
+    telemetry_worker = None
+    if app.telemetry:
+        telemetry_worker = threading.Thread(target=app.telemetry.worker, args=(app.stop,), daemon=True)
+        telemetry_worker.start()
     print(f"Local paper panel: http://127.0.0.1:{args.port}; live trading disabled", flush=True)
     try:
         server.serve_forever(poll_interval=.5)
@@ -223,6 +258,10 @@ def main():
         worker.join(timeout=15)
         if pipeline_worker:
             pipeline_worker.join(timeout=15)
+        if app.telemetry:
+            app.telemetry.close(wait=False)
+        if telemetry_worker:
+            telemetry_worker.join(timeout=2)
         server.server_close()
 
 

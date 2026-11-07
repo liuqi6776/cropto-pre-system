@@ -244,7 +244,7 @@ def test_fast_refresh_preserves_complete_due_source_set_and_observed_values(
         collector = online.OnlineInputs(root, clock=clock.utc, http_min_spacing_seconds=spacing)
         result = collector.refresh(now=cutoff)
         assert result["status"] == "READY", result
-        assert len(fixture.calls) == count and len(sessions) == 1
+        assert len(fixture.calls) == count and 1 <= len(sessions) <= 4
         assert sum(p.get("interval") == "1h" for _, p in fixture.calls) == hourly
         assert sum(p.get("interval") == "4h" for _, p in fixture.calls) == four_hourly
         assert sum(k == "dvol" for k, _ in fixture.calls) == daily

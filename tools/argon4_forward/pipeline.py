@@ -14,6 +14,7 @@ import time
 
 from .clock_sync import calibrate, calibrated_now, project_local
 from .stage import stage_profile, disabled_decision
+from .runtime_profile import engineering_profile
 
 ROOT = Path(__file__).resolve().parents[2]
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT")
@@ -118,6 +119,7 @@ class ForwardPipeline:
         self.last_warmup = 0
         self._pending_timing = None
         self._decision_timing = {}
+        self._prefetch_cohort = None
         from .polymarket_transport import PublicPolymarketTransport
         # Clock calibration keeps this CLOB connection warm without additional
         # requests. Background discovery has its own bounded connection pool.
@@ -259,15 +261,25 @@ class ForwardPipeline:
             kwargs["mark_registry_path"] = ROOT / "archive/catalog/mark_candle_registry.json"
         with collector._lock:
             result = reconcile_confirmed_price_revisions(
-                self.runtime, inputs["errors"], now=lambda: calibrated_now(self.clock), **kwargs)
+                self.runtime, inputs["errors"], now=lambda: calibrated_now(self.clock),
+                cutover_now=self.revision_cutover_now, **kwargs)
         self.observations.save("input_revision_reconciliation", result)
         return result
+
+    def revision_cutover_now(self):
+        # Archiving an audit database can exceed the clock's 60-second TTL.
+        # Obtain fresh evidence after that work, before certifying a new view.
+        self.update_clock()
+        return calibrated_now(self.clock)
 
     def wait_for_window(self, models):
         if self.state.get("inputs", {}).get("status") == "BLOCKED":
             revision = self.state.get("revision") or {}
+            errors = self.state.get("inputs", {}).get("errors", [])
+            deadline_block = any("DEADLINE" in str(e) or "BUSY" in str(e) for e in errors)
             reason = ("价格修订已保留旧版本并重复确认；等待下一窗口重新检查输入"
                       if revision.get("status") == "COMMITTED" else
+                      "采集超过本轮时间预算，已跳过；等待下一实时窗口，不补历史订单" if deadline_block else
                       "模型输入存在缺口或观测冲突；当前暂停新单，等待后续数据检查")
             self.publish(status="PAPER_DATA_BLOCKED", active=True, models=models, reason=reason)
         else:
@@ -295,6 +307,25 @@ class ForwardPipeline:
         frames = {}
         decisions = {}
         self._decision_timing = {"features_seconds": {}, "inference_seconds": {}}
+        snapshot = None
+        if engineering_profile(policy)["feature_snapshot_cache"]:
+            from .feature_cache import FeatureSnapshot
+            capture_started = time.perf_counter()
+            snapshot = FeatureSnapshot(inputs["data_root"], as_of=now_lower,
+                                       expected_sources=inputs.get("sources"))
+            self._decision_timing["snapshot_capture_seconds"] = time.perf_counter()-capture_started
+        try:
+            return self._score_decisions(policy, inputs, cohort, profile, now_lower,
+                                         available, frames, decisions, snapshot,
+                                         build_feature_frames, predict_stream)
+        finally:
+            if snapshot is not None:
+                self._decision_timing["snapshot"] = snapshot.stats
+                snapshot.close()
+
+    def _score_decisions(self, policy, inputs, cohort, profile, now_lower,
+                         available, frames, decisions, snapshot,
+                         build_feature_frames, predict_stream):
         for stream in policy["order"]:
             if stream in profile["disabled_streams"]:
                 decisions[stream] = disabled_decision(profile)
@@ -309,8 +340,9 @@ class ForwardPipeline:
             symbol = underlying + "USDT"
             if symbol not in frames:
                 started = time.perf_counter()
-                frames[symbol] = build_feature_frames(inputs["data_root"], symbol,
-                                                      as_of=now_lower, tail_rows=1)
+                frames[symbol] = (snapshot.build(symbol, tail_rows=1) if snapshot is not None else
+                                  build_feature_frames(inputs["data_root"], symbol,
+                                                       as_of=now_lower, tail_rows=1))
                 self._decision_timing["features_seconds"][symbol] = time.perf_counter()-started
             if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
                 raise ValueError("missed feature decision window")
@@ -335,6 +367,35 @@ class ForwardPipeline:
                 decisions[stream].update(status="SIGNAL", signal=signal)
         return decisions
 
+    def set_input_clock(self):
+        # A generation receives an immutable calibration. Retired requests must
+        # never inherit a subsequent generation's clock or evidence identifier.
+        clock = dict(self.clock)
+        frozen_now = lambda: calibrated_now(clock)
+        self.inputs.clock = frozen_now
+        self.inputs.client.clock = frozen_now
+        self.inputs.clock_evidence_sha256 = clock["receipt_sha256"]
+        self.inputs.client.clock_evidence_sha256 = clock["receipt_sha256"]
+
+    def prefetch_inputs(self, engineering, now_lower):
+        if not engineering["auxiliary_prefetch"]:
+            return
+        next_cohort = cohort_at(now_lower)+timedelta(minutes=5)
+        until_boundary = (next_cohort-calibrated_now(self.clock)).total_seconds()
+        if (self._prefetch_cohort == next_cohort or not
+                2 < until_boundary <= engineering["prefetch_lead_seconds"]):
+            return
+        self._prefetch_cohort = next_cohort
+        self.set_input_clock()
+        budget = min(engineering["prefetch_budget_seconds"], until_boundary-2)
+        result = self.inputs.prefetch_auxiliary(
+            now=now_lower, deadline_monotonic=time.monotonic()+budget,
+            cohort_id="prefetch:"+next_cohort.isoformat())
+        self.observations.save("input_prefetch", result)
+        with self.lock:
+            self.state["prefetch"] = {key: result.get(key) for key in
+                ("status", "errors", "observed_at", "cohort_id", "duration_seconds")}
+
     def cycle(self):
         from .online import OnlineInputs
         from .execution import PaperExecutor
@@ -345,12 +406,13 @@ class ForwardPipeline:
         policy = self.load_ready()
         if policy is None:
             return
-        revision_view = ensure_view_committed(self.runtime)
+        engineering = engineering_profile(policy)
         models = {s: {"version": b["manifest"]["model_version"], "sha256": b["manifest"]["model_sha256"]} for s,b in self.bundles.items()}
         if (self.runtime / "verification_pause.json").is_file():
             self.publish(status="VERIFICATION_PAUSE", active=False, models=models,
                          reason="完整检查期间暂停新预测与输入更新；市场观察和已有仓位官方结算继续")
             return
+        revision_view = ensure_view_committed(self.runtime)
         backoff_path = self.runtime / "features/binance_backoff.json"
         if backoff_path.exists():
             backoff = json.loads(backoff_path.read_text(encoding="utf-8"))
@@ -420,6 +482,7 @@ class ForwardPipeline:
         if not 5 <= earliest <= 10:
             raise ValueError("unsupported minimum decision delay")
         if not earliest <= elapsed <= 18 or self.last_cohort == cohort:
+            self.prefetch_inputs(engineering, now_lower)
             self.wait_for_window(models)
             return
         self.last_cohort = cohort
@@ -427,10 +490,16 @@ class ForwardPipeline:
         self._pending_timing = {"cohort": cohort.isoformat(), "deadline_seconds": 20,
             "started_at": calibrated_now(self.clock).isoformat(), "started_monotonic": time.perf_counter(),
             "http_min_spacing_seconds": spacing, "policy_version": policy["version"]}
-        self.inputs.clock_evidence_sha256 = self.clock["receipt_sha256"]
-        self.inputs.client.clock_evidence_sha256 = self.clock["receipt_sha256"]
+        self.set_input_clock()
         started = time.perf_counter()
-        inputs = self.inputs.refresh(now=now_lower)
+        if engineering["enabled"]:
+            input_cutoff = cohort+timedelta(seconds=engineering["input_deadline_after_boundary_seconds"])
+            remaining = max(0, (input_cutoff-calibrated_now(self.clock)).total_seconds())
+            self._pending_timing["input_deadline_at"] = input_cutoff.isoformat()
+            inputs = self.inputs.refresh(now=now_lower,
+                deadline_monotonic=time.monotonic()+remaining, cohort_id=cohort.isoformat())
+        else:
+            inputs = self.inputs.refresh(now=now_lower)
         self._pending_timing["input_refresh_seconds"] = time.perf_counter()-started
         self.observations.save("model_inputs", inputs)
         if inputs.get("status") not in ("READY", "COMPLETE", "OBSERVED"):

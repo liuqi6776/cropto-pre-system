@@ -7,7 +7,8 @@ a clean-room reader compatibility name: its contents remain observed events.
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -17,6 +18,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from urllib.parse import urlencode
 
 import numpy as np
@@ -40,6 +42,19 @@ ENDPOINTS = {
 STEPS = {"5m": pd.Timedelta(minutes=5), "1h": pd.Timedelta(hours=1),
          "4h": pd.Timedelta(hours=4), "1D": pd.Timedelta(days=1)}
 PROVENANCE = ("first_received_at", "receipt_sha256", "receipt_time_basis", "clock_evidence_sha256")
+
+
+class InputDeadlineExceeded(TimeoutError):
+    """A retired input generation must never publish a working view."""
+
+
+def _remaining(deadline):
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise InputDeadlineExceeded("INPUT_DEADLINE_EXCEEDED")
+    return remaining
 
 
 def _now():
@@ -107,59 +122,106 @@ class PublicInputsHTTP:
         self.min_spacing = min_spacing
         self.time_basis = time_basis
         self.clock_evidence_sha256 = clock_evidence_sha256
-        # One response, its receipt and any backoff must be fully handled before
-        # another queued worker may check the rate limit and reach the network.
-        # Keep this separate from the reentrant receipt/database lock below.
+        # Only sending is serialized. Each worker owns its connection pool;
+        # waiting on the network never holds the shared rate/receipt lock.
         self._request_lock = threading.Lock()
         self._lock = threading.RLock()
         self._last_request = 0.0
-        self._session = None
+        self._local = threading.local()
+        self._sessions = {}
+        self._sessions_lock = threading.Lock()
+        self._active_sessions = set()
+        self._closed = False
+        self._memory_backoff = {}
+        self._pending_backoff = {}
+        self._backoff_lock = threading.Lock()
+        self.backoff_persistence_failure = None
+        self.backoff_persistence_warning = None
+
+    @property
+    def _session(self):
+        """The calling thread's session; retained for diagnostic compatibility."""
+        return getattr(self._local, "session", None)
 
     def _session_for_request(self):
-        # The full request lock also serializes access to the connection pool.
-        # Reuse TCP/TLS connections, never server cookies or ambient credentials.
-        if self._session is None:
-            self._session = requests.Session()
-        self._session.trust_env = False
-        self._session.auth = None
-        proxies = getattr(self._session, "proxies", None)
+        with self._sessions_lock:
+            if self._closed:
+                raise ValueError("PUBLIC_INPUT_CLIENT_CLOSED")
+            if self._session is None:
+                self._local.session = requests.Session()
+                self._sessions[threading.get_ident()] = self._session
+            self._active_sessions.add(threading.get_ident())
+        session = self._session
+        session.trust_env = False
+        session.auth = None
+        proxies = getattr(session, "proxies", None)
         if proxies is not None:
             proxies.clear()
-        cookies = getattr(self._session, "cookies", None)
+        cookies = getattr(session, "cookies", None)
         if cookies is not None:
             cookies.clear()
-        return self._session
+        return session
 
     def _close_session(self):
-        session, self._session = self._session, None
+        session = self._session
+        self._local.session = None
+        with self._sessions_lock:
+            self._sessions.pop(threading.get_ident(), None)
         close = getattr(session, "close", None)
         if close:
             close()
 
     def close(self):
-        """Release the connection pool after any active request has completed."""
-        with self._request_lock:
-            self._close_session()
+        """Never wait on retired requests; each active worker closes on exit."""
+        with self._sessions_lock:
+            self._closed = True
+            inactive = [key for key in self._sessions if key not in self._active_sessions]
+            sessions = [self._sessions.pop(key) for key in inactive]
+        for session in sessions:
+            close = getattr(session, "close", None)
+            if close:
+                close()
+        self._local.session = None
 
     def _check_backoff(self, family):
-        deadlines = []
+        if self.backoff_persistence_failure:
+            raise ValueError("PUBLIC_BACKOFF_PERSISTENCE_FAILED")
+        pending_until = self._pending_backoff.get(family)
+        if pending_until is not None and _utc(self.clock()) < pending_until:
+            raise ValueError("PUBLIC_RATE_LIMIT_BACKOFF_UNTIL_RESPONSE_HANDLED")
+        self._pending_backoff.pop(family, None)
+        deadlines = [self._memory_backoff[family]] if family in self._memory_backoff else []
+        shared = self.path.parent / (family + "_backoff.json")
+        if shared.exists():
+            deadlines.append(_utc(json.loads(shared.read_text(encoding="utf-8"))["blocked_until_utc"]))
+        # A durable host block must not wait for an unrelated receipt database
+        # lock before stopping a new request (including after process restart).
+        if deadlines and _utc(self.clock()) < max(deadlines):
+            raise ValueError("PUBLIC_RATE_LIMIT_BACKOFF_UNTIL_" + _iso(max(deadlines)))
         if self.path.exists():
-            with sqlite3.connect(self.path, timeout=30) as conn:
+            with sqlite3.connect(self.path, timeout=self._sqlite_timeout()) as conn:
                 exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='backoff'").fetchone()
                 row = conn.execute("SELECT until_utc FROM backoff WHERE family=?", (family,)).fetchone() if exists else None
             if row:
                 deadlines.append(_utc(row[0]))
-        shared = self.path.parent / "binance_backoff.json"
-        if family == "binance" and shared.exists():
-            deadlines.append(_utc(json.loads(shared.read_text(encoding="utf-8"))["blocked_until_utc"]))
         if deadlines and _utc(self.clock()) < max(deadlines):
             raise ValueError("PUBLIC_RATE_LIMIT_BACKOFF_UNTIL_" + _iso(max(deadlines)))
 
+    def _backoff_now(self):
+        """Clock fallback is allowed only for conservative no-request periods."""
+        try:
+            return (_utc(getattr(self._local, "receipt_clock", self.clock)()),
+                    "CAPTURED_REQUEST_CLOCK")
+        except Exception:
+            return _utc(_now()), "SYSTEM_UTC_UNCALIBRATED_BACKOFF_ONLY"
+
     def _record_backoff(self, family, raw, retry_after, status):
-        # Follow the provider's explicit ban time; never rotate hosts/proxies.
-        now = _utc(self.clock())
+        # This is safety evidence, not a cohort data publication. A late 429 or
+        # 418 must remain durable after its generation/clock expires. It runs
+        # only in the bounded HTTP worker; the coordinator never waits for it.
+        now, time_basis = self._backoff_now()
         until = now + pd.Timedelta(seconds=3600 if status == 418 else 60)
-        match = re.search(rb"banned until (\d{13})", raw)
+        match = re.search(rb"banned until (\d{13})", raw or b"")
         if match:
             until = pd.to_datetime(int(match.group(1)), unit="ms", utc=True)
         elif retry_after:
@@ -173,97 +235,184 @@ class PublicInputsHTTP:
         # A small margin also covers an injected calibrated UTC upper bound.
         until += pd.Timedelta(seconds=15)
         response_until = until
-        with self._lock, sqlite3.connect(self.path, timeout=30) as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS backoff(family TEXT PRIMARY KEY, until_utc TEXT NOT NULL)")
-            old = conn.execute("SELECT until_utc FROM backoff WHERE family=?", (family,)).fetchone()
-            if old:
-                until = max(until, _utc(old[0]))
-            conn.execute("INSERT OR REPLACE INTO backoff(family,until_utc) VALUES(?,?)", (family, _iso(until)))
-        if family == "binance":
-            target = self.path.parent / "binance_backoff.json"
-            temporary = target.with_suffix(".json.tmp")
-            with self._lock:
-                previous = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {}
-                if previous.get("blocked_until_utc"):
-                    until = max(until, _utc(previous["blocked_until_utc"]))
-                evidence = ({"reason": previous["reason"],
-                             "source_receipt_sha256": previous["source_receipt_sha256"]}
-                            if previous.get("blocked_until_utc") and
-                            _utc(previous["blocked_until_utc"]) > response_until else
-                            {"reason": "PUBLIC_HTTP_" + str(status),
-                             "source_receipt_sha256": hashlib.sha256(raw).hexdigest()})
-                temporary.write_text(json.dumps({"blocked_until_utc": _iso(until),
-                    **evidence,
-                    "scope": "ALL_BINANCE_HOSTS", "safety_margin_seconds": 15}, indent=2), encoding="utf-8")
-                temporary.replace(target)
+        self._memory_backoff[family] = max(until, self._memory_backoff.get(family, until))
+        if not self._backoff_lock.acquire(timeout=2):
+            self.backoff_persistence_failure = "SAFETY_EVIDENCE_LOCK_TIMEOUT"
+            raise ValueError("PUBLIC_BACKOFF_PERSISTENCE_FAILED")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            target = self.path.parent / (family + "_backoff.json")
+            previous = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {}
+            if previous.get("blocked_until_utc"):
+                until = max(until, _utc(previous["blocked_until_utc"]))
+            until = max(until, self._memory_backoff[family])
+            evidence = ({key: previous.get(key) for key in
+                         ("reason", "source_receipt_sha256", "evidence_type", "retry_after", "backoff_time_basis")}
+                        if previous.get("blocked_until_utc") and
+                        _utc(previous["blocked_until_utc"]) > response_until else
+                        {"reason": "PUBLIC_HTTP_" + str(status),
+                         "source_receipt_sha256": hashlib.sha256(raw).hexdigest() if raw is not None else None,
+                         "evidence_type": "RAW_RESPONSE" if raw is not None else "HTTP_STATUS_AND_HEADERS_ONLY",
+                         "retry_after": retry_after, "backoff_time_basis": time_basis})
+            def publish_shared():
+                temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
+                try:
+                    temporary.write_text(json.dumps({"blocked_until_utc": _iso(until), **evidence,
+                        "scope": "ALL_BINANCE_HOSTS" if family == "binance" else "DERIBIT_PUBLIC_HOST",
+                        "safety_margin_seconds": 15}, indent=2), encoding="utf-8")
+                    temporary.replace(target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            # Publish the restart guard first. SQLite busy timeouts may exceed
+            # the expired cohort budget, but cannot erase this durable guard.
+            publish_shared()
+            try:
+                with sqlite3.connect(self.path, timeout=.5) as conn:
+                    conn.execute("CREATE TABLE IF NOT EXISTS backoff(family TEXT PRIMARY KEY, until_utc TEXT NOT NULL)")
+                    old = conn.execute("SELECT until_utc FROM backoff WHERE family=?", (family,)).fetchone()
+                    if old:
+                        until = max(until, _utc(old[0]))
+                    conn.execute("INSERT OR REPLACE INTO backoff(family,until_utc) VALUES(?,?)", (family, _iso(until)))
+                publish_shared()
+            except sqlite3.Error:
+                self.backoff_persistence_warning = "SQLITE_UNAVAILABLE_SHARED_HOST_GUARD_DURABLE"
+            self._memory_backoff[family] = until
+            self._pending_backoff.pop(family, None)
+        except Exception as exc:
+            self.backoff_persistence_failure = type(exc).__name__
+            raise ValueError("PUBLIC_BACKOFF_PERSISTENCE_FAILED") from exc
+        finally:
+            self._backoff_lock.release()
 
     def _save(self, receipt, raw):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock, sqlite3.connect(self.path, timeout=30) as conn:
+        with self._receipt_lock(), sqlite3.connect(self.path, timeout=self._sqlite_timeout()) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS receipts(id INTEGER PRIMARY KEY, "
                          "url TEXT NOT NULL, requested_at TEXT NOT NULL, received_at TEXT NOT NULL, "
                          "sha256 TEXT NOT NULL, http_status INTEGER NOT NULL, raw BLOB NOT NULL)")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(receipts)")}
-            for name in ("requested_at_local", "received_at_local", "time_basis", "clock_evidence_sha256"):
+            for name in ("requested_at_local", "received_at_local", "time_basis", "clock_evidence_sha256",
+                         "generation_id", "cohort_id"):
                 if name not in columns:
                     conn.execute("ALTER TABLE receipts ADD COLUMN " + name + " TEXT")
             conn.execute("INSERT INTO receipts(url,requested_at,received_at,sha256,http_status,raw,"
-                         "requested_at_local,received_at_local,time_basis,clock_evidence_sha256) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                         "requested_at_local,received_at_local,time_basis,clock_evidence_sha256,generation_id,cohort_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                          (receipt["url"], receipt["requested_at"], receipt["received_at"],
                           receipt["sha256"], receipt["http_status"], raw,
                           receipt["requested_at_local"], receipt["received_at_local"],
-                          receipt["time_basis"], receipt["clock_evidence_sha256"]))
+                          receipt["time_basis"], receipt["clock_evidence_sha256"],
+                          receipt.get("generation_id"), receipt.get("cohort_id")))
 
-    def get(self, kind, params=None):
-        with self._request_lock:
-            try:
-                return self._get_serial(kind, params)
-            except Exception:
-                # No transparent retry: retain the original failure and let the
-                # next authorized request establish a clean connection pool.
+    def _sqlite_timeout(self):
+        remaining = _remaining(getattr(self._local, "deadline", None))
+        return 5. if remaining is None else min(5., remaining)
+
+    @contextmanager
+    def _receipt_lock(self):
+        remaining = _remaining(getattr(self._local, "deadline", None))
+        acquired = self._lock.acquire(timeout=remaining) if remaining is not None else self._lock.acquire()
+        if not acquired:
+            raise InputDeadlineExceeded("INPUT_DEADLINE_RECEIPT_LOCK")
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    def get(self, kind, params=None, *, deadline_monotonic=None, generation_id=None, cohort_id=None,
+            receipt_clock=None, receipt_time_basis=None, receipt_clock_evidence=None):
+        _remaining(deadline_monotonic)
+        self._local.deadline = deadline_monotonic
+        self._local.receipt_clock = receipt_clock or self.clock
+        try:
+            return self._get_serial(kind, params, deadline_monotonic=deadline_monotonic,
+                                    generation_id=generation_id, cohort_id=cohort_id,
+                                    receipt_clock=receipt_clock or self.clock,
+                                    receipt_time_basis=receipt_time_basis or self.time_basis,
+                                    receipt_clock_evidence=receipt_clock_evidence)
+        except Exception:
+            # Rebuild only this worker's failed connection, never another
+            # worker's active request. There is no transparent retry.
+            self._close_session()
+            raise
+        finally:
+            with self._sessions_lock:
+                self._active_sessions.discard(threading.get_ident())
+                closed = self._closed
+            if closed:
                 self._close_session()
-                raise
 
-    def _get_serial(self, kind, params=None):
+    def _get_serial(self, kind, params=None, *, deadline_monotonic=None,
+                    generation_id=None, cohort_id=None, receipt_clock=None,
+                    receipt_time_basis=None, receipt_clock_evidence=None):
         params = params or {}
         _parameters(kind, params)
         base, path = ENDPOINTS[kind]
         family = "deribit" if kind == "dvol" else "binance"
         url = base + path + ("?" + urlencode(params) if params else "")
-        with self._lock:
-            self._check_backoff(family)
-            delay = self.min_spacing - (time.monotonic() - self._last_request)
-            if delay > 0:
-                time.sleep(delay)
-            self._check_backoff(family)
-            self._last_request = time.monotonic()
+        while True:
+            remaining = _remaining(deadline_monotonic)
+            acquired = self._request_lock.acquire(timeout=remaining) if remaining is not None else self._request_lock.acquire()
+            if not acquired:
+                raise InputDeadlineExceeded("INPUT_DEADLINE_EXCEEDED")
+            try:
+                _remaining(deadline_monotonic)
+                self._check_backoff(family)
+                delay = self.min_spacing - (time.monotonic() - self._last_request)
+                if delay <= 0:
+                    session = self._session_for_request()
+                    _remaining(deadline_monotonic)
+                    self._last_request = time.monotonic()
+                    break
+            finally:
+                self._request_lock.release()
+            remaining = _remaining(deadline_monotonic)
+            if remaining is not None and delay >= remaining:
+                raise InputDeadlineExceeded("INPUT_DEADLINE_BEFORE_SEND_SLOT")
+            time.sleep(delay)
+        remaining = _remaining(deadline_monotonic)
         requested_at_local = _iso(_now())
-        requested_at = _iso(self.clock())
-        session = self._session_for_request()
+        request_clock = receipt_clock or self.clock
+        requested_at = _iso(request_clock())
+        time_basis = receipt_time_basis or self.time_basis
+        clock_evidence = receipt_clock_evidence if receipt_clock_evidence is not None else self.clock_evidence_sha256
         try:
-            with session.get(url, timeout=(4, 12), allow_redirects=False, stream=True,
+            timeout = (4, 12) if remaining is None else (min(2., remaining), min(3.5, remaining))
+            with session.get(url, timeout=timeout, allow_redirects=False, stream=True,
                              headers={"User-Agent": "argon4-public-paper-inputs/1"}) as response:
+                if response.status_code in (418, 429):
+                    # Persist the observed status/Retry-After before waiting
+                    # for a body that might stall beyond this generation. An
+                    # incomplete body is explicitly not a completed receipt.
+                    self._pending_backoff[family] = self._backoff_now()[0] + pd.Timedelta(
+                        seconds=3615 if response.status_code == 418 else 75)
+                    self._record_backoff(family, None, getattr(response, "headers", {}).get("Retry-After"),
+                                         response.status_code)
+                _remaining(deadline_monotonic)
                 chunks, size = [], 0
                 for chunk in response.iter_content(65536):
+                    _remaining(deadline_monotonic)
                     size += len(chunk)
                     if size > 4_000_000:
                         raise ValueError("Public input response exceeds size limit")
                     chunks.append(chunk)
                 raw = b"".join(chunks)
                 received_at_local = _iso(_now())
-                received_at = _iso(self.clock())
+                received_at = _iso(request_clock())
                 receipt = {"url": url, "requested_at": requested_at, "received_at": received_at,
                            "sha256": hashlib.sha256(raw).hexdigest(), "http_status": response.status_code,
                            "requested_at_local": requested_at_local, "received_at_local": received_at_local,
-                           "time_basis": self.time_basis, "clock_evidence_sha256": self.clock_evidence_sha256}
+                           "time_basis": time_basis, "clock_evidence_sha256": clock_evidence,
+                           "generation_id": generation_id, "cohort_id": cohort_id}
                 retry_after = getattr(response, "headers", {}).get("Retry-After")
         finally:
             cookies = getattr(session, "cookies", None)
             if cookies is not None:
                 cookies.clear()
-        self._save(receipt, raw)
         if receipt["http_status"] in (418, 429):
             self._record_backoff(family, raw, retry_after, receipt["http_status"])
+        _remaining(deadline_monotonic)
+        self._save(receipt, raw)
+        _remaining(deadline_monotonic)
         if receipt["http_status"] != 200:
             raise ValueError("PUBLIC_HTTP_STATUS_" + str(receipt["http_status"]))
         return json.loads(raw), receipt
@@ -338,13 +487,73 @@ class OnlineInputs:
         self._lock = threading.RLock()
         self.state = json.loads(self.state_path.read_text(encoding="utf-8")) if self.state_path.exists() else {}
         self._checks = dict(self.state.get("checks", {}))
+        self._publication_lock = threading.RLock()
+        self._job_local = threading.local()
+        self._generation = 0
+        self._active_generation = None
+        self._outstanding = set()
+        self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="argon4-input")
+        self._closed = False
+        self._funding_cache = {}
+        self._cached_clock = None
+        self._basis_fingerprint = None
 
     def close(self):
-        """Close the owned/injected public client after refresh leaves its lock."""
-        with self._lock:
-            close = getattr(self.client, "close", None)
-            if close:
-                close()
+        """Retire workers without waiting on blocked sockets or publications."""
+        # Retirement cannot wait for a worker's filesystem operation. New
+        # generations already refuse admission while any old worker remains.
+        self._closed = True
+        self._active_generation = None
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        close = getattr(self.client, "close", None)
+        if close:
+            close()
+
+    def _guard_generation(self):
+        context = getattr(self._job_local, "context", None)
+        if context is not None:
+            generation, deadline, _, _, _, _ = context
+            _remaining(deadline)
+            if self._closed or generation != self._active_generation:
+                raise InputDeadlineExceeded("INPUT_GENERATION_RETIRED")
+        return context
+
+    def _get(self, kind, params=None):
+        context = self._guard_generation()
+        if context is not None and isinstance(self.client, PublicInputsHTTP):
+            generation, deadline, cohort_id, request_clock, time_basis, clock_evidence = context
+            result = self.client.get(kind, params, deadline_monotonic=deadline,
+                                     generation_id=str(generation), cohort_id=cohort_id,
+                                     receipt_clock=request_clock, receipt_time_basis=time_basis,
+                                     receipt_clock_evidence=clock_evidence)
+        else:
+            result = self.client.get(kind, params)
+        self._guard_generation()
+        return result
+
+    def _run_job(self, context, fn, args):
+        self._job_local.context = context
+        try:
+            self._guard_generation()
+            result = fn(*args)
+            self._guard_generation()
+            return result
+        finally:
+            self._job_local.context = None
+
+    def _publish_frame(self, frame, path, *, index=False):
+        self._guard_generation()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            frame.to_parquet(temporary, index=index)
+            # Generation verification and the actual replace are one atomic
+            # publication gate. A retired worker cannot overwrite a new view.
+            with self._publication_lock:
+                self._guard_generation()
+                temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _path(self, kind, symbol=None, interval=None):
         if kind == "dvol":
@@ -358,6 +567,7 @@ class OnlineInputs:
         return self.data_root / ("intraday" if interval == "5m" else "auxiliary") / name
 
     def _read(self, path):
+        self._guard_generation()
         frame = pd.read_parquet(path) if path.exists() else pd.DataFrame()
         if not frame.empty:
             if "receipt_time_basis" not in frame:
@@ -372,8 +582,10 @@ class OnlineInputs:
                 "clock_evidence_sha256": receipt.get("clock_evidence_sha256", self.clock_evidence_sha256)}
 
     def _checked(self, name, receipt):
-        self._checks[name] = {"received_at": receipt["received_at"], "source": receipt["url"],
-                              "sha256": receipt["sha256"]}
+        with self._publication_lock:
+            self._guard_generation()
+            self._checks[name] = {"received_at": receipt["received_at"], "source": receipt["url"],
+                                  "sha256": receipt["sha256"]}
 
     def _start(self, old, key, cutoff, step):
         initial = cutoff.floor("D") - pd.Timedelta(days=self.window_days + 1)
@@ -408,7 +620,7 @@ class OnlineInputs:
         rows = []
         while start <= end:
             try:
-                payload, receipt = self.client.get(kind, {"symbol": symbol, "interval": interval,
+                payload, receipt = self._get(kind, {"symbol": symbol, "interval": interval,
                     "startTime": _ms(start), "endTime": _ms(end), "limit": 1000})
             except Exception:
                 # Preserve already received, validated pages when a later page
@@ -416,7 +628,7 @@ class OnlineInputs:
                 if rows:
                     partial = pd.DataFrame(rows)
                     _validate_prices(partial)
-                    _atomic_frame(_merge(old, partial, ["date"]), path)
+                    self._publish_frame(_merge(old, partial, ["date"]), path)
                 raise
             self._checked(f"{symbol}:{kind}:{interval}", receipt)
             if not isinstance(payload, list):
@@ -453,17 +665,32 @@ class OnlineInputs:
         merged = _merge(old, new, ["date"])
         if merged.empty:
             raise ValueError("EMPTY_CANDLES")
-        _atomic_frame(merged, path)
+        self._publish_frame(merged, path)
         return str(path)
 
     def _funding(self, symbol, cutoff):
         path = self._path("funding", symbol)
         old = self._read(path)
+        cached = self._funding_cache.get(symbol)
+        if cached and not old.empty:
+            age = (cutoff - _utc(cached["received_at"])).total_seconds()
+            dates = pd.DatetimeIndex(old.date).sort_values()
+            observed = np.diff(dates.asi8)
+            # A receipt TTL is not a fabricated funding calendar. Near the
+            # earliest next event suggested by actual observations, recheck.
+            before_next = (len(observed) >= 2 and (observed > 0).all() and
+                           cutoff < dates[-1] + pd.Timedelta(int(observed.min()), unit="ns") - pd.Timedelta(seconds=60))
+            if (0 <= age < 60 and before_next and
+                    cached["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()):
+                return str(path)
+        with self._publication_lock:
+            self._guard_generation()
+            self._funding_cache.pop(symbol, None)
         start = (cutoff.floor("D") - pd.Timedelta(days=self.window_days + 3) if old.empty
                  else pd.Timestamp(old.date.max()) - pd.Timedelta(days=2))
         rows = []
         while start <= cutoff:
-            payload, receipt = self.client.get("funding", {"symbol": symbol, "startTime": _ms(start),
+            payload, receipt = self._get("funding", {"symbol": symbol, "startTime": _ms(start),
                                                 "endTime": _ms(cutoff), "limit": 1000})
             self._checked(f"{symbol}:funding", receipt)
             if not isinstance(payload, list):
@@ -488,7 +715,14 @@ class OnlineInputs:
         merged = _merge(old, pd.DataFrame(rows), ["date"])
         if merged.empty:
             raise ValueError("EMPTY_FUNDING_EVENTS")
-        _atomic_frame(merged, path)
+        self._publish_frame(merged, path)
+        # Reading/hash computation can stall on the filesystem. Keep it out of
+        # the tiny publication gate and recheck retirement after it completes.
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self._publication_lock:
+            self._guard_generation()
+            self._funding_cache[symbol] = {"received_at": receipt["received_at"],
+                                           "sha256": digest}
         return str(path)
 
     def _dvol_one(self, symbol, cutoff, old):
@@ -500,7 +734,7 @@ class OnlineInputs:
                  else pd.Timestamp(old.bucket_utc.max()) - pd.Timedelta(days=2))
         rows = []
         while end >= start:
-            payload, receipt = self.client.get("dvol", {"currency": symbol, "resolution": "1D",
+            payload, receipt = self._get("dvol", {"currency": symbol, "resolution": "1D",
                 "start_timestamp": _ms(start), "end_timestamp": _ms(end)})
             self._checked(f"{symbol}:dvol", receipt)
             if "error" in payload or not isinstance(payload.get("result", {}).get("data"), list):
@@ -552,16 +786,13 @@ class OnlineInputs:
         frame.index.name = "date"
         # The legacy basis reader requires an open-time DatetimeIndex.
         path = self._path("basis")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".parquet.tmp")
-        frame.to_parquet(temporary)
-        temporary.replace(path)
+        self._publish_frame(frame, path, index=True)
 
     def _check_clock(self):
         errors = []
         for kind in ("clock", "spot_clock"):
             try:
-                data, receipt = self.client.get(kind)
+                data, receipt = self._get(kind)
                 server = pd.to_datetime(int(data["serverTime"]), unit="ms", utc=True)
                 requested, received = _utc(receipt["requested_at"]), _utc(receipt["received_at"])
                 rtt = (received - requested).total_seconds()
@@ -575,48 +806,155 @@ class OnlineInputs:
                 errors.append(kind + ":" + type(exc).__name__)
         return {"status": "UNAVAILABLE", "errors": errors, "skew_seconds": None}
 
-    def refresh(self, now=None):
-        with self._lock:
-            cutoff = _utc(now) if now is not None else _utc(self.clock())
-            if cutoff > _utc(self.clock()) + pd.Timedelta(seconds=2):
-                raise ValueError("Future refresh cutoff")
-            errors = []
-            # Create shared parent directories before parallel publishers on
-            # Windows; workers only replace their own distinct data files.
-            for directory in (self.data_root / "intraday", self.data_root / "auxiliary"):
-                directory.mkdir(parents=True, exist_ok=True)
-            clock = self._check_clock()
-            jobs = [(self._candles, ("futures", s, "5m", cutoff)) for s in SYMBOLS]
-            jobs += [(self._candles, (k, s, "1h", cutoff)) for s in SYMBOLS for k in ("futures", "mark")]
-            jobs += [(self._candles, (k, s, "4h", cutoff)) for s in BASIS_SYMBOLS for k in ("futures", "spot")]
-            jobs += [(self._funding, (s, cutoff)) for s in SYMBOLS]
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                futures = [(args, pool.submit(fn, *args)) for fn, args in jobs]
-                for args, future in futures:
+    def _dvol(self, cutoff):
+        old = self._read(self._path("dvol"))
+        parts = [self._dvol_one(s, cutoff, old[old.symbol == s] if not old.empty else old)
+                 for s in ("BTC", "ETH")]
+        self._publish_frame(pd.concat(parts, ignore_index=True), self._path("dvol"))
+
+    def _blocked(self, cutoff, reason, *, generation=None, cohort_id=None):
+        return {"status": "BLOCKED", "mode": "PUBLIC_INPUTS_ONLY", "data_root": str(self.data_root),
+                "as_of": _iso(self.clock()), "local_now": _iso(self.clock()),
+                "system_local_now": _iso(_now()), "time_basis": self.time_basis,
+                "clock_evidence_sha256": self.clock_evidence_sha256,
+                "requested_cutoff": _iso(cutoff), "refresh_completed_at": None,
+                "latest_closed_5m": None, "feature_available_at": None,
+                "clock": {"status": "UNAVAILABLE"}, "sources": {}, "gaps": [],
+                "errors": [{"source": "refresh", "error": reason}],
+                "generation_id": generation, "cohort_id": cohort_id}
+
+    def _write_state(self, cutoff, clock, errors, generation, cohort_id):
+        """Prepare state off-lock in a bounded worker, then gate publication."""
+        self._guard_generation()
+        state = {"schema_version": 1, "requested_cutoff": _iso(cutoff),
+                 "refresh_completed_at": _iso(self.clock()), "clock": clock, "errors": errors,
+                 "time_basis": self.time_basis, "clock_evidence_sha256": self.clock_evidence_sha256,
+                 "checks": dict(self._checks), "generation_id": generation, "cohort_id": cohort_id}
+        self.root.mkdir(parents=True, exist_ok=True)
+        temp = self.state_path.with_name(self.state_path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            temp.write_text(json.dumps(state, indent=2, allow_nan=False), encoding="utf-8")
+            with self._publication_lock:
+                self._guard_generation()
+                temp.replace(self.state_path)
+                # If an OS-level atomic rename itself stalled past expiry, its
+                # disk effect cannot be canceled. Never then publish READY in
+                # memory; the outstanding-worker gate requires a fresh batch.
+                self._guard_generation()
+                self.state = state
+        finally:
+            temp.unlink(missing_ok=True)
+        return True
+
+    def _batch(self, now, deadline_monotonic, cohort_id, *, auxiliary):
+        cutoff = _utc(now) if now is not None else _utc(self.clock())
+        if cutoff > _utc(self.clock()) + pd.Timedelta(seconds=2):
+            raise ValueError("Future refresh cutoff")
+        try:
+            remaining = _remaining(deadline_monotonic)
+        except InputDeadlineExceeded:
+            return self._blocked(cutoff, "INPUT_DEADLINE_EXCEEDED", cohort_id=cohort_id)
+        acquired = self._lock.acquire(timeout=remaining) if remaining is not None else self._lock.acquire()
+        if not acquired:
+            return self._blocked(cutoff, "INPUT_DEADLINE_WAITING_FOR_BATCH", cohort_id=cohort_id)
+        generation = None
+        try:
+            _remaining(deadline_monotonic)
+            self._outstanding = {f for f in self._outstanding if not f.done()}
+            if self._closed or self._outstanding:
+                return self._blocked(cutoff, "INPUT_CLIENT_CLOSED" if self._closed else "INPUT_WORKERS_BUSY",
+                                     cohort_id=cohort_id)
+            if getattr(self.client, "backoff_persistence_failure", None):
+                return self._blocked(cutoff, "PUBLIC_BACKOFF_PERSISTENCE_FAILED", cohort_id=cohort_id)
+            # _lock serializes coordinators and _outstanding excludes retired
+            # workers. No worker publication lock is needed for admission.
+            self._generation += 1
+            generation = self._generation
+            self._active_generation = generation
+            # Capture the generation's clock and calibration. A retired socket
+            # must not acquire a newer cohort's mutable receipt-clock evidence.
+            context = (generation, deadline_monotonic, cohort_id, self.clock,
+                       self.time_basis, self.clock_evidence_sha256)
+            errors, results = [], {}
+            clock = self._cached_clock
+            cached_clock_ok = (clock is not None and clock.get("status") == "VERIFIED" and
+                               0 <= (cutoff - _utc(clock["received_at"])).total_seconds() <= 30 and
+                               getattr(self, "_cached_clock_identity", None) == context[4:])
+            jobs = [] if cached_clock_ok else [("clock", self._check_clock, ())]
+            if not auxiliary:
+                jobs += [(f"futures:{s}:5m", self._candles, ("futures", s, "5m", cutoff)) for s in SYMBOLS]
+            jobs += [(f"{k}:{s}:1h", self._candles, (k, s, "1h", cutoff)) for s in SYMBOLS for k in ("futures", "mark")]
+            jobs += [(f"{k}:{s}:4h", self._candles, (k, s, "4h", cutoff)) for s in BASIS_SYMBOLS for k in ("futures", "spot")]
+            jobs += [(s, self._funding, (s, cutoff)) for s in SYMBOLS]
+            jobs += [("dvol", self._dvol, (cutoff,))]
+
+            def execute(job_list):
+                futures = {self._pool.submit(self._run_job, context, fn, args): name
+                           for name, fn, args in job_list}
+                self._outstanding.update(futures)
+                _, pending = wait(futures, timeout=_remaining(deadline_monotonic))
+                if pending:
+                    raise InputDeadlineExceeded("INPUT_DEADLINE_EXCEEDED")
+                for future, name in futures.items():
                     try:
-                        future.result()
+                        results[name] = future.result()
                     except Exception as exc:
-                        errors.append({"source": ":".join(str(a) for a in args[:-1]),
-                                       "error": type(exc).__name__ + ":" + str(exc)[:160]})
-            try:
-                old = self._read(self._path("dvol"))
-                parts = [self._dvol_one(s, cutoff, old[old.symbol == s] if not old.empty else old) for s in ("BTC", "ETH")]
-                _atomic_frame(pd.concat(parts, ignore_index=True), self._path("dvol"))
-            except Exception as exc:
-                errors.append({"source": "dvol", "error": type(exc).__name__ + ":" + str(exc)[:160]})
-            try:
-                self._basis()
-            except Exception as exc:
-                errors.append({"source": "basis", "error": type(exc).__name__ + ":" + str(exc)[:160]})
-            self.state = {"schema_version": 1, "requested_cutoff": _iso(cutoff),
-                          "refresh_completed_at": _iso(self.clock()), "clock": clock, "errors": errors,
-                          "time_basis": self.time_basis, "clock_evidence_sha256": self.clock_evidence_sha256,
-                          "checks": self._checks}
-            self.root.mkdir(parents=True, exist_ok=True)
-            temp = self.state_path.with_suffix(".json.tmp")
-            temp.write_text(json.dumps(self.state, indent=2, allow_nan=False), encoding="utf-8")
-            temp.replace(self.state_path)
-            return self.snapshot()
+                        errors.append({"source": name, "error": type(exc).__name__ + ":" + str(exc)[:160]})
+                _remaining(deadline_monotonic)
+
+            execute(jobs)
+            execute([("basis", self._basis, ())])
+            if not cached_clock_ok:
+                clock = results.get("clock", {"status": "UNAVAILABLE"})
+            _remaining(deadline_monotonic)
+            self._cached_clock = clock if auxiliary else None
+            self._cached_clock_identity = context[4:]
+            if auxiliary:
+                return {"status": "AUXILIARY_PREFETCH_COMPLETE" if not errors else "BLOCKED",
+                        "requested_cutoff": _iso(cutoff), "completed_at": _iso(self.clock()),
+                        "generation_id": generation, "cohort_id": cohort_id, "errors": errors}
+            execute([("state", self._write_state, (cutoff, clock, errors, generation, cohort_id))])
+            if results.get("state") is not True:
+                result = self._blocked(cutoff, "INPUT_STATE_PUBLICATION_FAILED", generation=generation, cohort_id=cohort_id)
+                result["errors"].extend(errors)
+                return result
+            execute([("snapshot", self.snapshot, ())])
+            result = results.get("snapshot")
+            if result is None:
+                result = self._blocked(cutoff, "INPUT_SNAPSHOT_FAILED", generation=generation, cohort_id=cohort_id)
+                result["errors"].extend(errors)
+            _remaining(deadline_monotonic)
+            result.update(generation_id=generation, cohort_id=cohort_id)
+            return result
+        except InputDeadlineExceeded as exc:
+            result = self._blocked(cutoff, str(exc), generation=generation, cohort_id=cohort_id)
+            if not auxiliary:
+                # The deadline path must not touch the filesystem or wait on a
+                # worker lock. Pipeline persists the returned BLOCKED evidence
+                # separately; the next valid generation publishes new state.
+                self.state = {"schema_version": 1, "requested_cutoff": _iso(cutoff),
+                    "refresh_completed_at": None, "clock": result["clock"], "errors": result["errors"],
+                    "time_basis": self.time_basis, "clock_evidence_sha256": self.clock_evidence_sha256,
+                    "checks": dict(self._checks), "generation_id": generation, "cohort_id": cohort_id}
+            return result
+        finally:
+            if generation is not None and self._active_generation == generation:
+                self._active_generation = None
+            for future in self._outstanding:
+                future.cancel()
+            self._lock.release()
+
+    def refresh(self, now=None, *, deadline_monotonic=None, cohort_id=None):
+        """Refresh with a monotonic absolute budget; omitted budget supports warmup.
+
+        An expired generation is retired without joining running HTTP workers.
+        Until those bounded workers finish, another generation fails closed.
+        """
+        return self._batch(now, deadline_monotonic, cohort_id, auxiliary=False)
+
+    def prefetch_auxiliary(self, now=None, *, deadline_monotonic=None, cohort_id=None):
+        """Fetch only already-closed auxiliary bars and observed funding events."""
+        return self._batch(now, deadline_monotonic, cohort_id, auxiliary=True)
 
     def _source_specs(self):
         for symbol in SYMBOLS:
@@ -631,7 +969,10 @@ class OnlineInputs:
             yield f"{symbol}:dvol", self._path("dvol"), "bucket_utc", STEPS["1D"], symbol
 
     def snapshot(self, as_of=None):
-        with self._lock:
+        # Batch workers already have an exclusive generation while the caller
+        # holds _lock; running validation in the bounded pool keeps disk reads
+        # within the same non-blocking deadline envelope as HTTP.
+        with self._lock if self._guard_generation() is None else nullcontext():
             now = _utc(as_of) if as_of is not None else _utc(self.clock())
             if now > _utc(self.clock()) + pd.Timedelta(seconds=2):
                 raise ValueError("Future snapshot requested")
