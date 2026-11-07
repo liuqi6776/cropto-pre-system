@@ -40,6 +40,8 @@
 - [docs/ARGON4_EXECUTION_V12.md](../docs/ARGON4_EXECUTION_V12.md)
 - [docs/ARGON4_LATENCY_V11.md](../docs/ARGON4_LATENCY_V11.md)
 - [docs/EXPORT_VALIDATION.md](../docs/EXPORT_VALIDATION.md)
+- [docs/EXPORT_VALIDATION_V11.md](../docs/EXPORT_VALIDATION_V11.md)
+- [docs/EXPORT_VALIDATION_V12_INITIAL.md](../docs/EXPORT_VALIDATION_V12_INITIAL.md)
 - [docs/FILE_INDEX.md](../docs/FILE_INDEX.md)
 - [docs/RESTORE.md](../docs/RESTORE.md)
 - [docs/SOURCE_MANIFEST.json](../docs/SOURCE_MANIFEST.json)

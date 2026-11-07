@@ -30,9 +30,11 @@ flowchart TD
 
 ## 预测与执行路径
 
-当前配置启用 Stage 2 的五条流；流顺序与生效边界以 `config/argon4_forward_policy.json` 为准。模型、特征公式、阈值及权重保持。每个五分钟窗口只计算一次预测；未到周期和无信号立即放行，缺失或不一致证据停止相应分配。
+当前配置 `argon4-local311-independent65-20261107-v12r1` 从 `2026-11-07T08:20:00Z` 的未来窗口生效，启用 Stage 2 的五条流；流顺序与生效边界以 `config/argon4_forward_policy.json` 为准。模型、特征公式、阈值及权重保持。每个五分钟窗口只计算一次预测；未到周期和无信号立即放行，缺失或不一致证据停止相应分配。
 
 采集最早在校准时间下界达到 T+2.5 秒后开始，校准时间上界达到 T+14 秒即截止。仅当历史完整、唯一问题为最后一根已闭合 5m K 线尚未发布时，允许间隔 0.5 秒再检查；网络错误、历史缺口、修订冲突或辅助输入异常不按发布延迟重试。窗口附近的主循环间隔为 0.2 秒。
+
+v12r1 将完成热身的 `REVISION_WAITING_FUTURE_WINDOW` 纳入同一调度，时钟有效时普通期每 1 秒、关键窗口每 0.2 秒检查。初版该状态仍可能落入 inactive 分支的 10 秒等待，使修订后的新窗口启动过晚。未热身或无效时钟继续保守等待，已修订的当前窗口仍跳过，未来新窗口必须重新验证；此调整不放宽数据与时钟检查，也不解决外部数据修订或校准失败。
 
 每次模拟买入都检查新鲜盘口、官方费用和原资金上限。0.515 限制盘口成交价，手续费另计并占用预算。首次盘口价格未满足时，可以持久化等待并最多重检三次，间隔至少 2.5 秒；安排重检须有至少 3 秒余量，最晚 T+18.5 秒启动重检，所有模拟接受检查必须早于 T+20 秒。等待上层重检时，下层暂不占预算；最终有效价格拒绝才放行。中断请求、部分成交及已成交订单不能借重检重复执行。
 
@@ -52,4 +54,4 @@ Monitor 将未结算仓位分成窗口进行中、已到期等待官方结算、
 
 采集保持有界线程池和 0.25 秒最小发出间隔。迟到结果不能成为当轮交易输入；低频预取仅使用已经闭合的观测，资金费保持真实事件。完整说明见 [v12 执行与观测规则](ARGON4_EXECUTION_V12.md)和 [v11 采集、快照与修订边界](ARGON4_LATENCY_V11.md)。
 
-运行入口为 `scripts/argon4_forward_server.py`，前端通过本地只读 API 获取状态。训练入口为 `scripts/train_argon4_forward.py`；`train/evaluate_argon4_gen4*` 与组合场景脚本仍是独立候选研究。源码克隆不包含模型、行情、账本或完整验证凭据，不能直接恢复原模拟账户。当前验收进度见 [EXPORT_VALIDATION.md](EXPORT_VALIDATION.md)，历史快照见 [EXPORT_VALIDATION_V11.md](EXPORT_VALIDATION_V11.md)。
+运行入口为 `scripts/argon4_forward_server.py`，前端通过本地只读 API 获取状态。训练入口为 `scripts/train_argon4_forward.py`；`train/evaluate_argon4_gen4*` 与组合场景脚本仍是独立候选研究。源码克隆不包含模型、行情、账本或完整验证凭据，不能直接恢复原模拟账户。当前修正版验收进度见 [EXPORT_VALIDATION.md](EXPORT_VALIDATION.md)，不同部署时期的历史快照分别见 [EXPORT_VALIDATION_V12_INITIAL.md](EXPORT_VALIDATION_V12_INITIAL.md) 和 [EXPORT_VALIDATION_V11.md](EXPORT_VALIDATION_V11.md)，旧实测不能充作本次修复后的结果。

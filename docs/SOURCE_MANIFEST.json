@@ -4,8 +4,8 @@
   "files": [
     {
       "path": "config/argon4_forward_policy.json",
-      "sha256": "1c8dcd60dd3b27f3a030e93301ed67364615783e17f41a27af1a8d056ce7a483",
-      "bytes": 8640
+      "sha256": "83baaeca0684954d9624385e6df8e0bcd69d219b448b1adbaa9e7bc59f20f42e",
+      "bytes": 8824
     },
     {
       "path": "dashboard/argon4_forward/app.js",
@@ -24,8 +24,8 @@
     },
     {
       "path": "docs/ARGON4_EXECUTION_V12.md",
-      "sha256": "79aa90217d501ca84510f1a5a1e944d3c02a4748de8d06d2e745b728e9470443",
-      "bytes": 6094
+      "sha256": "8ed7e28644b73245fbff07f99c4b47e54a0bdb84fa1071b60e39aba23698aed9",
+      "bytes": 6969
     },
     {
       "path": "docs/ARGON4_LATENCY_V11.md",
@@ -374,8 +374,8 @@
     },
     {
       "path": "tests/test_argon4_forward_pipeline.py",
-      "sha256": "d23319eefdf436afcc84b54f18600eb4d37c573b60f6c09960e1e3e782db7ff6",
-      "bytes": 62650
+      "sha256": "1499d7ddc1e2563a9a9d05f920c1e90d09a683357efac31fcd05da2c19a94b0c",
+      "bytes": 66106
     },
     {
       "path": "tests/test_argon4_forward_polymarket.py",
@@ -554,8 +554,8 @@
     },
     {
       "path": "tools/argon4_forward/pipeline.py",
-      "sha256": "b36e5152cef84544a9f56dae58dbc6c5dc2975406767f08010e5d34e72b3a2dd",
-      "bytes": 41612
+      "sha256": "682b4e3970f6d2146e2d8147376f03f41cf0130fe80f9792466c6b9898e52af9",
+      "bytes": 41707
     },
     {
       "path": "tools/argon4_forward/polymarket.py",
@@ -588,5 +588,5 @@
       "bytes": 3785
     }
   ],
-  "updated_at_utc": "2026-11-07T07:13:51.639043+00:00"
+  "updated_at_utc": "2026-11-07T08:18:11.719766+00:00"
 }

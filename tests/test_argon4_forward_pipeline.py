@@ -1109,6 +1109,79 @@ def test_v12_future_stage_activation_does_not_sleep_through_early_window(harness
     assert h.p._worker_delay() == .2
 
 
+def test_v12_revision_wait_worker_reaches_next_early_window_without_replaying_cutover(harness, monkeypatch):
+    from tools.argon4_forward import revisions
+    h = harness
+    enable_v12(h, monkeypatch)
+    next_boundary = BOUNDARY + timedelta(minutes=5)
+    monkeypatch.setattr(revisions, "ensure_view_committed", lambda runtime: {
+        "status": "COMMITTED", "view_effective_at": (BOUNDARY+timedelta(seconds=1)).isoformat()})
+    h.state.upper = next_boundary-timedelta(seconds=3)
+    original_cycle = h.p.cycle
+    visits, finished = [], []
+
+    def cycle():
+        visits.append(h.state.upper)
+        assert len(visits) < 40, "worker failed to reach the next live window"
+        h.clock["observed_at"] = h.state.upper.isoformat()
+        if h.state.upper-timedelta(seconds=.2) >= next_boundary:
+            h.state.boundary = next_boundary
+            h.refresh_markets()
+        original_cycle()
+        if h.p.last_cohort == next_boundary:
+            finished.append(True)
+        if h.state.upper < next_boundary:
+            assert h.p.status()["status"] == "REVISION_WAITING_FUTURE_WINDOW"
+            assert h.state.refreshes == 0 and h.account.overview()["order_count"] == 0
+
+    monkeypatch.setattr(h.p, "cycle", cycle)
+    monkeypatch.setattr(h.p.stop, "is_set", lambda: bool(finished))
+    h.p.worker()
+    saved = h.observations.latest("prediction_decisions")
+    assert saved["cohort"] == next_boundary.isoformat()
+    assert h.state.refreshes == 1
+    timing = h.p.status()["timing"]
+    assert next_boundary+timedelta(seconds=2.5) <= datetime.fromisoformat(timing["started_at"]) <= next_boundary+timedelta(seconds=3)
+    assert 1 in h.state.waits and .2 in h.state.waits and 10 not in h.state.waits
+    assert h.account.cohort_state(BOUNDARY) is None
+    assert h.account.cohort_state(next_boundary) is not None
+    assert h.account.overview()["order_count"] > 0
+    assert h.account.overview()["live_enabled"] is False
+    assert all(datetime.fromisoformat(fill["venue_market"]["window_start"]) == next_boundary
+               for fill in h.p.status()["execution"]["fills"])
+
+
+@pytest.mark.parametrize("mode", ["legacy", "cold", "invalid_clock"])
+def test_revision_wait_fast_polling_does_not_bypass_legacy_warmup_or_clock_guards(harness, monkeypatch, mode):
+    from tools.argon4_forward import revisions
+    h = harness
+    if mode != "legacy":
+        enable_v12(h, monkeypatch)
+    if mode == "cold":
+        h.p.warmup_complete = False
+    h.state.upper = BOUNDARY+timedelta(seconds=299.5)
+    monkeypatch.setattr(revisions, "ensure_view_committed", lambda runtime: {
+        "status": "COMMITTED", "view_effective_at": (BOUNDARY+timedelta(seconds=1)).isoformat()})
+    if mode == "invalid_clock":
+        def invalid(*args, **kwargs):
+            raise ValueError("fixture calibration unavailable")
+        monkeypatch.setattr(pipeline, "calibrated_now", invalid)
+    completed = []
+    monkeypatch.setattr(h.p.stop, "is_set", lambda: bool(completed))
+
+    def one_wait(seconds):
+        completed.append(seconds)
+        return False
+
+    monkeypatch.setattr(h.p.stop, "wait", one_wait)
+    h.p.worker()
+    assert completed == [10]
+    assert h.state.refreshes == 0 and h.state.feature_calls == [] and h.state.book_calls == []
+    assert h.account.overview()["order_count"] == 0
+    expected = "PAPER_BLOCKED" if mode == "invalid_clock" else "REVISION_WAITING_FUTURE_WINDOW"
+    assert h.p.status()["status"] == expected
+
+
 def test_v5_saved_model_scores_fill_approved_budget_and_persist_execution(harness):
     h = harness
     enable_v5(h)

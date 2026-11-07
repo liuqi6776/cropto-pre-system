@@ -474,9 +474,10 @@ class ForwardPipeline:
             return False
 
     def _worker_delay(self):
-        stage_wait = (self._worker_engineering.get("profile") == V12_PROFILE_ID
-                      and self.warmup_complete and self.state.get("status") == "STAGE_WAITING_ACTIVATION")
-        if self.state.get("active") or stage_wait:
+        future_window_wait = (self._worker_engineering.get("profile") == V12_PROFILE_ID
+                              and self.warmup_complete and self.state.get("status") in (
+                                  "STAGE_WAITING_ACTIVATION", "REVISION_WAITING_FUTURE_WINDOW"))
+        if self.state.get("active") or future_window_wait:
             return self._worker_engineering.get("window_poll_interval_seconds", 1) if self._critical_window() else 1
         return 10
 
