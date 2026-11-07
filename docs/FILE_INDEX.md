@@ -37,6 +37,7 @@
 ## docs
 
 - [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)
+- [docs/ARGON4_EXECUTION_V12.md](../docs/ARGON4_EXECUTION_V12.md)
 - [docs/ARGON4_LATENCY_V11.md](../docs/ARGON4_LATENCY_V11.md)
 - [docs/EXPORT_VALIDATION.md](../docs/EXPORT_VALIDATION.md)
 - [docs/FILE_INDEX.md](../docs/FILE_INDEX.md)
@@ -107,6 +108,7 @@
 
 ## scripts
 
+- [scripts/analyze_argon4_book_telemetry.py](../scripts/analyze_argon4_book_telemetry.py)
 - [scripts/argon4_clean_room_fetch.py](../scripts/argon4_clean_room_fetch.py)
 - [scripts/argon4_clean_room_report.py](../scripts/argon4_clean_room_report.py)
 - [scripts/argon4_clean_room_reproduce.py](../scripts/argon4_clean_room_reproduce.py)
@@ -127,6 +129,7 @@
 ## tests
 
 - [tests/conftest.py](../tests/conftest.py)
+- [tests/test_argon4_book_telemetry_analysis.py](../tests/test_argon4_book_telemetry_analysis.py)
 - [tests/test_argon4_clean_room.py](../tests/test_argon4_clean_room.py)
 - [tests/test_argon4_forward_account.py](../tests/test_argon4_forward_account.py)
 - [tests/test_argon4_forward_allocation.py](../tests/test_argon4_forward_allocation.py)
@@ -151,6 +154,7 @@
 - [tests/test_argon4_forward_public_refresh.py](../tests/test_argon4_forward_public_refresh.py)
 - [tests/test_argon4_forward_recovery_cli.py](../tests/test_argon4_forward_recovery_cli.py)
 - [tests/test_argon4_forward_revisions.py](../tests/test_argon4_forward_revisions.py)
+- [tests/test_argon4_forward_risk_view.py](../tests/test_argon4_forward_risk_view.py)
 - [tests/test_argon4_forward_runtime_profile.py](../tests/test_argon4_forward_runtime_profile.py)
 - [tests/test_argon4_forward_server.py](../tests/test_argon4_forward_server.py)
 - [tests/test_argon4_forward_stage.py](../tests/test_argon4_forward_stage.py)
@@ -161,6 +165,7 @@
 - [tests/test_argon4_gen4_sparse_evaluation.py](../tests/test_argon4_gen4_sparse_evaluation.py)
 - [tests/test_argon4_gen4_sparse_network.py](../tests/test_argon4_gen4_sparse_network.py)
 - [tests/test_argon4_mark_revision_registry.py](../tests/test_argon4_mark_revision_registry.py)
+- [tests/test_argon4_multilook.py](../tests/test_argon4_multilook.py)
 - [tests/test_argon4_prepared_revision_recovery.py](../tests/test_argon4_prepared_revision_recovery.py)
 
 ## tools
@@ -186,6 +191,7 @@
 - [tools/argon4_forward/polymarket.py](../tools/argon4_forward/polymarket.py)
 - [tools/argon4_forward/polymarket_transport.py](../tools/argon4_forward/polymarket_transport.py)
 - [tools/argon4_forward/revisions.py](../tools/argon4_forward/revisions.py)
+- [tools/argon4_forward/risk_view.py](../tools/argon4_forward/risk_view.py)
 - [tools/argon4_forward/runtime_profile.py](../tools/argon4_forward/runtime_profile.py)
 - [tools/argon4_forward/stage.py](../tools/argon4_forward/stage.py)
 

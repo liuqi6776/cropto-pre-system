@@ -4,23 +4,28 @@
   "files": [
     {
       "path": "config/argon4_forward_policy.json",
-      "sha256": "58d43fc5c6ec312e3f3c441d183e247c3ba37173a323e64f363de8511a417471",
-      "bytes": 8175
+      "sha256": "1c8dcd60dd3b27f3a030e93301ed67364615783e17f41a27af1a8d056ce7a483",
+      "bytes": 8640
     },
     {
       "path": "dashboard/argon4_forward/app.js",
-      "sha256": "fd61516c57634f2bfa69e1161035a7a3e466629bf006132b9e06b69a4ff3aaf4",
-      "bytes": 13231
+      "sha256": "e769a78fc173c8f0cc57f2b8cb7a9dceeca5e1f4aeb3cc963bbea18ee80df79d",
+      "bytes": 15158
     },
     {
       "path": "dashboard/argon4_forward/index.html",
-      "sha256": "4e50384f170c4da852d5af46add0408da31c67318caa9a032c2387b99cc9fbaf",
-      "bytes": 6275
+      "sha256": "560468eb5e9c7b1dae168d4ad4243ee96a1b8f8a92f2efbd67a22e4e3db61518",
+      "bytes": 7305
     },
     {
       "path": "dashboard/argon4_forward/style.css",
       "sha256": "226e05a6e1ecb84e7d9ff96fa7eedf5f222283b92a9045de432dff56545ed643",
       "bytes": 3586
+    },
+    {
+      "path": "docs/ARGON4_EXECUTION_V12.md",
+      "sha256": "79aa90217d501ca84510f1a5a1e944d3c02a4748de8d06d2e745b728e9470443",
+      "bytes": 6094
     },
     {
       "path": "docs/ARGON4_LATENCY_V11.md",
@@ -188,6 +193,11 @@
       "bytes": 37223
     },
     {
+      "path": "scripts/analyze_argon4_book_telemetry.py",
+      "sha256": "fd6c1a1acd8590d80ae8b8c212f8ca971608209aa25a4594fdc3635f4d0838bc",
+      "bytes": 21412
+    },
+    {
       "path": "scripts/argon4_clean_room_fetch.py",
       "sha256": "fc63b8df37f9db1600b1fa05c5a1d44071c1c97f0dbd76f80695bf74fdf4778e",
       "bytes": 17420
@@ -209,8 +219,8 @@
     },
     {
       "path": "scripts/argon4_forward_server.py",
-      "sha256": "3196fceac6b70e7f7739d955ab85a2c5b70b3ad2f8aba32ead0fd87d1cc6e7db",
-      "bytes": 14708
+      "sha256": "13fc3248de805ef9e34d5c18172193b763e33aa9b10ca4e2e17a420ed113ab70",
+      "bytes": 15349
     },
     {
       "path": "scripts/argon4_live_preflight.py",
@@ -268,6 +278,11 @@
       "bytes": 16662
     },
     {
+      "path": "tests/test_argon4_book_telemetry_analysis.py",
+      "sha256": "a49bdcac546933b1a6801b43354d6b5220ab6a2be3018813fbfab6b5d2eba4a1",
+      "bytes": 13172
+    },
+    {
       "path": "tests/test_argon4_clean_room.py",
       "sha256": "4b04bdc74846988272dd88a697422e73e8e7a1db42e16b13da0f887c977ff2c4",
       "bytes": 3987
@@ -284,8 +299,8 @@
     },
     {
       "path": "tests/test_argon4_forward_book_telemetry.py",
-      "sha256": "9964ec89cb7d8f8838143305ebf42f7fac66f2bc18a42c4399ed2336988467d3",
-      "bytes": 15125
+      "sha256": "b7718102bf000ce5c28afe20e555bcc2ac2a6b4382674015c130fce67016fb3c",
+      "bytes": 25459
     },
     {
       "path": "tests/test_argon4_forward_clock.py",
@@ -359,8 +374,8 @@
     },
     {
       "path": "tests/test_argon4_forward_pipeline.py",
-      "sha256": "4633990c39fec62f6d036c09111c984d3ef94b3cbbe63ba6655efb345f9c1648",
-      "bytes": 52689
+      "sha256": "d23319eefdf436afcc84b54f18600eb4d37c573b60f6c09960e1e3e782db7ff6",
+      "bytes": 62650
     },
     {
       "path": "tests/test_argon4_forward_polymarket.py",
@@ -388,9 +403,14 @@
       "bytes": 15203
     },
     {
+      "path": "tests/test_argon4_forward_risk_view.py",
+      "sha256": "19f16d7ece50623f56243d67c9d7bf32bc709f830fee35b6af859cd75b09a85d",
+      "bytes": 5737
+    },
+    {
       "path": "tests/test_argon4_forward_runtime_profile.py",
-      "sha256": "4927b613637f20abe99338a3140aac3c68efcf36440247b1d095016f11bbfb6e",
-      "bytes": 2464
+      "sha256": "b28a2079c8f9bc7e9afb8d34059c438f0e40a6197fd4ec6ffbd187fd89a1a14f",
+      "bytes": 3762
     },
     {
       "path": "tests/test_argon4_forward_server.py",
@@ -438,6 +458,11 @@
       "bytes": 8653
     },
     {
+      "path": "tests/test_argon4_multilook.py",
+      "sha256": "3bd29e7df2b2b9920dfa6cc34c39df9e53f966ffb7277729ac49a60c18c2a271",
+      "bytes": 14104
+    },
+    {
       "path": "tests/test_argon4_prepared_revision_recovery.py",
       "sha256": "4042905fe6a6e739014c1199c6c392d24a56907028cd7d08813ea31ef28e5454",
       "bytes": 8995
@@ -449,8 +474,8 @@
     },
     {
       "path": "tools/argon4_forward/account.py",
-      "sha256": "add64561a7b245949075cdec0b19090e81288fda83e10c82a37998b3f820015c",
-      "bytes": 57471
+      "sha256": "c706f2e65ca463ce4bbb0047a796f41ea40c554b5933d4679b2711674bfbd4c2",
+      "bytes": 69561
     },
     {
       "path": "tools/argon4_forward/allocation.py",
@@ -459,8 +484,8 @@
     },
     {
       "path": "tools/argon4_forward/book_telemetry.py",
-      "sha256": "a11cc471c4e1fba5dd9a0ab6c15eb88b2c9e77b0afe1532e4faf3dadea738c8c",
-      "bytes": 23584
+      "sha256": "86d170665fa7c13930ec4617a94b4323269d4d26ef6542592d6998907c85c17a",
+      "bytes": 32120
     },
     {
       "path": "tools/argon4_forward/clock_sync.py",
@@ -469,8 +494,8 @@
     },
     {
       "path": "tools/argon4_forward/execution.py",
-      "sha256": "719b4598b6a1897dc70aaf2151d1f925f1b06d95197311187ff1f1bee2247e47",
-      "bytes": 36020
+      "sha256": "bf4d0e48f38d76e4f6cbdf468906b3f550957d1ab68b7d1e7e4b9b21778866f2",
+      "bytes": 39816
     },
     {
       "path": "tools/argon4_forward/feature_cache.py",
@@ -504,8 +529,8 @@
     },
     {
       "path": "tools/argon4_forward/live_preflight.py",
-      "sha256": "0a5d2ba245c444cd2054417c2e62c762a90e5ba7c7ba8480ab23e5e102aaafae",
-      "bytes": 3413
+      "sha256": "0ae2376c6172468d5844245fdd83131a9b33c98aa4e10f0f4a18f80b5c5ade70",
+      "bytes": 3756
     },
     {
       "path": "tools/argon4_forward/mark_revision_registry.py",
@@ -529,8 +554,8 @@
     },
     {
       "path": "tools/argon4_forward/pipeline.py",
-      "sha256": "7de0ad550d94efc9ad105a05a02fa8f3aff82984f6c8f1c0bc61be03412b6cf1",
-      "bytes": 32427
+      "sha256": "b36e5152cef84544a9f56dae58dbc6c5dc2975406767f08010e5d34e72b3a2dd",
+      "bytes": 41612
     },
     {
       "path": "tools/argon4_forward/polymarket.py",
@@ -548,9 +573,14 @@
       "bytes": 42292
     },
     {
+      "path": "tools/argon4_forward/risk_view.py",
+      "sha256": "7ca8d893bf3bcbe993106c8428e2d7d561fe9e6ead91389acf40a33a93bf3ad9",
+      "bytes": 8043
+    },
+    {
       "path": "tools/argon4_forward/runtime_profile.py",
-      "sha256": "e65fcbc80f3a2246dc3b66e36bcbdd45626cbb573a37e4fc4a2311b547a59ca7",
-      "bytes": 1661
+      "sha256": "2ecf58e3c3be2f03f925a6107c9bdd8508b0ca1c5a7fa062349fc9764587ad38",
+      "bytes": 3031
     },
     {
       "path": "tools/argon4_forward/stage.py",
@@ -558,5 +588,5 @@
       "bytes": 3785
     }
   ],
-  "updated_at_utc": "2026-11-07T05:36:04.940334+00:00"
+  "updated_at_utc": "2026-11-07T07:13:51.639043+00:00"
 }

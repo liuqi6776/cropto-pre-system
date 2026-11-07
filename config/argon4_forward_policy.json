@@ -1,15 +1,15 @@
 {
   "status": "CONFIRMED",
-  "version": "argon4-local311-independent65-20261106-v11",
+  "version": "argon4-local311-independent65-20261107-v12",
   "venue": "polymarket",
-  "ranking_source": "USER_EXPLICIT_STAGE1_CAPITAL_PRIORITY; user confirmed ETH_5m > BTC_15m > BTC_5m; remaining four disabled; historical win-rate evidence retained only as context",
-  "ranking_label": "第一阶段：用户指定资金顺序 ETH5 → BTC15 → BTC5",
+  "ranking_source": "USER_CONFIRMED_STAGE2_LOCAL_FROZEN_RAW_WIN_RATE; same saved local models; historical research evidence remains exploratory",
+  "ranking_label": "第二阶段：本地原始胜率 BTC15 → ETH5 → SOL15 → SOL5 → BTC5",
   "order": [
-    "ETH_5m",
     "BTC_15m",
-    "BTC_5m",
+    "ETH_5m",
     "SOL_15m",
     "SOL_5m",
+    "BTC_5m",
     "ETH_15m",
     "BNB_15m"
   ],
@@ -29,7 +29,7 @@
   "risk_limit_note": "200/1000/500 USD are proposed paper safety ceilings, not empirically established market capacity",
   "paper_trading_active": true,
   "live_enabled": false,
-  "ranking_confirmed_at": "2026-11-06T08:48:03.824352+00:00",
+  "ranking_confirmed_at": "2026-11-07T07:11:56.924576+00:00",
   "historical_ranking_evidence": [
     {
       "stream": "BTC_15m",
@@ -142,7 +142,7 @@
     "SOL_5m": "d024c28dbb773a6470b132cbc1ebd152ebdb706d0db8ee3047487493b3f4f822",
     "BNB_15m": "366484e02b2552e3acd095310b381d216b6f2016a39bd2fe001b1aad3660118f"
   },
-  "min_decision_delay_seconds": 5,
+  "min_decision_delay_seconds": 2.5,
   "input_revision_policy": {
     "scope": "OBSERVED_FUTURES_5M_AND_MARK_1H_VIEWS_ONLY",
     "confirming_receipts": 2,
@@ -155,18 +155,20 @@
     "skip_effective_cohort": true
   },
   "waterfall_semantics": "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1",
-  "previous_execution_version": "argon4-local311-independent65-20261106-v10",
-  "execution_change_authorized_at": "2026-11-07T05:18:51.658328+00:00",
-  "execution_change_note": "Authorized v11 engineering only: bounded parallel public input deadlines, immutable full-history cohort feature snapshots and compile cache, conservative auxiliary prefetch, separate proactive dual-side book telemetry. Models, thresholds, stream order, 0.515, capital limits, min +5s and +20s IOC cutoff unchanged. No historical orders or live order capability.",
+  "previous_execution_version": "argon4-local311-independent65-20261106-v11",
+  "execution_change_authorized_at": "2026-11-07T07:11:56.924576+00:00",
+  "execution_change_note": "Authorized v12 future-only paper: earliest +2.5s, 0.2s critical polling, latest-5m-publication-only input retries within +14s, same-score bounded multi-look IOC within +20s, center-dispatched explicitly classified telemetry, unchanged paid-risk accounting. User confirmed Stage2 local raw-win-rate order BTC15/ETH5/SOL15/SOL5/BTC5. Ask-price 0.515 and all capital caps unchanged. Models/thresholds unchanged. No historical orders or live execution.",
   "execution_stage": {
-    "id": "stage1-eth5-btc15-btc5-20261106",
+    "id": "stage2-local-winrate-v12-20261107",
     "status": "CONFIRMED",
     "enabled_streams": [
-      "ETH_5m",
       "BTC_15m",
+      "ETH_5m",
+      "SOL_15m",
+      "SOL_5m",
       "BTC_5m"
     ],
-    "effective_from": "2026-11-06T08:50:00+00:00"
+    "effective_from": "2026-11-07T07:20:00+00:00"
   },
   "previous_local_winrate_ranking": {
     "version": "argon4-local311-independent65-20261106-v5",
@@ -229,12 +231,32 @@
   },
   "input_http_min_spacing_seconds": 0.25,
   "engineering": {
-    "profile": "argon4-latency-v11",
+    "profile": "argon4-latency-v12",
     "input_deadline_after_boundary_seconds": 14.0,
     "feature_snapshot_cache": true,
     "auxiliary_prefetch": true,
     "prefetch_lead_seconds": 10.0,
     "prefetch_budget_seconds": 3.0,
-    "book_telemetry": true
+    "book_telemetry": true,
+    "window_poll_interval_seconds": 0.2,
+    "input_ready_retry_interval_seconds": 0.5,
+    "telemetry_sampling_profile": "clock_center_v12"
+  },
+  "execution": {
+    "multi_look_ioc": true,
+    "max_price_rechecks": 3,
+    "price_recheck_interval_seconds": 2.5,
+    "minimum_recheck_remaining_seconds": 3.0,
+    "last_recheck_start_after_boundary_seconds": 18.5
+  },
+  "previous_execution_stage": {
+    "id": "stage1-eth5-btc15-btc5-20261106",
+    "status": "CONFIRMED",
+    "enabled_streams": [
+      "ETH_5m",
+      "BTC_15m",
+      "BTC_5m"
+    ],
+    "effective_from": "2026-11-06T08:50:00+00:00"
   }
 }

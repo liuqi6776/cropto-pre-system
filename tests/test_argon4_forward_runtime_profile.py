@@ -5,6 +5,7 @@ import json
 import pytest
 
 from tools.argon4_forward.runtime_profile import engineering_profile, V11_ENGINEERING
+from tools.argon4_forward.runtime_profile import V12_ENGINEERING, minimum_decision_delay
 from tools.argon4_forward.live_preflight import preparation_status, verify_artifacts
 
 
@@ -35,6 +36,33 @@ def test_legacy_defaults_and_shared_preparation_never_enable_live():
     c["live_enabled"] = True
     report = preparation_status(p, c)
     assert not report["configuration_safe"] and not report["live_enabled"]
+
+
+def test_early_decision_is_explicit_v12_only():
+    p = fixture_policy()
+    p["min_decision_delay_seconds"] = 2.5
+    with pytest.raises(ValueError, match="minimum decision delay"):
+        minimum_decision_delay(p)
+    p["engineering"] = deepcopy(V12_ENGINEERING)
+    assert minimum_decision_delay(p) == 2.5
+    assert preparation_status(p, fixture_config())["ready_for_live"] is False
+
+
+@pytest.mark.parametrize("key,value", [("window_poll_interval_seconds", True),
+    ("window_poll_interval_seconds", .01), ("input_ready_retry_interval_seconds", float("nan")),
+    ("input_ready_retry_interval_seconds", .1), ("telemetry_sampling_profile", "ignore_uncertainty")])
+def test_v12_timing_and_sampling_contract_fails_closed(key, value):
+    p = fixture_policy()
+    p["engineering"] = deepcopy(V12_ENGINEERING)
+    p["engineering"][key] = value
+    with pytest.raises(ValueError): engineering_profile(p)
+
+
+@pytest.mark.parametrize("value", [True, None, float("nan"), 1.9, 10.1])
+def test_v12_rejects_unapproved_earliest_delay(value):
+    p = fixture_policy()
+    p.update(engineering=deepcopy(V12_ENGINEERING), min_decision_delay_seconds=value)
+    with pytest.raises(ValueError): minimum_decision_delay(p)
 
 
 def test_preflight_checks_bytes_without_deserializing_or_connecting(tmp_path):

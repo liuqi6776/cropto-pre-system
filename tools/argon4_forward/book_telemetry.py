@@ -28,6 +28,25 @@ EVIDENCE_CLASS = "PUBLIC_BOOK_OBSERVATION_ONLY_NOT_FILL_EVIDENCE"
 SAMPLE_TOLERANCE_SECONDS = 1.0
 BOOK_MAX_AGE_SECONDS = 2.0
 MAX_WORKERS = 6
+SAMPLING_PROFILES = ("legacy_v11", "clock_center_v12")
+
+
+def _midpoint(lower, upper):
+    return lower + (upper - lower) / 2
+
+
+def _interval_relation(lower, upper, target):
+    """Classify the entire calibrated interval, never just its lower bound."""
+    deadline = target + timedelta(seconds=SAMPLE_TOLERANCE_SECONDS)
+    if upper < target:
+        return "BEFORE_TARGET"
+    if lower > deadline:
+        return "AFTER_TARGET_WINDOW"
+    if lower < target:
+        return "CLOCK_OVERLAP_TARGET"
+    if upper > deadline:
+        return "CLOCK_OVERLAP_DEADLINE"
+    return "WITHIN_TARGET_WINDOW"
 
 
 def _iso(value):
@@ -90,7 +109,12 @@ class BookTelemetry:
     """
 
     def __init__(self, runtime, *, policy_provider, market_provider, clock_provider,
-                 decision_provider=None, transport_factory=None, request_spacing_seconds=.05):
+                 decision_provider=None, transport_factory=None, request_spacing_seconds=.05,
+                 sampling_profile="legacy_v11"):
+        if sampling_profile not in SAMPLING_PROFILES:
+            raise ValueError("unknown book sampling profile")
+        self.sampling_profile = sampling_profile
+        self._center_dispatch = sampling_profile == "clock_center_v12"
         self.path = Path(runtime) / "book_telemetry.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.policy_provider = policy_provider
@@ -105,11 +129,18 @@ class BookTelemetry:
         self._pending = {}
         self._last_armed = None
         self._closed = threading.Event()
-        self._queue = queue.Queue(maxsize=MAX_WORKERS)
-        self._slots = threading.BoundedSemaphore(MAX_WORKERS)
+        # Stage 2 can schedule ten simultaneous outcome observations. V12
+        # retains six HTTP workers and bounds running + queued tasks to twelve;
+        # every queued task must still pass its own request-time deadline.
+        self._max_outstanding = MAX_WORKERS * (2 if self._center_dispatch else 1)
+        self._queue = queue.Queue(maxsize=self._max_outstanding)
+        self._slots = threading.BoundedSemaphore(self._max_outstanding)
         self._workers = []
         self._active = 0
         self._completed = 0
+        self._quality_counts = {}
+        self._actual_quote_samples = 0
+        self._actual_depth_samples = 0
         self._last_sample = None
         self._last_error = None
         self._clock_status = "WAITING_CLOCK"
@@ -151,9 +182,16 @@ class BookTelemetry:
         with self._lock:
             self._pending.pop(row["sample_id"], None)
             self._completed += 1
+            self._quality_counts[status] = self._quality_counts.get(status, 0) + 1
+            actual = row.get("actual_observation")
+            if actual is not None:
+                self._actual_quote_samples += 1
+                if actual.get("capacity", {}).get("status") == "OBSERVED_DEPTH":
+                    self._actual_depth_samples += 1
             self._last_sample = {k: row.get(k) for k in (
                 "cohort", "stream", "outcome", "target_offset_seconds", "target_at", "status", "reason",
-                "requested_at_local", "received_at_local", "best_bid", "best_ask", "capacity")}
+                "requested_at_local", "received_at_local", "best_bid", "best_ask", "capacity",
+                "sampling_profile", "timing_quality", "actual_observation")}
 
     def _bounds(self):
         clock = _copy(self.clock_provider() or {})
@@ -181,10 +219,16 @@ class BookTelemetry:
                            "status": "PLANNED", "reason": None, "armed_at_local": _iso(datetime.now(timezone.utc)),
                            "source": SOURCE, "evidence_class": EVIDENCE_CLASS, "policy_sha256": policy_hash,
                            "stage_id": profile["id"], "execution_enabled": False, "live_enabled": False,
-                           "best_bid": None, "best_ask": None, "capacity": None}
+                           "best_bid": None, "best_ask": None, "capacity": None,
+                           "sampling_profile": self.sampling_profile,
+                           "actual_observation": None, "timing_quality": None}
                     if self._save(row, insert=True):
                         self._pending[identity] = row
         self._last_armed = cohort
+        if self._center_dispatch:
+            # Start the bounded, independent worker pool before the target.
+            # No network requests or historical catch-up are performed here.
+            self._ensure_workers()
 
     def _market(self, snapshot, row):
         state = (snapshot or {}).get("streams", {}).get(row["stream"], {})
@@ -228,12 +272,17 @@ class BookTelemetry:
             future = datetime.fromtimestamp((int(upper.timestamp()) // 300 + 1) * 300, timezone.utc)
             if self._last_armed is None or future > self._last_armed:
                 self._arm(future)
-            due = [r for r in self._pending.values() if utc(r["target_at"]) <= lower]
+            dispatch_point = _midpoint(lower, upper) if self._center_dispatch else lower
+            due = [r for r in self._pending.values() if utc(r["target_at"]) <= dispatch_point]
             snapshot = None
             for row in due:
                 target = utc(row["target_at"])
                 row["dispatch_clock"] = clock
-                if upper > target + timedelta(seconds=SAMPLE_TOLERANCE_SECONDS):
+                # In v12 the centre schedules requests; it does NOT attest that
+                # they started after target or finished before target + 1s.
+                # Both bounds are checked again from actual receipt timestamps.
+                expiry_point = dispatch_point if self._center_dispatch else upper
+                if expiry_point > target + timedelta(seconds=SAMPLE_TOLERANCE_SECONDS):
                     self._finish(row, "MISSED_SAMPLE", "SCHEDULER_LATE")
                     continue
                 with self._lock:
@@ -317,7 +366,8 @@ class BookTelemetry:
             return
         clock, lower, upper = self._bounds()
         target = utc(row["target_at"])
-        if upper > target + timedelta(seconds=SAMPLE_TOLERANCE_SECONDS):
+        dispatch_point = _midpoint(lower, upper) if self._center_dispatch else upper
+        if dispatch_point > target + timedelta(seconds=SAMPLE_TOLERANCE_SECONDS):
             self._finish(row, "MISSED_SAMPLE", "REQUEST_SLOT_LATE")
             return
         with self._lock:
@@ -347,19 +397,28 @@ class BookTelemetry:
         try:
             calibrated_now(clock, upper=True)
             requested_lower = project_local(receipt["requested_at"], clock, upper=False)
+            requested_upper = project_local(receipt["requested_at"], clock, upper=True)
             received_lower = project_local(receipt["received_at"], clock, upper=False)
             received_upper = project_local(receipt["received_at"], clock, upper=True)
             row.update(requested_at_server_lower=_iso(requested_lower),
+                       requested_at_server_upper=_iso(requested_upper),
                        received_at_server_lower=_iso(received_lower), received_at_server_upper=_iso(received_upper),
                        clock_uncertainty_seconds=clock["uncertainty_seconds"],
                        receipt_lateness_upper_seconds=(received_upper-target).total_seconds())
-            book = validate_book(raw, row["token_id"], row["condition_id"], received_upper)
+            # V12 derivatives are built from the exact hashed response text,
+            # not a possibly inconsistent caller-supplied decoded object.
+            evidence = json.loads(receipt["raw_text"]) if self._center_dispatch else raw
+            book = validate_book(evidence, row["token_id"], row["condition_id"], received_upper)
             row["parsed_book"] = book
             source = utc(book["source_at"])
             row.update(source_at=book["source_at"], source_book_age_upper_seconds=(received_upper-source).total_seconds(),
                        source_book_age_lower_seconds=(received_lower-source).total_seconds())
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             self._finish(row, "INVALID_OBSERVATION", type(exc).__name__)
+            return
+        if self._center_dispatch:
+            self._finish_v12_response(row, book, target, requested_lower, requested_upper,
+                                      received_lower, received_upper, source, clock)
             return
         if requested_lower < target or received_lower < requested_lower:
             self._finish(row, "INVALID_OBSERVATION", "RECEIPT_TIMING_INVALID")
@@ -381,6 +440,78 @@ class BookTelemetry:
         row["capacity"] = (fee_inclusive_capacity(book, row.get("fee") or {}) if valid_fee_proof
                            else {"status": "FEE_METADATA_UNVERIFIED", "usd": None, "shares": None, "is_fill_estimate": False})
         self._finish(row, "OBSERVED")
+
+    def _finish_v12_response(self, row, book, target, requested_lower, requested_upper,
+                             received_lower, received_upper, source, clock):
+        """Keep strict slice eligibility separate from actual receipt evidence.
+
+        A centre-clock dispatch can straddle the target. Such a response is
+        useful timestamped evidence, but it does not become an OBSERVED slice.
+        Late, complete responses get the same freshness/fee checks as timely
+        ones before any derived depth is published in ``actual_observation``.
+        """
+        request_center = _midpoint(requested_lower, requested_upper)
+        receipt_center = _midpoint(received_lower, received_upper)
+        request_relation = _interval_relation(requested_lower, requested_upper, target)
+        response_relation = _interval_relation(received_lower, received_upper, target)
+        strict = (requested_lower >= target and received_lower >= requested_lower
+                  and received_upper <= target + timedelta(seconds=SAMPLE_TOLERANCE_SECONDS))
+        row["timing_quality"] = {
+            "request_interval_relation": request_relation,
+            "response_interval_relation": response_relation,
+            "requested_offset_center_seconds": (request_center-target).total_seconds(),
+            "received_offset_center_seconds": (receipt_center-target).total_seconds(),
+            "requested_offset_lower_seconds": (requested_lower-target).total_seconds(),
+            "requested_offset_upper_seconds": (requested_upper-target).total_seconds(),
+            "received_offset_lower_seconds": (received_lower-target).total_seconds(),
+            "received_offset_upper_seconds": (received_upper-target).total_seconds(),
+            "strict_target_window": strict,
+            "exact_target_instant": False,
+            "sample_tolerance_seconds": SAMPLE_TOLERANCE_SECONDS,
+        }
+        if received_lower < requested_lower:
+            self._finish(row, "INVALID_OBSERVATION", "RECEIPT_TIMING_INVALID")
+            return
+        if (book["status"] != "OBSERVED" or source > received_upper
+                or (received_upper-source).total_seconds() > BOOK_MAX_AGE_SECONDS):
+            self._finish(row, "INVALID_OBSERVATION", "BOOK_STALE_FUTURE_OR_INCOMPLETE")
+            return
+        try:
+            if not row.get("metadata_received_at_local"):
+                raise ValueError("metadata receipt missing")
+            metadata_age = (received_upper - project_local(row["metadata_received_at_local"], clock, upper=False)).total_seconds()
+            valid_fee_proof = bool(re.fullmatch(r"[0-9a-f]{64}", row["metadata_sha256"])) and 0 <= metadata_age <= 90
+        except (KeyError, TypeError, ValueError):
+            valid_fee_proof = False
+        capacity = (fee_inclusive_capacity(book, row.get("fee") or {}) if valid_fee_proof
+                    else {"status": "FEE_METADATA_UNVERIFIED", "usd": None, "shares": None, "is_fill_estimate": False})
+        row["actual_observation"] = {
+            "source_at": book["source_at"],
+            "source_offset_seconds": (source-target).total_seconds(),
+            "source_receipt_relation": "AT_OR_BEFORE_RECEIPT_INTERVAL" if source <= received_lower else "CLOCK_OVERLAP_RECEIPT",
+            "requested_at_server_center": _iso(request_center),
+            "requested_at_server_lower": _iso(requested_lower),
+            "requested_at_server_upper": _iso(requested_upper),
+            "received_at_server_center": _iso(receipt_center),
+            "received_at_server_lower": _iso(received_lower),
+            "received_at_server_upper": _iso(received_upper),
+            "best_bid": book["best_bid"], "best_ask": book["best_ask"],
+            "capacity": capacity,
+            "capacity_scope": "ACTUAL_RECEIPT_NOT_TARGET_INSTANT",
+            "strict_target_window": strict,
+            "source_book_age_upper_seconds": (received_upper-source).total_seconds(),
+            "clock_uncertainty_seconds": clock["uncertainty_seconds"],
+            "is_fill_estimate": False,
+        }
+        if received_upper > target + timedelta(seconds=SAMPLE_TOLERANCE_SECONDS):
+            self._finish(row, "MISSED_SAMPLE", "RESPONSE_LATE_RAW_RETAINED")
+        elif requested_upper < target:
+            self._finish(row, "MISSED_SAMPLE", "REQUEST_BEFORE_TARGET_RAW_RETAINED")
+        elif requested_lower < target:
+            self._finish(row, "AMBIGUOUS_SAMPLE", "REQUEST_TARGET_CLOCK_OVERLAP")
+        else:
+            row.update(best_bid=book["best_bid"], best_ask=book["best_ask"], capacity=capacity)
+            self._finish(row, "OBSERVED")
 
     def publish_decisions(self, cohort, decisions, *, inputs_ready_at=None, observed_at=None):
         """Attach later evidence without changing a single sample timestamp."""
@@ -429,8 +560,16 @@ class BookTelemetry:
             return {"status": "STOPPED" if self._closed.is_set() else self._clock_status,
                     "evidence_class": EVIDENCE_CLASS, "source": SOURCE, "database": str(self.path),
                     "target_offsets_seconds": list(OFFSETS), "sample_tolerance_seconds": SAMPLE_TOLERANCE_SECONDS,
-                    "pending_samples": len(self._pending), "active_requests": self._active, "max_requests": MAX_WORKERS,
+                    "sampling_profile": self.sampling_profile,
+                    "dispatch_time_basis": "CALIBRATED_CENTER" if self._center_dispatch else "CALIBRATED_LOWER_BOUND",
+                    "observed_requires_full_target_interval": True,
+                    "pending_samples": len(self._pending), "active_requests": self._active,
+                    "max_requests": self._max_outstanding, "max_workers": MAX_WORKERS,
+                    "queued_requests": self._queue.qsize(),
                     "completed_this_process": self._completed, "last_sample": _copy(self._last_sample),
+                    "quality_counts_this_process": dict(self._quality_counts),
+                    "actual_quote_samples_this_process": self._actual_quote_samples,
+                    "actual_depth_samples_this_process": self._actual_depth_samples,
                     "last_error": self._last_error, "last_armed_cohort": _iso(self._last_armed) if self._last_armed else None,
                     "backoff_until": _iso(self._backoff_until) if self._backoff_until else None,
                     "execution_enabled": False, "live_enabled": False, "counts_as_fills": False}
@@ -438,7 +577,7 @@ class BookTelemetry:
     def worker(self, stop_event):
         while not stop_event.is_set() and not self._closed.is_set():
             self.tick()
-            stop_event.wait(.1)
+            stop_event.wait(.05 if self._center_dispatch else .1)
         self.close(wait=False)
 
     def close(self, wait=False):

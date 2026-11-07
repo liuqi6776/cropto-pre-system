@@ -99,6 +99,24 @@ def _stage(policy, boundary):
         raise AccountRejected(str(exc)) from exc
 
 
+def multi_look_settings(policy):
+    """Explicit v12-only admission; older policies retain one-look semantics."""
+    if policy.get("engineering", {}).get("profile") != "argon4-latency-v12":
+        return None
+    settings = policy.get("execution", {})
+    if not isinstance(settings, Mapping) or not isinstance(settings.get("multi_look_ioc", False), bool):
+        raise AccountRejected("invalid multi-look execution settings")
+    if settings.get("multi_look_ioc") is not True:
+        return None
+    count = settings.get("max_price_rechecks")
+    if (not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= 3
+            or _d(settings.get("price_recheck_interval_seconds")) != Decimal("2.5")
+            or _d(settings.get("minimum_recheck_remaining_seconds")) != Decimal("3")
+            or _d(settings.get("last_recheck_start_after_boundary_seconds")) != Decimal("18.5")):
+        raise AccountRejected("multi-look bounds differ from the approved execution policy")
+    return dict(settings)
+
+
 class Account:
     """One restart-safe USD account, stored separately from every historical run."""
 
@@ -157,6 +175,12 @@ class Account:
                     state TEXT NOT NULL, capacity_atoms INTEGER NOT NULL, approved_atoms INTEGER NOT NULL,
                     spent_atoms INTEGER NOT NULL, signal_id TEXT, receipt_json TEXT NOT NULL,
                     PRIMARY KEY(cohort_id,stream), UNIQUE(cohort_id,rank)
+                );
+                CREATE TABLE IF NOT EXISTS cohort_book_looks (
+                    cohort_id TEXT NOT NULL, stream TEXT NOT NULL, attempt INTEGER NOT NULL,
+                    requested_at TEXT NOT NULL, completed_at TEXT, state TEXT NOT NULL,
+                    next_retry_at TEXT, signal_sha256 TEXT NOT NULL, receipt_json TEXT NOT NULL,
+                    PRIMARY KEY(cohort_id,stream,attempt)
                 );
                 CREATE TABLE IF NOT EXISTS events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, utc TEXT NOT NULL, event_type TEXT NOT NULL,
@@ -360,7 +384,8 @@ class Account:
         from the UTC schedule. A price skip carries the full observed own-side
         book, bound fee quote and validated signal. Missing data is never a skip.
         """
-        stamp, boundary = _now(now), _ts(cohort_id)
+        current_time = lambda: _now(now() if callable(now) else now)
+        stamp, boundary = current_time(), _ts(cohort_id)
         key = _iso(boundary)
         _safe(receipt)
         if (stream not in STREAMS or decision_status not in ("NO_SIGNAL", "NOT_DUE", "PRICE_LIMIT_NOT_MET")
@@ -368,36 +393,12 @@ class Account:
             raise AccountRejected("explicit validated skip receipt required")
         clean = None
         if decision_status == "PRICE_LIMIT_NOT_MET":
-            clean = self._validate_signal(receipt.get("signal"), stamp)
-            if clean["stream"] != stream or _ts(clean["window_start"]) != boundary:
-                raise AccountRejected("price skip signal cohort mismatch")
-            book, fee = receipt.get("orderbook"), receipt.get("fee_quote")
-            if (receipt.get("source") != "OBSERVED_PRICE_LIMIT_CHECK" or not isinstance(book, Mapping)
-                    or book.get("kind") != "OBSERVED_PUBLIC_ORDERBOOK" or not book.get("source")
-                    or not isinstance(fee, Mapping)):
-                raise AccountRejected("observed price and fee evidence required")
-            if any(book.get(k) != clean[k] for k in ("market_id", "underlying", "outcome")):
-                raise AccountRejected("price skip book identity mismatch")
-            if any(_ts(book.get(k)) != _ts(clean[k]) for k in ("window_start", "window_end")):
-                raise AccountRejected("price skip contract window mismatch")
-            source, received = _ts(book.get("observed_at")), _ts(book.get("received_at"))
-            if not _ts(clean["decision_at"]) <= source <= received <= stamp or (stamp-source).total_seconds() > 2:
-                raise AccountRejected("price skip book is stale or future")
-            self._fee_per_share(fee, Decimal(".515"), stamp, clean["market_id"], clean["outcome"])
-            asks = book.get("asks")
-            if not isinstance(asks, list) or not asks:
-                raise AccountRejected("nonempty observed asks required for price skip")
-            positive = []
-            for ask in asks:
-                price, size = _d(ask.get("price")), _d(ask.get("size"))
-                if not 0 < price < 1 or size < 0:
-                    raise AccountRejected("invalid price skip ask level")
-                if size > 0:
-                    positive.append(price)
-            if not positive or min(positive) <= Decimal(".515"):
-                raise AccountRejected("price skip requires all positive asks above the limit")
+            clean = self._validate_price_skip_receipt(stream, boundary, receipt, stamp)
         with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
+            stamp = current_time()
+            if decision_status == "PRICE_LIMIT_NOT_MET":
+                clean = self._validate_price_skip_receipt(stream, boundary, receipt, stamp)
             cohort = con.execute("SELECT * FROM decision_cohorts WHERE cohort_id=?", (key,)).fetchone()
             if (not cohort or not boundary <= stamp < _ts(cohort["expires_at"]) or cohort["blocked_reason"]):
                 raise AccountRejected("decision cohort unavailable")
@@ -431,6 +432,15 @@ class Account:
                 if threshold <= 0 or abs(score) >= threshold or prediction.get("side") != ("UP" if score > 0 else "DOWN"):
                     raise AccountRejected("no-signal selection does not match the frozen threshold")
             encoded = _json(dict(receipt))
+            if multi_look_settings(policy) is not None:
+                look = con.execute("SELECT * FROM cohort_book_looks WHERE cohort_id=? AND stream=? ORDER BY attempt DESC LIMIT 1",
+                                   (key, stream)).fetchone()
+                if decision_status == "PRICE_LIMIT_NOT_MET":
+                    if (look is None or look["state"] != decision_status or look["next_retry_at"] is not None
+                            or look["receipt_json"] != encoded):
+                        raise AccountRejected("terminal price skip requires its completed final book look")
+                elif look is not None:
+                    raise AccountRejected("cannot replace a book look with an absent signal")
             previous = con.execute("SELECT * FROM cohort_streams WHERE cohort_id=? AND stream=?", (key,stream)).fetchone()
             if previous:
                 if previous["state"] != decision_status or previous["receipt_json"] != encoded:
@@ -444,6 +454,170 @@ class Account:
                 self._event(con, "COHORT_STREAM_SKIPPED", {"cohort_id":key,"stream":stream,"state":decision_status,
                     "receipt":dict(receipt),"receipt_sha256":hashlib.sha256(encoded.encode()).hexdigest()}, stamp)
         return self.cohort_state(key)
+
+    def book_look_state(self, cohort_id, stream):
+        """Last durable observation attempt; waiting never grants rank credit."""
+        with self._connection() as con:
+            row = con.execute("SELECT * FROM cohort_book_looks WHERE cohort_id=? AND stream=? ORDER BY attempt DESC LIMIT 1",
+                              (_iso(_ts(cohort_id)), stream)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["receipt"] = json.loads(result.pop("receipt_json"))
+        return result
+
+    @staticmethod
+    def _book_look_context(con, key, stream, stamp):
+        cohort = con.execute("SELECT * FROM decision_cohorts WHERE cohort_id=?", (key,)).fetchone()
+        if (not cohort or cohort["blocked_reason"] or not _ts(key) <= stamp < _ts(cohort["expires_at"])):
+            raise AccountRejected("decision cohort unavailable for a book look")
+        policy = json.loads(cohort["policy_json"])
+        settings = multi_look_settings(policy)
+        if settings is None or policy.get("waterfall_semantics") != V5_SEMANTICS:
+            raise AccountRejected("multi-look is not enabled for this cohort")
+        if stream not in STREAMS or stream in _stage(policy, _ts(key))["disabled_streams"]:
+            raise AccountRejected("book look stream is unavailable")
+        if con.execute("SELECT 1 FROM cohort_streams WHERE cohort_id=? AND stream=?", (key, stream)).fetchone():
+            raise AccountRejected("book look stream is already terminal")
+        rank = policy["order"].index(stream) + 1
+        higher = con.execute("SELECT state FROM cohort_streams WHERE cohort_id=? AND rank<?", (key, rank)).fetchall()
+        if len(higher) != rank-1 or any(r["state"] not in V5_UNLOCKED for r in higher):
+            raise AccountRejected("higher cohort ranks are not unlocked")
+        return cohort, settings
+
+    def begin_book_look(self, cohort_id, stream, signal, now=None):
+        """Claim before HTTP. An interrupted claim is never retried or replayed."""
+        current_time = lambda: _now(now() if callable(now) else now)
+        stamp, key = current_time(), _iso(_ts(cohort_id))
+        clean = self._validate_signal(signal, stamp)
+        if clean["stream"] != stream or _ts(clean["window_start"]) != _ts(key):
+            raise AccountRejected("book look signal cohort mismatch")
+        digest = hashlib.sha256(_json(clean).encode()).hexdigest()
+        with self._connection() as con:
+            con.execute("BEGIN IMMEDIATE")
+            stamp = current_time()
+            self._validate_signal(clean, stamp)
+            cohort, settings = self._book_look_context(con, key, stream, stamp)
+            old = con.execute("SELECT * FROM cohort_book_looks WHERE cohort_id=? AND stream=? ORDER BY attempt DESC LIMIT 1",
+                              (key, stream)).fetchone()
+            attempt = 0
+            if old is not None:
+                if old["signal_sha256"] != digest:
+                    raise AccountRejected("book look signal changed within the cohort")
+                if old["state"] != "PRICE_LIMIT_NOT_MET" or not old["next_retry_at"]:
+                    raise AccountRejected("previous book look is not retryable")
+                if stamp < _ts(old["next_retry_at"]):
+                    raise AccountRejected("price recheck is not yet due")
+                if stamp > _ts(key) + timedelta(seconds=18.5):
+                    raise AccountRejected("price recheck start deadline expired")
+                attempt = old["attempt"] + 1
+                if attempt > settings["max_price_rechecks"]:
+                    raise AccountRejected("price recheck count exhausted")
+            con.execute("INSERT INTO cohort_book_looks VALUES(?,?,?,?,NULL,'REQUESTED',NULL,?,?)",
+                        (key, stream, attempt, _iso(stamp), digest, _json({"signal": clean})))
+            self._event(con, "COHORT_BOOK_LOOK_REQUESTED", {"cohort_id": key, "stream": stream,
+                        "attempt": attempt, "signal_sha256": digest}, stamp)
+        return self.book_look_state(key, stream)
+
+    def finish_book_look(self, cohort_id, stream, attempt, outcome, receipt, now=None):
+        """Record a real validated response, with no cashflow or invented fill."""
+        current_time = lambda: _now(now() if callable(now) else now)
+        stamp, key = current_time(), _iso(_ts(cohort_id))
+        _safe(receipt)
+        if outcome not in ("PRICE_LIMIT_NOT_MET", "EXECUTABLE_BOOK"):
+            raise AccountRejected("unsupported book look outcome")
+        clean = self._validate_signal(receipt.get("signal"), stamp)
+        if clean["stream"] != stream or _ts(clean["window_start"]) != _ts(key):
+            raise AccountRejected("book look signal cohort mismatch")
+        if outcome == "PRICE_LIMIT_NOT_MET":
+            self._validate_price_skip_receipt(stream, _ts(key), receipt, stamp)
+        digest = hashlib.sha256(_json(clean).encode()).hexdigest()
+        with self._connection() as con:
+            con.execute("BEGIN IMMEDIATE")
+            stamp = current_time()
+            self._validate_signal(clean, stamp)
+            if outcome == "PRICE_LIMIT_NOT_MET":
+                self._validate_price_skip_receipt(stream, _ts(key), receipt, stamp)
+            cohort, settings = self._book_look_context(con, key, stream, stamp)
+            row = con.execute("SELECT * FROM cohort_book_looks WHERE cohort_id=? AND stream=? AND attempt=?",
+                              (key, stream, attempt)).fetchone()
+            if (row is None or row["state"] != "REQUESTED" or row["signal_sha256"] != digest
+                    or stamp < _ts(row["requested_at"])):
+                raise AccountRejected("book look claim changed or already completed")
+            # A response received before this claim is cached evidence, not a
+            # new look. Its venue source may be earlier but must pass freshness.
+            received = _ts(receipt.get("orderbook", {}).get("received_at"))
+            if not _ts(row["requested_at"]) <= received <= stamp:
+                raise AccountRejected("book look response precedes its request")
+            retry_at = None
+            expiry = min(_ts(cohort["expires_at"]), _ts(clean["valid_until"]))
+            proposed = stamp + timedelta(seconds=2.5)
+            if (outcome == "PRICE_LIMIT_NOT_MET" and attempt < settings["max_price_rechecks"]
+                    and (expiry-stamp).total_seconds() >= 3
+                    and proposed <= _ts(key)+timedelta(seconds=18.5)):
+                retry_at = _iso(proposed)
+            encoded = _json(dict(receipt))
+            con.execute("UPDATE cohort_book_looks SET completed_at=?,state=?,next_retry_at=?,receipt_json=? "
+                        "WHERE cohort_id=? AND stream=? AND attempt=?",
+                        (_iso(stamp), outcome, retry_at, encoded, key, stream, attempt))
+            self._event(con, "COHORT_BOOK_LOOK_COMPLETED", {"cohort_id": key, "stream": stream,
+                        "attempt": attempt, "state": outcome, "next_retry_at": retry_at,
+                        "receipt_sha256": hashlib.sha256(encoded.encode()).hexdigest()}, stamp)
+        return self.book_look_state(key, stream)
+
+    def fail_book_look(self, cohort_id, stream, attempt, reason, now=None):
+        """Seal an interrupted, invalid or late attempt; never make it retryable."""
+        current_time = lambda: _now(now() if callable(now) else now)
+        stamp, key = current_time(), _iso(_ts(cohort_id))
+        _safe(reason)
+        with self._connection() as con:
+            con.execute("BEGIN IMMEDIATE")
+            stamp = current_time()
+            row = con.execute("SELECT * FROM cohort_book_looks WHERE cohort_id=? AND stream=? AND attempt=?",
+                              (key, stream, attempt)).fetchone()
+            if row is None or (row["state"] not in ("REQUESTED", "EXECUTABLE_BOOK")
+                               and not (row["state"] == "PRICE_LIMIT_NOT_MET" and row["next_retry_at"])):
+                return False
+            if stamp < _ts(row["requested_at"]):
+                raise AccountRejected("book look failure time precedes request")
+            encoded = _json({"reason": reason, "prior_receipt": json.loads(row["receipt_json"])})
+            con.execute("UPDATE cohort_book_looks SET state='FAILED',completed_at=?,next_retry_at=NULL,receipt_json=? "
+                        "WHERE cohort_id=? AND stream=? AND attempt=?", (_iso(stamp), encoded, key, stream, attempt))
+            self._event(con, "COHORT_BOOK_LOOK_FAILED", {"cohort_id": key, "stream": stream,
+                        "attempt": attempt, "reason": reason}, stamp)
+        return True
+
+    def _validate_price_skip_receipt(self, stream, boundary, receipt, stamp):
+        """One admission path for terminal skips and retryable price misses."""
+        clean = self._validate_signal(receipt.get("signal"), stamp)
+        if clean["stream"] != stream or _ts(clean["window_start"]) != boundary:
+            raise AccountRejected("price skip signal cohort mismatch")
+        book, fee = receipt.get("orderbook"), receipt.get("fee_quote")
+        if (receipt.get("source") != "OBSERVED_PRICE_LIMIT_CHECK" or not isinstance(book, Mapping)
+                or book.get("kind") != "OBSERVED_PUBLIC_ORDERBOOK" or not book.get("source")
+                or not isinstance(fee, Mapping)):
+            raise AccountRejected("observed price and fee evidence required")
+        if any(book.get(k) != clean[k] for k in ("market_id", "underlying", "outcome")):
+            raise AccountRejected("price skip book identity mismatch")
+        if any(_ts(book.get(k)) != _ts(clean[k]) for k in ("window_start", "window_end")):
+            raise AccountRejected("price skip contract window mismatch")
+        source, received = _ts(book.get("observed_at")), _ts(book.get("received_at"))
+        if not _ts(clean["decision_at"]) <= source <= received <= stamp or (stamp-source).total_seconds() > 2:
+            raise AccountRejected("price skip book is stale or future")
+        self._fee_per_share(fee, Decimal(".515"), stamp, clean["market_id"], clean["outcome"])
+        asks = book.get("asks")
+        if not isinstance(asks, list) or not asks:
+            raise AccountRejected("nonempty observed asks required for price skip")
+        positive = []
+        for ask in asks:
+            price, size = _d(ask.get("price")), _d(ask.get("size"))
+            if not 0 < price < 1 or size < 0:
+                raise AccountRejected("invalid price skip ask level")
+            if size > 0:
+                positive.append(price)
+        if not positive or min(positive) <= Decimal(".515"):
+            raise AccountRejected("price skip requires all positive asks above the limit")
+        return clean
 
     def _validate_signal(self, signal, now):
         _safe(signal)
@@ -661,6 +835,15 @@ class Account:
                 if v5 and (authorization.get("waterfall_semantics") != V5_SEMANTICS
                            or budget != _atoms(_d(authorization["approved_stake_usd"]))):
                     raise AccountRejected("approved-budget cohort authorization mismatch")
+                if multi_look_settings(cohort_policy) is not None:
+                    look = con.execute("SELECT * FROM cohort_book_looks WHERE cohort_id=? AND stream=? ORDER BY attempt DESC LIMIT 1",
+                                       (cohort_key, clean["stream"])).fetchone()
+                    proof = json.loads(look["receipt_json"]) if look is not None else {}
+                    if (look is None or look["state"] != "EXECUTABLE_BOOK"
+                            or look["attempt"] != authorization.get("book_look_attempt")
+                            or look["signal_sha256"] != hashlib.sha256(_json(clean).encode()).hexdigest()
+                            or proof.get("orderbook") != orderbook or proof.get("fee_quote") != fee_quote):
+                        raise AccountRejected("paper acceptance does not match the claimed book look")
                 if ranking[authorization["rank"]-1] != clean["stream"]:
                     raise AccountRejected("cohort ranking mismatch")
                 if _ts(clean["window_start"]) != _ts(cohort_key):

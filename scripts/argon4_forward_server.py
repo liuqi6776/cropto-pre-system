@@ -22,6 +22,7 @@ from tools.argon4_forward.monitor import ObservationStore, collect_reference_sna
 from tools.argon4_forward.stage import stage_profile, StageRejected, DISABLED
 from tools.argon4_forward.runtime_profile import engineering_profile
 from tools.argon4_forward.live_preflight import preparation_status
+from tools.argon4_forward.risk_view import split_open_risk, RiskViewError
 
 STREAMS = ["BTC_15m", "ETH_5m", "SOL_15m", "ETH_15m", "SOL_5m", "BTC_5m", "BNB_15m"]
 BLOCKERS = [
@@ -64,7 +65,8 @@ class Application:
                 self.telemetry = BookTelemetry(self.runtime, policy_provider=policy_provider,
                     market_provider=lambda: self.observations.latest("polymarket"),
                     clock_provider=lambda: dict(self.pipeline.clock or {}),
-                    decision_provider=self.pipeline.status)
+                    decision_provider=self.pipeline.status,
+                    sampling_profile=engineering_profile(policy_provider()).get("telemetry_sampling_profile", "legacy_v11"))
         self.account.heartbeat("WAITING_FOR_MODEL", BLOCKERS[0]["message"])
 
     def status(self):
@@ -73,6 +75,13 @@ class Application:
         live = load_json(ROOT / "config/argon4_live_preflight.json", {})
         pipeline = self.pipeline.status() if self.pipeline else {"active": False, "models": {}, "status": "NOT_ENABLED"}
         models = pipeline.get("models", {})
+        overview = self.account.overview()
+        try:
+            open_risk = split_open_risk(overview, clock=dict(getattr(self.pipeline, "clock", None) or {}))
+        except RiskViewError:
+            open_risk = {"status": "UNAVAILABLE", "reconciled": False,
+                         "total_locked_cost_usd": overview.get("locked_cost"),
+                         "risk_released_usd": 0., "reusable_cash_from_unsettled_usd": 0.}
         blockers = ([{"code": pipeline["status"], "message": pipeline.get("reason")}]
                     if self.pipeline and pipeline.get("reason") else ([] if pipeline.get("active") else BLOCKERS))
         try:
@@ -93,7 +102,7 @@ class Application:
                 "service_status": pipeline["status"] if self.pipeline else "OBSERVING_ONLY",
                 "paper_trading_active": pipeline.get("active", False) and stage["status"] != "INVALID" and engineering["profile"] != "INVALID", "live_enabled": False,
                 "strategy": "ARGON4_SEVEN_STREAM_PRIORITY_WATERFALL",
-                "account": self.account.overview(), "blockers": blockers,
+                "account": overview, "open_risk": open_risk, "blockers": blockers,
                 "last_cycle": self.last_cycle, "last_error": self.last_error,
                 "reference": self.observations.latest("reference"),
                 "markets": self.observations.latest("polymarket"),

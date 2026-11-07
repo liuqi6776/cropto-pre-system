@@ -5,19 +5,34 @@ const when=v=>v?new Date(v).toLocaleString("zh-CN",{hour12:false}):"尚无观测
 function elem(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=String(text);if(cls)n.className=cls;return n;}
 function cell(row,text,cls){row.appendChild(elem("td",text,cls));}
 function renderEngineering(s){
+ renderRisk(s);
  const e=s.engineering||{},t=(s.pipeline||{}).timing||{},b=s.book_telemetry||{},q=b.last_sample||{};
  const sec=v=>typeof v==="number"&&Number.isFinite(v)?v.toFixed(2)+" 秒":"—";
  $("engineeringversion").textContent=(s.allocation||{}).version||e.profile||"—";
  $("latencycohort").textContent=t.cohort?when(t.cohort):"等待新窗口";
- const statuses={PROCESSED:"已完成检查",COMPLETE:"已完成检查",INPUTS_NOT_VALIDATED:"输入未通过，跳过",FAILED:"检查失败，跳过",STOPPED_BEFORE_EXECUTION:"执行前停止"};
+ const statuses={PROCESSED:"已完成检查",COMPLETE:"已完成检查",WAITING_PRICE_RECHECK:"等待本窗口价格重检",WINDOW_EXPIRED:"窗口到期，停止重检",INPUTS_NOT_VALIDATED:"输入未通过，跳过",FAILED:"检查失败，跳过",STOPPED_BEFORE_EXECUTION:"执行前停止"};
  $("latencytotal").textContent=sec(t.completed_after_boundary_seconds)+" · "+(statuses[t.status]||t.status||"等待检查")+(typeof t.deadline_margin_seconds==="number"?" · 距 20 秒截止 "+sec(t.deadline_margin_seconds):"");
  $("latencybreakdown").textContent=sec(t.input_refresh_seconds)+" / "+sec(t.decisions_seconds);
+ $("latencyfirstlook").textContent=sec(t.first_execution_completed_after_boundary_seconds)+(t.execution_passes?" · 执行检查轮数 "+t.execution_passes:"");
  const names={CALIBRATED:"实时采样中",WAITING_CLOCK:"等待时钟检查",WAITING_VALID_CLOCK:"时钟暂不可用",DISABLED:"未启用",STOPPED:"已停止"};
  $("telemetrystate").textContent=(names[b.status]||b.status||"等待启动")+(b.completed_this_process!==undefined?" · 本次启动已记录 "+b.completed_this_process+" 个切片 · 待采 "+b.pending_samples:"");
- const sampleNames={OBSERVED:"有效观测",MISSED_SAMPLE:"漏采 / 迟到",FAILED_OBSERVATION:"采集失败",INVALID_OBSERVATION:"校验未通过"};
+ const sampleNames={OBSERVED:"严格时间窗内观测",AMBIGUOUS_SAMPLE:"时间区间与目标交叠",MISSED_SAMPLE:"漏采 / 迟到",FAILED_OBSERVATION:"采集失败",INVALID_OBSERVATION:"校验未通过"};
  $("telemetrylatest").textContent=q.stream?q.stream+" "+q.outcome+" · T+"+q.target_offset_seconds+"s · "+(sampleNames[q.status]||q.status)+(q.best_ask!==null&&q.best_ask!==undefined?" · 卖一 "+q.best_ask:"")+" · "+when(q.received_at_local||q.target_at):"等待未来窗口；不补历史切片";
+ const actual=q.actual_observation||{};
+ $("telemetryactual").textContent=actual.received_at_server_center?"实际接收 "+when(actual.received_at_server_center)+" · 卖一 "+actual.best_ask+" · 限价内含费深度 "+money((actual.capacity||{}).usd)+"；不是目标瞬间报价":"等待带真实时间的有效盘口";
+ $("telemetryusable").textContent=b.actual_quote_samples_this_process!==undefined?"有效报价 "+b.actual_quote_samples_this_process+" / 费用可核验深度 "+b.actual_depth_samples_this_process+"；严格切片 "+((b.quality_counts_this_process||{}).OBSERVED||0):"—";
  const p=(s.live_preflight||{}).preparation||{};
  $("livepreparation").textContent=p.configuration_safe&&p.risk_limits_match?"共用采集配置与资金上限检查已同步 · 真实执行关闭":"准备检查未完成 · 真实执行关闭";
+}
+function renderRisk(s){
+ const r=s.open_risk||{};
+ $("riskactive").textContent=money(r.active_window_cost_usd);
+ $("riskpending").textContent=money(r.awaiting_resolution_cost_usd);
+ $("riskunknown").textContent=money(r.unknown_cost_usd);
+ $("risktotal").textContent=money(r.total_locked_cost_usd);
+ const body=$("riskcoins");body.replaceChildren();
+ for(const [coin,costs] of Object.entries(r.by_underlying||{})){const row=elem("tr");cell(row,coin);cell(row,money(costs.active_window_cost_usd));cell(row,money(costs.awaiting_resolution_cost_usd));cell(row,money(costs.unknown_cost_usd));cell(row,money(costs.total_locked_cost_usd));body.append(row);}
+ $("riskstate").textContent=r.reconciled?"与未结算成本对账一致 · 未释放任何额度":"分类暂不可核验；原资金与风险限制继续生效";
 }
 function executionText(result){
  if(!result)return "等待新窗口记录";
@@ -26,6 +41,7 @@ function executionText(result){
  if(status==="NO_SIGNAL")return "无信号，已跳过";
  if(status==="NOT_DUE")return "未到决策周期，已跳过";
  if(status==="PRICE_LIMIT_NOT_MET")return "买价高于 0.515，已跳过";
+ if(status==="WAITING_PRICE_RECHECK")return "第 "+((result.attempt||0)+1)+" 次检查价格未达限价 · "+when(result.next_retry_at)+" 重检 · 下层等待";
  if(status==="FILLED_BUDGET")return "本层额度已完成 · "+money(result.spent_usd)+" / "+money(result.approved_usd);
  if(status==="PARTIAL")return "本层未完成 · 已成交 "+money(result.spent_usd)+" / "+money(result.approved_usd)+"，下层等待";
  if(status==="UNREACHED")return "本轮未检查 · 上层或预算已阻断";

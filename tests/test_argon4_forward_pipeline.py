@@ -882,6 +882,233 @@ def enable_v5(h):
     h.policy_path.write_text(json.dumps(h.policy))
 
 
+def enable_v12(h, monkeypatch):
+    from tools.argon4_forward import online
+    from tools.argon4_forward.runtime_profile import V12_ENGINEERING
+    enable_v5(h)
+    active = ["BTC_15m", "ETH_5m", "SOL_15m", "SOL_5m", "BTC_5m"]
+    engineering = deepcopy(V12_ENGINEERING)
+    # This harness uses explicit tiny model frames; real snapshot parity has a
+    # separate full-history test. Do not pretend these frames are disk inputs.
+    engineering["feature_snapshot_cache"] = False
+    h.policy.update(version="offline-v12-five-stream", order=active+["ETH_15m", "BNB_15m"],
+        engineering=engineering, min_decision_delay_seconds=2.5,
+        execution={"multi_look_ioc": True, "max_price_rechecks": 3,
+            "price_recheck_interval_seconds": 2.5, "minimum_recheck_remaining_seconds": 3.,
+            "last_recheck_start_after_boundary_seconds": 18.5},
+        execution_stage={"id": "offline-stage2", "status": "CONFIRMED", "enabled_streams": active,
+            "effective_from": BOUNDARY.isoformat()})
+    h.policy_path.write_text(json.dumps(h.policy))
+    old_refresh = online.OnlineInputs.refresh
+    monkeypatch.setattr(online.OnlineInputs, "refresh", lambda self, now=None, **kw: old_refresh(self, now))
+    h.state.upper = BOUNDARY+timedelta(seconds=2.7)
+    h.state.capacity = 1000
+    return active
+
+
+def test_v12_starts_at_lower_bound_2_5_and_scores_five_pinned_streams_once(harness, monkeypatch):
+    h = harness
+    active = enable_v12(h, monkeypatch)
+    h.state.upper -= timedelta(microseconds=1)
+    h.p.cycle()
+    assert h.state.refreshes == 0
+    h.state.upper += timedelta(microseconds=1)
+    h.p.cycle()
+    status = h.p.status()
+    assert status["status"] == "PAPER_CYCLE_COMPLETE"
+    assert [x[0] for x in h.state.feature_calls] == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    assert list(status["timing"]["computation"]["inference_seconds"]) == active
+    assert status["timing"]["completed_after_boundary_seconds"] < 5
+    for stream in active:
+        assert status["decisions"][stream]["prediction"]["z_v4"] == h.trained.scores[stream]["score"]
+    assert h.account.overview()["live_enabled"] is False
+
+
+def test_v12_recheck_reuses_frozen_scores_without_input_reads_or_lower_allocation(harness, monkeypatch):
+    h = harness
+    active = enable_v12(h, monkeypatch)
+    original = h.p.refresh_book
+    price = [.52]
+    def book(market, side):
+        result = original(market, side)
+        result["asks"][0]["price"] = price[0]
+        return result
+    monkeypatch.setattr(h.p, "refresh_book", book)
+    h.p.cycle()
+    state = h.p.status()
+    assert state["status"] == "PAPER_WAITING_PRICE_RECHECK"
+    assert state["execution"]["stream_results"][active[1]]["status"] == "UNREACHED"
+    scores = deepcopy(state["decisions"])
+    calls, reads, features = len(h.state.book_calls), h.state.refreshes, len(h.state.feature_calls)
+    h.p.cycle()
+    assert len(h.state.book_calls) == calls
+    h.state.upper = datetime.fromisoformat(state["execution"]["next_retry_at"])+timedelta(milliseconds=1)
+    price[0] = .5
+    h.p.cycle()
+    state = h.p.status()
+    assert state["status"] == "PAPER_CYCLE_COMPLETE"
+    assert state["decisions"] == scores
+    assert h.state.refreshes == reads and len(h.state.feature_calls) == features
+    assert h.account.overview()["order_count"] == 2
+    assert state["timing"]["execution_passes"] == 2
+    h.p.cycle()
+    assert h.account.overview()["order_count"] == 2
+
+
+@pytest.mark.parametrize("mode", ["expired", "changed_policy"])
+def test_v12_pending_is_abandoned_without_late_order_or_rescore(harness, monkeypatch, mode):
+    h = harness
+    enable_v12(h, monkeypatch)
+    original = h.p.refresh_book
+    def too_high(market, side):
+        result = original(market, side)
+        result["asks"][0]["price"] = .52
+        return result
+    monkeypatch.setattr(h.p, "refresh_book", too_high)
+    h.p.cycle()
+    assert h.p._pending_execution
+    calls = len(h.state.book_calls)
+    if mode == "expired":
+        h.state.upper = BOUNDARY+timedelta(seconds=20)
+    else:
+        h.policy["version"] += "-changed"
+        h.policy_path.write_text(json.dumps(h.policy))
+    h.p.cycle()
+    assert h.p._pending_execution is None and h.p._pending_timing is None
+    assert len(h.state.book_calls) == calls and h.state.refreshes == 1
+    assert h.account.overview()["order_count"] == 0
+
+
+def last_close_missing():
+    return {"status": "BLOCKED", "errors": [],
+        "gaps": [{"source": "BTCUSDT:futures:5m", "error": "LATEST_CLOSED_BAR_MISSING"}],
+        "sources": {"BTCUSDT:futures:5m": {"rows": 4320,
+            "latest_closed": (BOUNDARY-timedelta(minutes=5)).isoformat(),
+            "issues": ["LATEST_CLOSED_BAR_MISSING"]}}}
+
+
+def test_v12_retries_only_unpublished_last_close_and_then_validates(harness, monkeypatch):
+    from tools.argon4_forward import online
+    h = harness
+    enable_v12(h, monkeypatch)
+    old = online.OnlineInputs.refresh
+    attempts = []
+    def delayed(self, now=None, **kwargs):
+        attempts.append((now, kwargs["deadline_monotonic"]))
+        return last_close_missing() if len(attempts) == 1 else old(self, now, **kwargs)
+    monkeypatch.setattr(online.OnlineInputs, "refresh", delayed)
+    h.p.cycle()
+    assert len(attempts) == 2 and attempts[1][0] > attempts[0][0]
+    assert .5 in h.state.waits
+    assert h.p.status()["timing"]["input_refresh_attempts"] == 2
+    assert h.p.status()["execution"]["status"] == "PROCESSED"
+
+
+@pytest.mark.parametrize("change", ["error", "interior_gap", "old_bar", "hourly", "warmup"])
+def test_v12_does_not_retry_integrity_failure_as_publication_delay(change):
+    value = last_close_missing()
+    if change == "error": value["errors"] = [{"error": "CLOCK_SKEW_OR_LATENCY"}]
+    if change == "interior_gap": value["gaps"][0]["error"] = "CANDLE_GAPS"
+    if change == "old_bar": value["sources"]["BTCUSDT:futures:5m"]["latest_closed"] = (BOUNDARY-timedelta(minutes=10)).isoformat()
+    if change == "hourly": value["gaps"][0]["source"] = "BTCUSDT:futures:1h"
+    if change == "warmup": value["sources"]["BTCUSDT:futures:5m"]["rows"] = 300
+    assert pipeline.ForwardPipeline.retryable_latest_candle(value, BOUNDARY) is False
+
+
+def test_v12_stops_missing_latest_close_at_input_deadline(harness, monkeypatch):
+    from tools.argon4_forward import online
+    h = harness
+    enable_v12(h, monkeypatch)
+    attempts = []
+    def not_published(self, now=None, **kwargs):
+        attempts.append(now)
+        h.state.upper += timedelta(seconds=1)
+        return last_close_missing()
+    monkeypatch.setattr(online.OnlineInputs, "refresh", not_published)
+    h.p.cycle()
+    assert len(attempts) < 10
+    assert h.p.status()["status"] == "PAPER_DATA_BLOCKED"
+    assert h.state.feature_calls == [] and h.account.overview()["order_count"] == 0
+    h.p.cycle()
+    assert len(attempts) < 10
+
+
+def test_v12_fast_polling_and_settlement_reads_avoid_critical_window(harness, monkeypatch):
+    h = harness
+    enable_v12(h, monkeypatch)
+    h.p._worker_engineering = deepcopy(h.policy["engineering"])
+    polled = []
+    monkeypatch.setattr(h.p, "poll_settlements", lambda policy: polled.append(True))
+    h.p.cycle()
+    assert not polled and h.p._worker_delay() == .2
+    h.state.upper = BOUNDARY+timedelta(seconds=25)
+    h.p.cycle()
+    assert polled == [True] and h.p._worker_delay() == 1
+
+
+@pytest.mark.parametrize("cancel", ["pause", "disabled", "stop", "clock"])
+def test_v12_cancelled_wait_cannot_resume_when_condition_clears(harness, monkeypatch, cancel):
+    h = harness
+    enable_v12(h, monkeypatch)
+    original = h.p.refresh_book
+    def high(market, side):
+        value = original(market, side)
+        value["asks"][0]["price"] = .52
+        return value
+    monkeypatch.setattr(h.p, "refresh_book", high)
+    h.p.cycle()
+    assert h.p._pending_execution
+    calls = len(h.state.book_calls)
+    original_clock = h.p.clock
+    if cancel == "pause":
+        (h.p.runtime/"verification_pause.json").write_text("{}")
+    elif cancel == "disabled":
+        h.policy["paper_trading_active"] = False
+        h.policy_path.write_text(json.dumps(h.policy))
+    elif cancel == "stop":
+        monkeypatch.setattr(h.p.stop, "is_set", lambda: True)
+    else:
+        h.p.clock = {**h.p.clock, "receipt_sha256": "e"*64}
+    h.p.cycle()
+    assert h.p._pending_execution is None
+    if cancel == "pause": (h.p.runtime/"verification_pause.json").unlink()
+    if cancel == "disabled":
+        h.policy["paper_trading_active"] = True
+        h.policy_path.write_text(json.dumps(h.policy))
+    if cancel == "stop": monkeypatch.setattr(h.p.stop, "is_set", lambda: False)
+    h.p.clock = original_clock
+    h.state.upper += timedelta(seconds=3)
+    h.p.cycle()
+    assert len(h.state.book_calls) == calls
+    assert h.state.refreshes == 1 and h.account.overview()["order_count"] == 0
+
+
+def test_v12_settlement_guard_rechecks_each_fetch_and_defers_before_boundary(harness, monkeypatch):
+    from tools.argon4_forward import execution
+    h = harness
+    enable_v12(h, monkeypatch)
+    h.p._worker_engineering = h.policy["engineering"]
+    h.state.upper = BOUNDARY+timedelta(seconds=280)
+    polled = []
+    monkeypatch.setattr(h.p, "poll_settlements", lambda policy: polled.append(True))
+    monkeypatch.setattr(execution, "fetch_public_resolution", lambda *a: pytest.fail("must not fetch near boundary"))
+    h.p.cycle()
+    assert polled == [] and h.p._worker_delay() == 1
+    with pytest.raises(ValueError, match="DEFERRED_FOR_DECISION_WINDOW"):
+        h.p.fetch_resolution("123")
+
+
+def test_v12_future_stage_activation_does_not_sleep_through_early_window(harness, monkeypatch):
+    h = harness
+    enable_v12(h, monkeypatch)
+    h.p._worker_engineering = h.policy["engineering"]
+    h.p.state.update(status="STAGE_WAITING_ACTIVATION", active=False)
+    h.state.upper = BOUNDARY+timedelta(seconds=295)
+    assert h.p._worker_delay() == 1
+    h.state.upper = BOUNDARY+timedelta(seconds=299.5)
+    assert h.p._worker_delay() == .2
+
+
 def test_v5_saved_model_scores_fill_approved_budget_and_persist_execution(harness):
     h = harness
     enable_v5(h)

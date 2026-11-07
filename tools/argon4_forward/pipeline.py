@@ -4,6 +4,7 @@ Never replay a missed decision window or count a historical backtest as cash.
 The only execution class used here is the isolated SQLite paper executor.
 """
 from datetime import datetime, timedelta, timezone
+from copy import deepcopy
 import hashlib
 import io
 import json
@@ -14,7 +15,7 @@ import time
 
 from .clock_sync import calibrate, calibrated_now, project_local
 from .stage import stage_profile, disabled_decision
-from .runtime_profile import engineering_profile
+from .runtime_profile import engineering_profile, minimum_decision_delay, V12_PROFILE_ID
 
 ROOT = Path(__file__).resolve().parents[2]
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT")
@@ -120,6 +121,9 @@ class ForwardPipeline:
         self._pending_timing = None
         self._decision_timing = {}
         self._prefetch_cohort = None
+        self._pending_execution = None
+        self._worker_engineering = {}
+        self._last_idle_publish = 0.
         from .polymarket_transport import PublicPolymarketTransport
         # Clock calibration keeps this CLOB connection warm without additional
         # requests. Background discovery has its own bounded connection pool.
@@ -162,6 +166,7 @@ class ForwardPipeline:
         from .model import STREAMS, load_model_bundle
         policy = json.loads((ROOT / "config/argon4_forward_policy.json").read_text(encoding="utf-8"))
         if not policy.get("paper_trading_active") or policy.get("ranking_model_scope") != "LOCAL_SELF_TRAINED_OOS":
+            self.abandon_prepared("PAPER_DISABLED")
             self.publish(status="WAITING_LOCAL_BACKTEST", active=False, reason="本地训练与回测尚未完成，等待本地胜率排序")
             return None
         profile = stage_profile(policy)
@@ -230,6 +235,13 @@ class ForwardPipeline:
 
     def fetch_resolution(self, market_id):
         from .execution import fetch_public_resolution
+        if self._worker_engineering.get("profile") == V12_PROFILE_ID:
+            if self._settlement_guard():
+                raise ValueError("DEFERRED_FOR_DECISION_WINDOW")
+            lower = calibrated_now(self.clock, upper=False)
+            positions = [p for p in self.account.overview()["positions"] if p["market_id"] == market_id]
+            if not positions or any(datetime.fromisoformat(p["window_end"]) > lower for p in positions):
+                raise ValueError("WAITING_FOR_WINDOW_END")
         raw, receipt = fetch_public_resolution(market_id)
         self.observations.save("paper_resolution_receipt", {"receipts": [receipt],
             "market_id": market_id, "clock_evidence_sha256": self.clock["receipt_sha256"]})
@@ -273,6 +285,11 @@ class ForwardPipeline:
         return calibrated_now(self.clock)
 
     def wait_for_window(self, models):
+        if (self._worker_engineering.get("profile") == V12_PROFILE_ID
+                and self.state.get("status") == "PAPER_WAITING_WINDOW"
+                and time.monotonic()-self._last_idle_publish < .8):
+            return
+        self._last_idle_publish = time.monotonic()
         if self.state.get("inputs", {}).get("status") == "BLOCKED":
             revision = self.state.get("revision") or {}
             errors = self.state.get("inputs", {}).get("errors", [])
@@ -396,19 +413,189 @@ class ForwardPipeline:
             self.state["prefetch"] = {key: result.get(key) for key in
                 ("status", "errors", "observed_at", "cohort_id", "duration_seconds")}
 
+    @staticmethod
+    def retryable_latest_candle(inputs, cohort):
+        """Only a single not-yet-published 5m close is retryable, never gaps."""
+        gaps = inputs.get("gaps") or []
+        if inputs.get("errors") or not gaps or inputs.get("status") != "BLOCKED":
+            return False
+        allowed = {f"{symbol}:futures:5m" for symbol in SYMBOLS}
+        for gap in gaps:
+            if not isinstance(gap, dict) or gap.get("source") not in allowed or gap.get("error") != "LATEST_CLOSED_BAR_MISSING":
+                return False
+            info = inputs.get("sources", {}).get(gap["source"], {})
+            try:
+                latest = datetime.fromisoformat(info["latest_closed"].replace("Z", "+00:00"))
+                if latest != cohort-timedelta(minutes=5) or info["rows"] < 4320:
+                    return False
+                if info.get("issues") != ["LATEST_CLOSED_BAR_MISSING"]:
+                    return False
+            except (KeyError, TypeError, ValueError):
+                return False
+        return True
+
+    def refresh_decision_inputs(self, engineering, cohort, now_lower):
+        self.set_input_clock()
+        cutoff = cohort+timedelta(seconds=engineering.get("input_deadline_after_boundary_seconds", 14))
+        if engineering["enabled"]:
+            self._pending_timing["input_deadline_at"] = cutoff.isoformat()
+        attempts = 0
+        while True:
+            attempts += 1
+            if engineering["enabled"]:
+                remaining = max(0, (cutoff-calibrated_now(self.clock)).total_seconds())
+                inputs = self.inputs.refresh(now=now_lower,
+                    deadline_monotonic=time.monotonic()+remaining, cohort_id=cohort.isoformat())
+            else:
+                inputs = self.inputs.refresh(now=now_lower)
+            self._pending_timing["input_refresh_attempts"] = attempts
+            if (engineering["profile"] != V12_PROFILE_ID
+                    or not self.retryable_latest_candle(inputs, cohort) or attempts >= 24):
+                return inputs
+            interval = engineering["input_ready_retry_interval_seconds"]
+            if calibrated_now(self.clock)+timedelta(seconds=interval) >= cutoff:
+                return inputs
+            self.observations.save("input_readiness_retry", {
+                "cohort": cohort.isoformat(), "attempt": attempts,
+                "observed_at": calibrated_now(self.clock).isoformat(), "gaps": inputs["gaps"],
+                "reason": "LATEST_5M_CLOSE_NOT_YET_PUBLISHED", "retry_after_seconds": interval})
+            if self.stop.wait(interval):
+                return {**inputs, "errors": [{"source": "pipeline", "error": "STOPPED_DURING_INPUT_RETRY"}]}
+            now_lower = calibrated_now(self.clock, upper=False)
+
+    def _critical_window(self):
+        if self._worker_engineering.get("profile") != V12_PROFILE_ID or not self.clock:
+            return False
+        try:
+            lower, upper = calibrated_now(self.clock, upper=False), calibrated_now(self.clock)
+            elapsed = (lower-cohort_at(lower)).total_seconds()
+            return elapsed >= 299 or (upper-cohort_at(lower)).total_seconds() <= 20
+        except ValueError:
+            return False
+
+    def _worker_delay(self):
+        stage_wait = (self._worker_engineering.get("profile") == V12_PROFILE_ID
+                      and self.warmup_complete and self.state.get("status") == "STAGE_WAITING_ACTIVATION")
+        if self.state.get("active") or stage_wait:
+            return self._worker_engineering.get("window_poll_interval_seconds", 1) if self._critical_window() else 1
+        return 10
+
+    def _settlement_guard(self):
+        """Leave 30 seconds before the boundary for bounded public GETs."""
+        if self._worker_engineering.get("profile") != V12_PROFILE_ID or not self.clock:
+            return False
+        try:
+            lower, upper = calibrated_now(self.clock, upper=False), calibrated_now(self.clock)
+            elapsed = (lower-cohort_at(lower)).total_seconds()
+            return elapsed >= 270 or (upper-cohort_at(lower)).total_seconds() <= 20
+        except ValueError:
+            return True
+
+    def abandon_prepared(self, reason):
+        pending = self._pending_execution
+        if pending is None:
+            return
+        self._pending_execution = None
+        outcome = {"status": reason, "fills": pending["fills"], "blocked": [reason], "live_enabled": False}
+        self.observations.save("paper_execution_abandoned", {
+            "cohort": pending["cohort"].isoformat(), "reason": reason, "result": outcome})
+        timing = self.finish_timing(reason)
+        with self.lock:
+            self.state.update(execution=outcome, timing=timing)
+
+    def execution_now(self, clock):
+        if self.stop.is_set() or (self.runtime/"verification_pause.json").is_file():
+            raise ValueError("EXECUTION_CANCELLED")
+        keys = ("receipt_sha256", "calibrated_monotonic", "server_minus_local_seconds",
+                "uncertainty_seconds", "calibrated_at_local")
+        if any(self.clock.get(k) != clock.get(k) for k in keys):
+            raise ValueError("EXECUTION_CLOCK_CHANGED")
+        return calibrated_now(clock)
+
+    def execute_prepared(self, policy, inputs, models, cohort, decisions, clock, prior_fills=None):
+        """Reuse the exact score and clock within one live cohort; never rescore."""
+        from .execution import PaperExecutor
+        started = time.perf_counter()
+        outcome = PaperExecutor(self.account, policy).process_cohort(
+            cohort.isoformat(), decisions, self.observations.latest("polymarket"),
+            now=lambda: self.execution_now(clock), book_refresh=self.refresh_book,
+            clock=clock, market_refresh=self.refresh_market)
+        self._pending_timing["execution_seconds"] = self._pending_timing.get("execution_seconds", 0)+time.perf_counter()-started
+        self._pending_timing["execution_passes"] = self._pending_timing.get("execution_passes", 0)+1
+        self._pending_timing.setdefault("first_execution_completed_after_boundary_seconds", (calibrated_now(clock)-cohort).total_seconds())
+        # A later pass can find prior fills in the immutable account; keep the
+        # dashboard's cumulative cohort list without booking them a second time.
+        fills = {fill["order_id"]: fill for fill in (prior_fills or [])+outcome.get("fills", [])}
+        outcome["fills"] = list(fills.values())
+        if outcome["status"] == "BLOCKED" and fills:
+            outcome["status"] = "PARTIAL_BLOCKED"
+        self.observations.save("paper_execution", {
+            "cohort": cohort.isoformat(), "policy_version": policy["version"],
+            "waterfall_semantics": policy.get("waterfall_semantics", "LEGACY_CAPACITY_GATE"),
+            "clock_evidence_sha256": clock["receipt_sha256"],
+            "completed_at": calibrated_now(clock).isoformat(), "result": outcome})
+        waiting = outcome.get("status") == "WAITING_PRICE_RECHECK"
+        if waiting:
+            self._pending_execution = deepcopy({"policy": policy, "inputs": inputs, "models": models,
+                "cohort": cohort, "decisions": decisions, "clock": clock,
+                "next_retry_at": outcome["next_retry_at"], "fills": outcome["fills"]})
+            timing = {k: v for k, v in self._pending_timing.items() if k != "started_monotonic"}
+            timing.update(status="WAITING_PRICE_RECHECK", next_retry_at=outcome["next_retry_at"])
+        else:
+            self._pending_execution = None
+            timing = self.finish_timing(outcome.get("status", "COMPLETE"))
+        self.publish(status="PAPER_WAITING_PRICE_RECHECK" if waiting else "PAPER_CYCLE_COMPLETE",
+            active=True, reason="当前优先流价格未达限价，等待本窗口内重检；下层暂不占预算" if waiting else None,
+            models=models, inputs=inputs, revision=None, decisions=decisions,
+            last_cohort=cohort.isoformat(), last_attempt_cohort=cohort.isoformat(),
+            execution=outcome, timing=timing)
+
+    def resume_prepared(self, policy):
+        pending = self._pending_execution
+        if pending is None:
+            return False
+        now = calibrated_now(self.clock)
+        reason = None
+        if self.stop.is_set():
+            reason = "STOPPED_DURING_RECHECK"
+        elif policy != pending["policy"]:
+            reason = "POLICY_CHANGED_DURING_WINDOW"
+        elif now >= pending["cohort"]+timedelta(seconds=20):
+            reason = "WINDOW_EXPIRED"
+        elif self.clock != pending["clock"]:
+            reason = "CLOCK_CHANGED_DURING_RECHECK"
+        if reason:
+            self.abandon_prepared(reason)
+            self.publish(status="PAPER_CYCLE_COMPLETE", active=True,
+                reason="本窗口重检已停止；不重算预测、不补历史订单",
+                execution=self.state["execution"], timing=self.state["timing"])
+            return True
+        if now < datetime.fromisoformat(pending["next_retry_at"]):
+            return True
+        self.execute_prepared(pending["policy"], pending["inputs"], pending["models"],
+            pending["cohort"], pending["decisions"], pending["clock"], pending["fills"])
+        return True
+
     def cycle(self):
         from .online import OnlineInputs
-        from .execution import PaperExecutor
         from .revisions import ensure_view_committed
         # Turning off new predictions or a model-pin failure must not freeze
         # previously recorded positions awaiting official final settlement.
-        self.poll_settlements({})
+        # Final official settlement is still required; move this read-only poll
+        # outside the short decision/recheck window to reduce interference.
+        # Each fetch checks this guard again; running GETs remain bounded by
+        # their transport and entry still fails closed if scheduling is late.
+        if not self._settlement_guard():
+            self.poll_settlements({})
         policy = self.load_ready()
         if policy is None:
+            self.abandon_prepared("PAPER_DISABLED")
             return
         engineering = engineering_profile(policy)
+        self._worker_engineering = engineering
         models = {s: {"version": b["manifest"]["model_version"], "sha256": b["manifest"]["model_sha256"]} for s,b in self.bundles.items()}
         if (self.runtime / "verification_pause.json").is_file():
+            self.abandon_prepared("VERIFICATION_PAUSE")
             self.publish(status="VERIFICATION_PAUSE", active=False, models=models,
                          reason="完整检查期间暂停新预测与输入更新；市场观察和已有仓位官方结算继续")
             return
@@ -418,6 +605,7 @@ class ForwardPipeline:
             backoff = json.loads(backoff_path.read_text(encoding="utf-8"))
             until = datetime.fromisoformat(backoff["blocked_until_utc"].replace("Z", "+00:00"))
             if datetime.now(timezone.utc) < until:
+                self.abandon_prepared("PUBLIC_RATE_LIMIT_BACKOFF")
                 self.publish(status="PUBLIC_RATE_LIMIT_BACKOFF", active=False, models=models, backoff=backoff,
                              reason="公开行情限流暂停；本地模型已保存，等待供应商解除限制")
                 return
@@ -426,6 +614,7 @@ class ForwardPipeline:
             effective = datetime.fromisoformat(revision_view["view_effective_at"].replace("Z", "+00:00"))
             next_window = cohort_at(effective) + timedelta(minutes=5)
             if cohort_at(calibrated_now(self.clock, upper=False)) < next_window:
+                self.abandon_prepared("REVISION_CUTOVER_WINDOW")
                 self.publish(status="REVISION_WAITING_FUTURE_WINDOW", active=False, models=models,
                              revision=revision_view, decisions={},
                              execution={"status": "NOT_EVALUATED", "fills": [], "blocked": ["REVISION_CUTOVER_WINDOW"]},
@@ -458,9 +647,12 @@ class ForwardPipeline:
         now_lower = calibrated_now(self.clock, upper=False)
         profile = stage_profile(policy)
         if profile["configured"] and cohort_at(now_lower) < datetime.fromisoformat(profile["effective_from"]):
+            self.abandon_prepared("STAGE_WAITING_ACTIVATION")
             self.publish(status="STAGE_WAITING_ACTIVATION", active=False, models=models,
                          decisions={s: disabled_decision(profile) for s in profile["disabled_streams"]},
                          reason="新阶段等待指定的未来窗口启用；已有仓位继续按官方结果结算")
+            return
+        if self.resume_prepared(policy):
             return
         spacing = policy.get("input_http_min_spacing_seconds", 1.0)
         if isinstance(spacing, bool) or not isinstance(spacing, (int, float)) or not math.isfinite(spacing) or not .25 <= spacing <= 1:
@@ -475,12 +667,9 @@ class ForwardPipeline:
                                                   clock_evidence_sha256=self.clock["receipt_sha256"],
                                                   http_min_spacing_seconds=spacing)
         self._input_spacing = spacing
-        executor = PaperExecutor(self.account, policy)
         cohort = cohort_at(now_lower)
         elapsed = (now_lower-cohort).total_seconds()
-        earliest = float(policy.get("min_decision_delay_seconds", 5))
-        if not 5 <= earliest <= 10:
-            raise ValueError("unsupported minimum decision delay")
+        earliest = minimum_decision_delay(policy, engineering)
         if not earliest <= elapsed <= 18 or self.last_cohort == cohort:
             self.prefetch_inputs(engineering, now_lower)
             self.wait_for_window(models)
@@ -490,16 +679,8 @@ class ForwardPipeline:
         self._pending_timing = {"cohort": cohort.isoformat(), "deadline_seconds": 20,
             "started_at": calibrated_now(self.clock).isoformat(), "started_monotonic": time.perf_counter(),
             "http_min_spacing_seconds": spacing, "policy_version": policy["version"]}
-        self.set_input_clock()
         started = time.perf_counter()
-        if engineering["enabled"]:
-            input_cutoff = cohort+timedelta(seconds=engineering["input_deadline_after_boundary_seconds"])
-            remaining = max(0, (input_cutoff-calibrated_now(self.clock)).total_seconds())
-            self._pending_timing["input_deadline_at"] = input_cutoff.isoformat()
-            inputs = self.inputs.refresh(now=now_lower,
-                deadline_monotonic=time.monotonic()+remaining, cohort_id=cohort.isoformat())
-        else:
-            inputs = self.inputs.refresh(now=now_lower)
+        inputs = self.refresh_decision_inputs(engineering, cohort, now_lower)
         self._pending_timing["input_refresh_seconds"] = time.perf_counter()-started
         self.observations.save("model_inputs", inputs)
         if inputs.get("status") not in ("READY", "COMPLETE", "OBSERVED"):
@@ -521,27 +702,12 @@ class ForwardPipeline:
         # The observation worker discovers current AND next contracts. Reuse its
         # identity/fee evidence within the executor's 90-second metadata limit;
         # refresh executable books immediately through the isolated callback.
-        markets = self.observations.latest("polymarket")
         started = time.perf_counter()
         if self.stop.wait(2*self.clock["uncertainty_seconds"]+.01):
             self.finish_timing("STOPPED_BEFORE_EXECUTION")
             return
         self._pending_timing["causal_wait_seconds"] = time.perf_counter()-started
-        started = time.perf_counter()
-        outcome = executor.process_cohort(cohort.isoformat(), decisions, markets,
-                                           now=lambda: calibrated_now(self.clock),
-                                           book_refresh=self.refresh_book, clock=self.clock,
-                                           market_refresh=self.refresh_market)
-        self._pending_timing["execution_seconds"] = time.perf_counter()-started
-        self.observations.save("paper_execution", {
-            "cohort": cohort.isoformat(), "policy_version": policy["version"],
-            "waterfall_semantics": policy.get("waterfall_semantics", "LEGACY_CAPACITY_GATE"),
-            "clock_evidence_sha256": self.clock["receipt_sha256"],
-            "completed_at": calibrated_now(self.clock).isoformat(), "result": outcome})
-        self.publish(status="PAPER_CYCLE_COMPLETE", active=True, reason=None, models=models,
-                     inputs=inputs, revision=None, decisions=decisions, last_cohort=cohort.isoformat(),
-                     last_attempt_cohort=cohort.isoformat(), execution=outcome,
-                     timing=self.finish_timing(outcome.get("status", "COMPLETE")))
+        self.execute_prepared(policy, inputs, models, cohort, decisions, dict(self.clock))
 
     def worker(self):
         try:
@@ -549,10 +715,11 @@ class ForwardPipeline:
                 try:
                     self.cycle()
                 except Exception as exc:
+                    self.abandon_prepared("CHECK_FAILED_DURING_RECHECK")
                     self.publish(status="PAPER_BLOCKED", active=False,
                                  timing=self.finish_timing("FAILED", exc),
                                  reason="本地模拟检查未通过："+type(exc).__name__)
-                self.stop.wait(1 if self.state.get("active") else 10)
+                self.stop.wait(self._worker_delay())
         finally:
             self.close()
 

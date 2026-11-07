@@ -15,7 +15,7 @@ import re
 import time
 
 from .account import (Account, AccountRejected, STREAMS, V5_SEMANTICS, V5_UNLOCKED,
-                      _d, _iso, _json, _now, _safe, _ts)
+                      _d, _iso, _json, _now, _safe, _ts, multi_look_settings)
 
 
 def _stamp(now):
@@ -356,8 +356,9 @@ class PaperExecutor:
         result = {"fills":[],"blocked":[],"cohort":None,"live_enabled":False,
                   "execution":"OBSERVED_BOOK_IOC_PAPER_ONLY","waterfall_semantics":V5_SEMANTICS,
                   "stream_results":stream_results}
-        current = None
+        current, look_claim = None, None
         try:
+            multi_look = multi_look_settings(self.policy)
             profile = stage_profile(self.policy, cohort_id)
             result["stage"] = profile
             for stream in profile["disabled_streams"]:
@@ -410,6 +411,20 @@ class PaperExecutor:
                     stream_results[stream] = {"status":decision["status"],"approved_usd":0.,"spent_usd":0.,
                                               "book_checked":False,"persisted":True}
                     continue
+                if multi_look is not None:
+                    old_look = self.account.book_look_state(cohort["cohort_id"], stream)
+                    if old_look is not None:
+                        if old_look["state"] != "PRICE_LIMIT_NOT_MET" or not old_look["next_retry_at"]:
+                            raise AccountRejected("previous book look is not retryable")
+                        if stamp > boundary + timedelta(seconds=18.5):
+                            look_claim = (stream, old_look["attempt"])
+                            raise AccountRejected("price recheck start deadline expired")
+                        if stamp < _ts(old_look["next_retry_at"]):
+                            stream_results[stream] = {"status":"WAITING_PRICE_RECHECK","persisted":True,
+                                "book_checked":False,"attempt":old_look["attempt"],
+                                "next_retry_at":old_look["next_retry_at"],"approved_usd":0.,"spent_usd":0.}
+                            result.update(status="WAITING_PRICE_RECHECK", next_retry_at=old_look["next_retry_at"])
+                            break
                 summary = self.account.overview(now=stamp)
                 if _d(cohort["remaining_usd"]) <= 0:
                     stream_results[stream] = {"status":"UNREACHED","reason":"COHORT_BUDGET_EXHAUSTED"}
@@ -461,6 +476,14 @@ class PaperExecutor:
                 if signal["stream"] != stream or _ts(signal["window_start"]) != boundary:
                     raise AccountRejected("signal cohort mismatch")
                 side = signal["outcome"]
+                if multi_look is not None:
+                    claim = self.account.begin_book_look(cohort["cohort_id"], stream, signal, now=now)
+                    look_claim = (stream, claim["attempt"])
+                    stamp = _stamp(now)
+                    self._clock(clock, stamp)
+                    if (stamp >= _ts(cohort["expires_at"])
+                            or (claim["attempt"] > 0 and stamp > boundary+timedelta(seconds=18.5))):
+                        raise AccountRejected("book look deadline expired before HTTP dispatch")
                 observed = book_refresh(market,side) if book_refresh else market.get("books",{}).get(side)
                 stamp = _stamp(now)
                 self._clock(clock,stamp)
@@ -471,12 +494,28 @@ class PaperExecutor:
                     raise AccountRejected("fill clock lower bound has not passed the decision")
                 if capacity == 0:
                     receipt = {"source":"OBSERVED_PRICE_LIMIT_CHECK","signal":signal,"orderbook":book,"fee_quote":fee}
-                    self.account.record_cohort_skip(cohort["cohort_id"],stream,"PRICE_LIMIT_NOT_MET",receipt,now=stamp)
+                    if multi_look is not None:
+                        completed = self.account.finish_book_look(cohort["cohort_id"],stream,look_claim[1],
+                                                                 "PRICE_LIMIT_NOT_MET",receipt,now=now)
+                        look_claim = None
+                        if completed["next_retry_at"]:
+                            best = min(_d(a["price"]) for a in book["asks"] if _d(a["size"]) > 0)
+                            stream_results[stream] = {"status":"WAITING_PRICE_RECHECK","persisted":True,
+                                "book_checked":True,"attempt":completed["attempt"],"best_ask":float(best),
+                                "limit_price":.515,"next_retry_at":completed["next_retry_at"],
+                                "book_observed_at":book["observed_at"],"approved_usd":0.,"spent_usd":0.}
+                            result.update(status="WAITING_PRICE_RECHECK", next_retry_at=completed["next_retry_at"])
+                            break
+                    self.account.record_cohort_skip(cohort["cohort_id"],stream,"PRICE_LIMIT_NOT_MET",receipt,
+                                                    now=now if multi_look is not None else stamp)
                     best = min(_d(a["price"]) for a in book["asks"] if _d(a["size"])>0)
                     stream_results[stream] = {"status":"PRICE_LIMIT_NOT_MET","raw_capacity_usd":0.,
                         "best_ask":float(best),"limit_price":.515,"book_observed_at":book["observed_at"],
                         "book_checked":True,"approved_usd":0.,"spent_usd":0.,"persisted":True}
                     continue
+                if multi_look is not None:
+                    receipt = {"source":"OBSERVED_EXECUTABLE_BOOK","signal":signal,"orderbook":book,"fee_quote":fee}
+                    self.account.finish_book_look(cohort["cohort_id"],stream,look_claim[1],"EXECUTABLE_BOOK",receipt,now=now)
                 # Re-read balances after I/O; both this target and the actual
                 # account mutation enforce the unchanged aggregate risk limits.
                 summary = self.account.overview(now=stamp)
@@ -495,8 +534,11 @@ class PaperExecutor:
                     "valid_until":_iso(min(_ts(signal["valid_until"]),stamp+timedelta(seconds=2),_ts(cohort["expires_at"]))),
                     "policy_version":cohort["policy_version"],"preceding_allocations":preceding,
                     "cohort_id":cohort["cohort_id"],"cohort_capacity_usd":float(capacity)}
+                if multi_look is not None:
+                    authorization["book_look_attempt"] = look_claim[1]
                 fill = self.account.place_paper_buy(signal,book,fee,now=self._paper_acceptance_clock(now,clock,book,fee,signal),
                                                     stake=amount,allocation_authorization=authorization)
+                look_claim = None
                 result["fills"].append(fill)
                 state = fill["cohort_stream_state"]
                 stream_results[stream] = {"status":state,"raw_capacity_usd":float(capacity),"approved_usd":float(amount),
@@ -504,9 +546,17 @@ class PaperExecutor:
                     "book_checked":True,"persisted":True}
                 if state != "FILLED_BUDGET":
                     raise AccountRejected("upper stream has an unsatisfied approved budget")
-            result["status"] = "PROCESSED"
+            if result.get("status") != "WAITING_PRICE_RECHECK":
+                result["status"] = "PROCESSED"
         except Exception as exc:
             reason = str(exc) if isinstance(exc,AccountRejected) else type(exc).__name__
+            if look_claim is not None and result["cohort"]:
+                try:
+                    self.account.fail_book_look(result["cohort"]["cohort_id"],look_claim[0],look_claim[1],reason,now=_stamp(now))
+                except Exception:
+                    # A failed audit write leaves the durable claim sealed from
+                    # retry by its REQUESTED/EXECUTABLE state, never unlocked.
+                    pass
             result["blocked"].append(reason)
             result["status"] = "PARTIAL_BLOCKED" if result["fills"] else "BLOCKED"
             if current is not None and stream_results[current]["status"] != "PARTIAL":

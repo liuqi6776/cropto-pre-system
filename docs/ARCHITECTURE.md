@@ -2,31 +2,54 @@
 
 ```mermaid
 flowchart TD
-    B[公开标的行情与结算观测] --> O["online.py / revisions.py<br/>采集、来源记录、缺口与修订检查"]
-    P[Polymarket 公开市场信息和盘口] --> T["polymarket_transport.py<br/>复用连接与分离观察路径"]
-    T --> PM["polymarket.py<br/>市场映射、盘口和费用"]
-    C["clock_sync.py<br/>时钟偏差与有效窗口"] --> PL["pipeline.py<br/>实时调度与输入验证"]
+    B[公开标的行情] --> O["online.py / revisions.py<br/>有界采集、来源记录、缺口与修订检查"]
+    C["clock_sync.py<br/>校准时间上下界"] --> PL["pipeline.py<br/>T+2.5秒输入检查 / 0.2秒窗口轮询"]
     O --> PL
-    M[本地模型与冻结特征源码] --> MOD["model.py<br/>特征计算、模型校验、预测"]
-    PL --> FC["feature_cache.py<br/>完整历史 / 当轮18文件快照 / 编译缓存"]
+    PL --> FC["feature_cache.py<br/>完整历史 / 同轮18文件快照 / 编译缓存"]
+    M[本地模型与冻结特征源码] --> MOD["model.py<br/>固定模型校验与一次预测"]
     FC --> MOD
-    MOD --> S["stage.py / execution.py<br/>ETH5 → BTC15 → BTC5 容量阶梯"]
+    MOD --> S["stage.py / execution.py<br/>BTC15 → ETH5 → SOL15 → SOL5 → BTC5"]
+    P[Polymarket 公开市场信息和盘口] --> T["polymarket_transport.py<br/>独立只读连接与真实收据"]
+    T --> PM["polymarket.py<br/>合约身份、盘口和官方费用"]
     PM --> S
-    S --> A["account.py<br/>本地模拟成交、风险上限、账本"]
-    A --> MON["monitor.py / argon4_forward_server.py"]
-    MON --> UI["dashboard/argon4_forward<br/>127.0.0.1 Monitor"]
-    P --> BT["book_telemetry.py<br/>独立只读双边时间切片"]
-    BT --> BD[独立观测数据库，不计作成交]
+    S -->|合规价格未满足且仍有时间| R["持久化等待与重检<br/>首次检查加最多三次"]
+    R --> S
+    S -->|全部检查通过且早于T+20秒| A["account.py<br/>模拟成交、风险上限、独立账本"]
+    RES[最终官方结算收据] --> A
+    A --> MON["monitor.py / argon4_forward_server.py<br/>风险分类、耗时与执行状态"]
+    MON --> UI["dashboard/argon4_forward<br/>本机只读 Monitor"]
+    P --> BT["book_telemetry.py<br/>6个HTTP线程 / 最多12个在途或排队任务"]
+    C --> BT
+    BT --> BD["独立观测数据库<br/>严格切片与实际接收深度分开"]
     BD --> MON
-    RP["runtime_profile.py<br/>共用工程配置"] --> PL
-    RP --> LP["live_preflight.py<br/>禁用状态与模型哈希检查"]
-    R[训练与候选研究 scripts] --> M
+    BD --> AN["analyze_argon4_book_telemetry.py<br/>历史原始证据只读核查与聚合"]
+    RP["runtime_profile.py<br/>显式版本配置"] --> PL
+    RP --> LP["live_preflight.py<br/>禁用状态、资金上限及模型哈希检查"]
+    TRAIN[训练与候选研究 scripts] --> M
 ```
 
-`execution.py` 只记录本地模拟。限价、风险上限、流启用状态以 `config/argon4_forward_policy.json` 为准。没有信号、尚未到期或经确认的价格不满足可以跳过；缺失、失效或不一致的证据必须停止相应分配，不能猜测容量。已批准但未完成的上层目标与有效跳过是不同状态。
+## 预测与执行路径
 
-实盘准备检查使用同一工程配置，核对禁用状态、资金上限与模型哈希，不提供钱包签名和真实下单通道。当前仓库也不配置交易所账户密钥。
+当前配置启用 Stage 2 的五条流；流顺序与生效边界以 `config/argon4_forward_policy.json` 为准。模型、特征公式、阈值及权重保持。每个五分钟窗口只计算一次预测；未到周期和无信号立即放行，缺失或不一致证据停止相应分配。
 
-采集线程池有界，0.25 秒请求间隔保留；整轮到期会退役该轮任务，迟到结果不能成为该轮交易输入。低频数据只提前获取已经闭合的观测；资金费保持真实事件。完整的截止隔离、不可撤销系统调用边界、修订恢复与校验说明见 [ARGON4_LATENCY_V11.md](ARGON4_LATENCY_V11.md)。
+采集最早在校准时间下界达到 T+2.5 秒后开始，校准时间上界达到 T+14 秒即截止。仅当历史完整、唯一问题为最后一根已闭合 5m K 线尚未发布时，允许间隔 0.5 秒再检查；网络错误、历史缺口、修订冲突或辅助输入异常不按发布延迟重试。窗口附近的主循环间隔为 0.2 秒。
 
-运行入口：`scripts/argon4_forward_server.py`；前端通过本地只读 API 获取状态、账本和权益。训练入口：`scripts/train_argon4_forward.py`。`train/evaluate_argon4_gen4*` 和组合场景脚本为独立候选研究。
+每次模拟买入都检查新鲜盘口、官方费用和原资金上限。0.515 限制盘口成交价，手续费另计并占用预算。首次盘口价格未满足时，可以持久化等待并最多重检三次，间隔至少 2.5 秒；安排重检须有至少 3 秒余量，最晚 T+18.5 秒启动重检，所有模拟接受检查必须早于 T+20 秒。等待上层重检时，下层暂不占预算；最终有效价格拒绝才放行。中断请求、部分成交及已成交订单不能借重检重复执行。
+
+暂停、禁用、停止、政策或时钟变化会作废挂起重检。每次尝试有独立证据，同一窗口的预测与预算不会重复建立，也不补停机期间的历史订单。上层重检可能压缩下层时间，不能只凭多看几次推断总成交量或收益增加。
+
+## 观测与风险
+
+盘口观测使用独立连接、线程和数据库，不持有模拟执行的连接或资金锁。v12 按校准中心时刻派发；严格 `OBSERVED` 仍要求整个时钟区间证明请求在目标后、响应在目标后一秒内。时钟交叠、迟到和漏采分别标识。完整、有效但不符合严格切片的响应，可在 `actual_observation` 提供真实接收时间及含费深度；它不是目标瞬间盘口，也不是成交。
+
+只读分析脚本从保留的原始盘口、时钟与 Gamma 收据重新核验身份、时间和费用，按原记录的 profile 与目标偏移分组，同时列出实际接收延迟。缺少历史费用证明时，不借用当前费率。脚本不更新数据库、历史样本状态或账本。
+
+Monitor 将未结算仓位分成窗口进行中、已到期等待官方结算、时间暂不确定三类。三类成本与费用均继续占用原风险额度；到期本身不会释放现金或生成盈亏。结算查询在开窗前 30 秒至开窗后 20 秒避让，并在每次请求前复核；未到期仓位不发结算请求。已发出的网络操作无法保证硬实时完成，迟到入场仍被拒绝。
+
+## 部署边界与入口
+
+`execution.py` 只记录本地模拟。实盘准备检查使用同一配置，核对禁用状态、资金上限与模型哈希；**真实订单适配器和签名器尚未实现**。仓库没有配置交易所账户密钥，不能把预检通过当作实盘就绪。
+
+采集保持有界线程池和 0.25 秒最小发出间隔。迟到结果不能成为当轮交易输入；低频预取仅使用已经闭合的观测，资金费保持真实事件。完整说明见 [v12 执行与观测规则](ARGON4_EXECUTION_V12.md)和 [v11 采集、快照与修订边界](ARGON4_LATENCY_V11.md)。
+
+运行入口为 `scripts/argon4_forward_server.py`，前端通过本地只读 API 获取状态。训练入口为 `scripts/train_argon4_forward.py`；`train/evaluate_argon4_gen4*` 与组合场景脚本仍是独立候选研究。源码克隆不包含模型、行情、账本或完整验证凭据，不能直接恢复原模拟账户。当前验收进度见 [EXPORT_VALIDATION.md](EXPORT_VALIDATION.md)，历史快照见 [EXPORT_VALIDATION_V11.md](EXPORT_VALIDATION_V11.md)。

@@ -27,9 +27,9 @@ def policy():
             "enabled_streams": ORDER[:3], "effective_from": iso(START-timedelta(days=1))}}
 
 
-def snapshot(start=START, fee=None):
+def snapshot(start=START, fee=None, enabled=None):
     streams = {}
-    for index, stream in enumerate(ORDER[:3]):
+    for index, stream in enumerate(enabled or ORDER[:3]):
         duration = 900 if stream.endswith("15m") else 300
         asset = stream.split("_")[0].lower()
         market = {"status": "VERIFIED_MARKET", "market_id": str(index+1),
@@ -338,3 +338,227 @@ def test_partial_decisions_can_link_remaining_streams_later(harness):
     service._poll_decisions()
     with sqlite3.connect(service.path) as db:
         assert db.execute("SELECT count(*) FROM decision_links").fetchone()[0] == 2
+
+
+@pytest.fixture
+def harness_v12(harness):
+    old = harness["service"]
+    old.close(wait=True)
+    service = mod.BookTelemetry(old.path.parent, policy_provider=old.policy_provider,
+        market_provider=old.market_provider, clock_provider=old.clock_provider,
+        transport_factory=old.transport_factory, sampling_profile="clock_center_v12")
+    harness["service"] = service
+    yield harness
+    if harness["gate"]:
+        harness["gate"].set()
+    service.close(wait=True)
+    assert not any(worker.is_alive() for worker in service._workers)
+
+
+def test_sampling_profile_is_explicit_and_invalid_profile_writes_nothing(tmp_path):
+    with pytest.raises(ValueError, match="sampling profile"):
+        mod.BookTelemetry(tmp_path / "invalid", policy_provider=policy,
+            market_provider=lambda: {}, clock_provider=lambda: {}, sampling_profile="v12_typo")
+    assert not (tmp_path / "invalid").exists()
+
+
+def test_v12_center_dispatch_preserves_clock_overlap_not_falsely_observed(harness_v12):
+    state = harness_v12
+    state["uncertainty"] = .35
+    arm_and_sample(state)
+    collected = rows(state["service"], status="AMBIGUOUS_SAMPLE")
+    assert len(state["calls"]) == len(collected) == 6
+    assert not rows(state["service"], status="OBSERVED")
+    for row in collected:
+        assert row["reason"] == "REQUEST_TARGET_CLOCK_OVERLAP"
+        quality = row["timing_quality"]
+        assert quality["request_interval_relation"] == "CLOCK_OVERLAP_TARGET"
+        assert quality["requested_offset_center_seconds"] == pytest.approx(.1)
+        assert quality["received_offset_center_seconds"] == pytest.approx(.15)
+        assert not quality["strict_target_window"] and not quality["exact_target_instant"]
+        assert row["best_ask"] is None and row["capacity"] is None
+        actual = row["actual_observation"]
+        assert actual["best_ask"] == .51 and Decimal(actual["capacity"]["shares"]) == 30
+        assert actual["capacity_scope"] == "ACTUAL_RECEIPT_NOT_TARGET_INSTANT"
+        assert not actual["strict_target_window"] and not actual["is_fill_estimate"]
+        assert actual["requested_at_server_lower"] == iso(START+timedelta(seconds=1.75))
+        assert actual["requested_at_server_upper"] == iso(START+timedelta(seconds=2.45))
+    status = state["service"].status()
+    assert status["sampling_profile"] == "clock_center_v12"
+    assert status["dispatch_time_basis"] == "CALIBRATED_CENTER"
+    assert status["observed_requires_full_target_interval"]
+    assert status["actual_quote_samples_this_process"] == 6
+    assert status["actual_depth_samples_this_process"] == 6
+    assert status["quality_counts_this_process"] == {"AMBIGUOUS_SAMPLE": 6}
+
+
+def test_v12_strict_observed_remains_bounded_by_both_clock_sides(harness_v12):
+    state = harness_v12
+    state["uncertainty"] = .1
+    state["service"].tick()
+    state["now"] = START+timedelta(seconds=2.2)
+    state["service"].tick()
+    wait_idle(state["service"])
+    collected = rows(state["service"], status="OBSERVED")
+    assert len(collected) == 6
+    for row in collected:
+        assert row["timing_quality"]["strict_target_window"]
+        assert row["timing_quality"]["request_interval_relation"] == "WITHIN_TARGET_WINDOW"
+        assert row["timing_quality"]["response_interval_relation"] == "WITHIN_TARGET_WINDOW"
+        assert row["capacity"] == row["actual_observation"]["capacity"]
+
+
+def test_v12_late_complete_book_keeps_actual_capacity_without_relabelling(harness_v12):
+    state = harness_v12
+    state["response_delay"] = 2
+    arm_and_sample(state)
+    collected = rows(state["service"], status="MISSED_SAMPLE")
+    assert len(collected) == 6
+    for row in collected:
+        assert row["reason"] == "RESPONSE_LATE_RAW_RETAINED"
+        assert row["receipt"]["raw_text"]
+        assert row["best_ask"] is None and row["capacity"] is None
+        assert row["timing_quality"]["response_interval_relation"] == "AFTER_TARGET_WINDOW"
+        assert not row["timing_quality"]["strict_target_window"]
+        assert row["actual_observation"]["received_at_server_center"] == iso(START+timedelta(seconds=4.1))
+        assert row["actual_observation"]["capacity"]["status"] == "OBSERVED_DEPTH"
+
+
+def test_v12_lower_bound_before_deadline_does_not_prove_timeliness(harness_v12):
+    state = harness_v12
+    state["uncertainty"] = .35
+    state["service"].tick()
+    state["now"] = START+timedelta(seconds=2.8)
+    state["service"].tick()
+    wait_idle(state["service"])
+    collected = rows(state["service"], status="MISSED_SAMPLE")
+    assert len(collected) == 6
+    for row in collected:
+        assert row["reason"] == "RESPONSE_LATE_RAW_RETAINED"
+        assert row["timing_quality"]["request_interval_relation"] == "CLOCK_OVERLAP_DEADLINE"
+        assert row["timing_quality"]["response_interval_relation"] == "CLOCK_OVERLAP_DEADLINE"
+        assert not row["timing_quality"]["strict_target_window"]
+        assert row["actual_observation"]["capacity"]["usd"] is not None
+
+
+def test_v12_centre_past_window_is_missed_without_backfill(harness_v12):
+    state = harness_v12
+    state["uncertainty"] = .35
+    state["service"].tick()
+    state["now"] = START+timedelta(seconds=3.1)
+    state["service"].tick()
+    assert not state["calls"]
+    missed = rows(state["service"], status="MISSED_SAMPLE")
+    assert len(missed) == 6
+    assert all(row["reason"] == "SCHEDULER_LATE" and row["actual_observation"] is None for row in missed)
+
+
+@pytest.mark.parametrize("key,value", [("source_age", 3), ("source_age", -1), ("omit_asks", True)])
+def test_v12_late_invalid_depth_has_no_actual_capacity(harness_v12, key, value):
+    state = harness_v12
+    state["response_delay"] = 2
+    state[key] = value
+    arm_and_sample(state)
+    invalid = rows(state["service"], status="INVALID_OBSERVATION")
+    assert len(invalid) == 6
+    assert all(row["actual_observation"] is None and row["capacity"] is None for row in invalid)
+
+
+@pytest.mark.parametrize("fee", [{"status": "UNKNOWN"},
+    {"status": "KNOWN_SCHEDULE", "fees_enabled": True, "rate": .02, "exponent": 2, "taker_only": True}])
+def test_v12_late_unknown_fee_remains_unknown_capacity(harness_v12, fee):
+    state = harness_v12
+    state["snapshot"] = snapshot(fee=fee)
+    state["response_delay"] = 2
+    arm_and_sample(state)
+    missed = rows(state["service"], status="MISSED_SAMPLE")
+    assert len(missed) == 6
+    assert all(row["actual_observation"]["capacity"]["status"] == "UNKNOWN_FEE"
+               and row["actual_observation"]["capacity"]["usd"] is None for row in missed)
+
+
+def test_v12_late_invalid_metadata_proof_does_not_attest_fee(harness_v12):
+    state = harness_v12
+    state["response_delay"] = 2
+    for market in state["snapshot"]["streams"].values():
+        market["current"]["metadata_sha256"] = None
+    arm_and_sample(state)
+    missed = rows(state["service"], status="MISSED_SAMPLE")
+    assert len(missed) == 6
+    assert all(row["actual_observation"]["capacity"]["status"] == "FEE_METADATA_UNVERIFIED"
+               and row["actual_observation"]["capacity"]["usd"] is None for row in missed)
+
+
+def test_v12_derivatives_use_hashed_raw_body_not_alternate_decoded_payload(harness_v12):
+    state = harness_v12
+    original = state["service"].transport_factory
+    class AlternateDecoded(original):
+        def get(self, *args):
+            raw, receipt, error = super().get(*args)
+            raw["asks"][0]["price"] = ".505"
+            return raw, receipt, error
+    state["service"].transport_factory = AlternateDecoded
+    arm_and_sample(state)
+    observed = rows(state["service"], status="OBSERVED")
+    assert len(observed) == 6
+    assert all(row["best_ask"] == .51 and row["actual_observation"]["best_ask"] == .51 for row in observed)
+
+
+def test_v12_backwards_receipt_has_no_usable_depth(harness_v12):
+    state = harness_v12
+    state["response_delay"] = -.05
+    arm_and_sample(state)
+    invalid = rows(state["service"], status="INVALID_OBSERVATION")
+    assert len(invalid) == 6
+    assert all(row["reason"] == "RECEIPT_TIMING_INVALID" and row["actual_observation"] is None for row in invalid)
+
+
+def test_v12_workers_start_before_targets_and_remain_bounded(harness_v12):
+    state = harness_v12
+    service = state["service"]
+    state["gate"] = threading.Event()
+    service.tick()
+    assert len(service._workers) == mod.MAX_WORKERS
+    assert not state["calls"] and not service.status()["active_requests"]
+    state["now"] = START+timedelta(seconds=2.1)
+    service.tick()
+    deadline = time.monotonic()+2
+    while len(state["calls"]) < 6 and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert len(state["calls"]) == 6
+    state["now"] = START+timedelta(seconds=6.1)
+    started = time.monotonic()
+    service.tick()
+    assert time.monotonic()-started < .5
+    assert len(state["calls"]) == 6
+    assert service.status()["active_requests"] == service.status()["max_requests"] == 12
+    assert service.status()["queued_requests"] == 6
+    state["now"] = START+timedelta(seconds=10.1)
+    service.tick()
+    assert len(state["calls"]) == 6 and service.status()["active_requests"] == 12
+    assert len([row for row in rows(service) if row.get("reason") == "OBSERVATION_WORKERS_BUSY"]) == 6
+    state["gate"].set()
+    wait_idle(service)
+    assert len(state["calls"]) == 6
+    assert len([row for row in rows(service) if row.get("reason") == "REQUEST_SLOT_LATE"]) == 6
+
+
+def test_v12_stage_two_ten_samples_use_six_workers_with_bounded_queue(harness_v12):
+    state = harness_v12
+    service = state["service"]
+    enabled = ORDER[:5]
+    def stage_two_policy():
+        result = policy()
+        result["execution_stage"]["enabled_streams"] = enabled
+        return result
+    service.policy_provider = stage_two_policy
+    state["snapshot"] = snapshot(enabled=enabled)
+    arm_and_sample(state)
+    observed = rows(service, status="OBSERVED")
+    assert len(observed) == len(state["calls"]) == 10
+    assert {row["stream"] for row in observed} == set(enabled)
+    assert len(service._workers) == service.status()["max_workers"] == 6
+    assert service.status()["max_requests"] == 12
+    assert not service.status()["queued_requests"] and not service.status()["active_requests"]
+    assert service.status()["actual_depth_samples_this_process"] == 10
+    assert not service.status()["execution_enabled"]
