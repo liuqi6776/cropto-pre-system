@@ -15,7 +15,7 @@ import re
 import time
 
 from .account import (Account, AccountRejected, ALL_STREAMS, STREAMS, V5_SEMANTICS, V5_UNLOCKED,
-                      _d, _iso, _json, _now, _safe, _ts, multi_look_settings)
+                      _d, _iso, _json, _now, _policy_risk_limits, _safe, _ts, multi_look_settings)
 
 
 def _stamp(now):
@@ -112,14 +112,9 @@ class PaperExecutor:
 
     @staticmethod
     def _clock(clock, stamp):
-        borderline_completed = (isinstance(clock, dict)
-                                and isinstance(clock.get("borderline_retry"), dict)
-                                and clock["borderline_retry"].get("status") == "COMPLETED"
-                                and len(clock.get("receipts", ())) == 8)
-        max_uncertainty = Decimal(".6") if borderline_completed else Decimal(".5")
         if (not isinstance(clock, dict) or clock.get("status") != "CALIBRATED"
                 or clock.get("source") != "POLYMARKET_CLOB_SERVER_TIME"
-                or not 0 <= _d(clock.get("uncertainty_seconds")) <= max_uncertainty
+                or not 0 <= _d(clock.get("uncertainty_seconds")) <= Decimal(".5")
                 or not 0 <= (stamp-_ts(clock.get("observed_at"))).total_seconds() <= 60):
             raise AccountRejected("CLOCK_NOT_CALIBRATED")
 
@@ -147,22 +142,8 @@ class PaperExecutor:
                 return market
         raise AccountRejected("verified contract window is missing")
 
-    def _stream_limit_price(self, decision=None):
-        cap = Decimal(".515")
-        exec_cfg = self.policy.get("execution")
-        if isinstance(exec_cfg, dict) and exec_cfg.get("high_confidence_max_buy_price") is not None:
-            hi = _d(exec_cfg["high_confidence_max_buy_price"])
-            if not Decimal(".515") <= hi <= Decimal(".520"):
-                raise AccountRejected("unsupported high-confidence buy price limit")
-            if isinstance(decision, dict) and (
-                    decision.get("high_confidence") is True
-                    or (decision.get("limit_price") is not None and _d(decision["limit_price"]) == hi)
-                    or (isinstance(decision.get("prediction"), dict) and decision["prediction"].get("high_confidence_q97") is True)):
-                cap = hi
-        return cap
-
     @staticmethod
-    def _adapt(market, side, book, stamp, clock, allow_price_skip=False, price_limit=Decimal(".515")):
+    def _adapt(market, side, book, stamp, clock, allow_price_skip=False):
         if (market.get("status") != "VERIFIED_MARKET" or market.get("active") is not True
                 or market.get("closed") is not False or market.get("accepting_orders") is not True
                 or not _ts(market["window_start"]) <= stamp < _ts(market["window_end"])):
@@ -194,7 +175,7 @@ class PaperExecutor:
                "observed_at_local":_iso(_ts(meta_local))}
         # A bad schedule cannot become a known price failure merely because no
         # ask is inside the limit; validate it independently of executable depth.
-        Account._fee_per_share(fee,price_limit,stamp,market["market_id"],side)
+        Account._fee_per_share(fee,Decimal(".515"),stamp,market["market_id"],side)
         contract = {k:market[k] for k in ("market_id", "condition_id", "protocol", "asset", "window_start", "window_end", "outcome_ids")}
         contract["resolution_source"] = market["resolution"]["source"]
         adapted = {"kind":"OBSERVED_PUBLIC_ORDERBOOK", "source":f"https://clob.polymarket.com/book?token_id={token}",
@@ -212,10 +193,10 @@ class PaperExecutor:
                 raise AccountRejected("invalid ask level")
             if quantity > 0:
                 positive_prices.append(price)
-            if price <= price_limit:
+            if price <= Decimal(".515"):
                 capacity += quantity * (price + Account._fee_per_share(fee,price,stamp,market["market_id"],side))
         if capacity <= 0:
-            if allow_price_skip and positive_prices and min(positive_prices) > price_limit:
+            if allow_price_skip and positive_prices and min(positive_prices) > Decimal(".515"):
                 return adapted, fee, Decimal(0)
             raise AccountRejected("zero or unknown capacity cannot unlock a lower rank")
         capacity = capacity.quantize(Decimal(".000001"), rounding=ROUND_DOWN)
@@ -302,10 +283,12 @@ class PaperExecutor:
                 # a paper fill, rather than relying on a possibly future bound.
                 if not _ts(signal["decision_at"]) < stamp-timedelta(seconds=2*float(_d(clock["uncertainty_seconds"]))):
                     raise AccountRejected("fill clock lower bound has not passed the decision")
-                summary = self.account.overview(now=stamp)
+                summary = self.account.overview(now=stamp, policy=self.policy)
+                limits = _policy_risk_limits(self.policy)
                 coin_cost = sum(p["cost_usd"]+p["fee_usd"] for p in summary["positions"] if p["underlying"]==signal["underlying"])
                 amount = min(capacity,_d(cohort["single_usd"]),_d(cohort["remaining_usd"]),_d(summary["cash"]),
-                             Decimal(1000)-_d(summary["locked_cost"]),Decimal(500)-_d(coin_cost))
+                             limits["max_order_usd"],limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
+                             limits["max_underlying_open_risk_usd"]-_d(coin_cost))
                 if amount <= 0:
                     raise AccountRejected("persistent budget or existing position limit exhausted")
                 amount = amount.quantize(Decimal(".000001"),rounding=ROUND_DOWN)
@@ -333,7 +316,7 @@ class PaperExecutor:
         return result
 
     @staticmethod
-    def _precheck_market_refresh(signal, stream, boundary, stamp, summary, cohort):
+    def _precheck_market_refresh(signal, stream, boundary, stamp, summary, cohort, policy=None):
         """Check eligibility before optional I/O, without inventing a market ID.
 
         This is an extra precondition, never a replacement for the account's
@@ -356,10 +339,12 @@ class PaperExecutor:
                 or not decision < expiry <= end or not stamp < expiry
                 or (stamp-decision).total_seconds() > 20):
             raise AccountRejected("invalid signal timing before market refresh")
+        limits = _policy_risk_limits(policy or (cohort.get("policy") if isinstance(cohort, dict) else None))
         coin_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
                         if p["underlying"] == asset)
         budget = min(_d(cohort["single_usd"]), _d(cohort["remaining_usd"]), _d(summary["cash"]),
-                     Decimal(200), Decimal(1000)-_d(summary["locked_cost"]), Decimal(500)-coin_cost)
+                     limits["max_order_usd"], limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
+                     limits["max_underlying_open_risk_usd"]-coin_cost)
         if budget < Decimal(".000001"):
             raise AccountRejected("persistent budget or existing position limit exhausted")
 
@@ -378,8 +363,7 @@ class PaperExecutor:
         current, look_claim = None, None
         try:
             multi_look = multi_look_settings(self.policy)
-            cascade_enabled = (isinstance(self.policy.get("execution"), dict)
-                               and self.policy["execution"].get("partial_fill_remainder_cascade") is True)
+            limits = _policy_risk_limits(self.policy)
             profile = stage_profile(self.policy, cohort_id)
             result["stage"] = profile
             for stream in profile["disabled_streams"]:
@@ -412,9 +396,7 @@ class PaperExecutor:
                         "persisted":True,"approved_usd":previous["approved_usd"],"spent_usd":previous["spent_usd"]}
                     if state not in ("NO_SIGNAL","NOT_DUE"):
                         stream_results[stream]["raw_capacity_usd"] = previous["capacity_usd"]
-                    if state in V5_UNLOCKED or (cascade_enabled and state == "PARTIAL"
-                                                and _d(previous["spent_usd"]) > 0
-                                                and (_ts(cohort["expires_at"]) - stamp).total_seconds() >= 4):
+                    if state in V5_UNLOCKED:
                         continue
                     raise AccountRejected("upper stream has an unsatisfied approved budget")
                 decision = decisions.get(stream)
@@ -448,14 +430,13 @@ class PaperExecutor:
                                 "next_retry_at":old_look["next_retry_at"],"approved_usd":0.,"spent_usd":0.}
                             result.update(status="WAITING_PRICE_RECHECK", next_retry_at=old_look["next_retry_at"])
                             break
-                summary = self.account.overview(now=stamp)
+                summary = self.account.overview(now=stamp, policy=self.policy)
                 if _d(cohort["remaining_usd"]) <= 0:
                     stream_results[stream] = {"status":"UNREACHED","reason":"COHORT_BUDGET_EXHAUSTED"}
                     break
                 signal = dict(decision["signal"])
-                limit_price = self._stream_limit_price(decision)
                 if market_refresh is not None:
-                    self._precheck_market_refresh(signal,stream,boundary,stamp,summary,cohort)
+                    self._precheck_market_refresh(signal,stream,boundary,stamp,summary,cohort,policy=self.policy)
                 try:
                     market = self._market(markets,stream,boundary)
                 except AccountRejected as exc:
@@ -476,7 +457,7 @@ class PaperExecutor:
                     self._clock(clock,stamp)
                     if not boundary <= stamp < _ts(cohort["expires_at"]):
                         raise AccountRejected("decision cohort expired before market refresh")
-                    self._precheck_market_refresh(signal,stream,boundary,stamp,summary,cohort)
+                    self._precheck_market_refresh(signal,stream,boundary,stamp,summary,cohort,policy=self.policy)
                     existing = market
                     refreshed = market_refresh(stream,boundary,deepcopy(existing))
                     stamp = _stamp(now)
@@ -513,13 +494,11 @@ class PaperExecutor:
                 self._clock(clock,stamp)
                 if not stamp < _ts(cohort["expires_at"]):
                     raise AccountRejected("decision cohort expired")
-                book,fee,capacity = self._adapt(market,side,observed,stamp,clock,allow_price_skip=True,price_limit=limit_price)
+                book,fee,capacity = self._adapt(market,side,observed,stamp,clock,allow_price_skip=True)
                 if not _ts(signal["decision_at"]) < stamp-timedelta(seconds=2*float(_d(clock["uncertainty_seconds"]))):
                     raise AccountRejected("fill clock lower bound has not passed the decision")
                 if capacity == 0:
                     receipt = {"source":"OBSERVED_PRICE_LIMIT_CHECK","signal":signal,"orderbook":book,"fee_quote":fee}
-                    if limit_price != Decimal(".515"):
-                        receipt["limit_price"] = float(limit_price)
                     if multi_look is not None:
                         completed = self.account.finish_book_look(cohort["cohort_id"],stream,look_claim[1],
                                                                  "PRICE_LIMIT_NOT_MET",receipt,now=now)
@@ -528,7 +507,7 @@ class PaperExecutor:
                             best = min(_d(a["price"]) for a in book["asks"] if _d(a["size"]) > 0)
                             stream_results[stream] = {"status":"WAITING_PRICE_RECHECK","persisted":True,
                                 "book_checked":True,"attempt":completed["attempt"],"best_ask":float(best),
-                                "limit_price":float(limit_price),"next_retry_at":completed["next_retry_at"],
+                                "limit_price":.515,"next_retry_at":completed["next_retry_at"],
                                 "book_observed_at":book["observed_at"],"approved_usd":0.,"spent_usd":0.}
                             result.update(status="WAITING_PRICE_RECHECK", next_retry_at=completed["next_retry_at"])
                             break
@@ -536,7 +515,7 @@ class PaperExecutor:
                                                     now=now if multi_look is not None else stamp)
                     best = min(_d(a["price"]) for a in book["asks"] if _d(a["size"])>0)
                     stream_results[stream] = {"status":"PRICE_LIMIT_NOT_MET","raw_capacity_usd":0.,
-                        "best_ask":float(best),"limit_price":float(limit_price),"book_observed_at":book["observed_at"],
+                        "best_ask":float(best),"limit_price":.515,"book_observed_at":book["observed_at"],
                         "book_checked":True,"approved_usd":0.,"spent_usd":0.,"persisted":True}
                     continue
                 if multi_look is not None:
@@ -544,40 +523,34 @@ class PaperExecutor:
                     self.account.finish_book_look(cohort["cohort_id"],stream,look_claim[1],"EXECUTABLE_BOOK",receipt,now=now)
                 # Re-read balances after I/O; both this target and the actual
                 # account mutation enforce the unchanged aggregate risk limits.
-                summary = self.account.overview(now=stamp)
+                summary = self.account.overview(now=stamp, policy=self.policy)
                 coin_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
                                 if p["underlying"]==signal["underlying"])
                 amount = min(capacity,_d(cohort["single_usd"]),_d(cohort["remaining_usd"]),_d(summary["cash"]),
-                             Decimal(200),Decimal(1000)-_d(summary["locked_cost"]),Decimal(500)-coin_cost)
+                             limits["max_order_usd"],limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
+                             limits["max_underlying_open_risk_usd"]-coin_cost)
                 amount = amount.quantize(Decimal(".000001"),rounding=ROUND_DOWN)
                 if amount <= 0:
                     raise AccountRejected("persistent budget or existing position limit exhausted")
-                preceding = [{"signal_id":s["signal_id"],"rank":s["rank"],
-                              "required_cost_usd":s["approved_usd"] if s["state"]=="FILLED_BUDGET" else s["spent_usd"]}
-                             for s in cohort["streams"]
-                             if s["state"]=="FILLED_BUDGET" or (cascade_enabled and s["state"]=="PARTIAL" and _d(s["spent_usd"]) > 0)]
+                preceding = [{"signal_id":s["signal_id"],"rank":s["rank"],"required_cost_usd":s["approved_usd"]}
+                             for s in cohort["streams"] if s["state"]=="FILLED_BUDGET"]
                 authorization = {"policy":"RANKED_CAPACITY_WATERFALL","waterfall_semantics":V5_SEMANTICS,
                     "plan_id":cohort["plan_id"],"rank":rank,"signal_id":signal["signal_id"],"market_id":market["market_id"],
                     "approved_stake_usd":float(amount),"planned_at":_iso(stamp),
                     "valid_until":_iso(min(_ts(signal["valid_until"]),stamp+timedelta(seconds=2),_ts(cohort["expires_at"]))),
                     "policy_version":cohort["policy_version"],"preceding_allocations":preceding,
                     "cohort_id":cohort["cohort_id"],"cohort_capacity_usd":float(capacity)}
-                if limit_price != Decimal(".515"):
-                    authorization["max_buy_price"] = float(limit_price)
                 if multi_look is not None:
                     authorization["book_look_attempt"] = look_claim[1]
                 fill = self.account.place_paper_buy(signal,book,fee,now=self._paper_acceptance_clock(now,clock,book,fee,signal),
-                                                    stake=amount,limit_price=limit_price,allocation_authorization=authorization)
+                                                    stake=amount,allocation_authorization=authorization)
                 look_claim = None
                 result["fills"].append(fill)
                 state = fill["cohort_stream_state"]
-                spent = _d(fill["cost_usd"])+_d(fill["fee_usd"])
                 stream_results[stream] = {"status":state,"raw_capacity_usd":float(capacity),"approved_usd":float(amount),
-                    "spent_usd":float(spent),"order_id":fill["order_id"],
+                    "spent_usd":float(_d(fill["cost_usd"])+_d(fill["fee_usd"])),"order_id":fill["order_id"],
                     "book_checked":True,"persisted":True}
-                cascade_allowed = (cascade_enabled and state == "PARTIAL" and spent > 0
-                                   and (_ts(cohort["expires_at"]) - stamp).total_seconds() >= 4)
-                if state != "FILLED_BUDGET" and not cascade_allowed:
+                if state != "FILLED_BUDGET":
                     raise AccountRejected("upper stream has an unsatisfied approved budget")
             if result.get("status") != "WAITING_PRICE_RECHECK":
                 result["status"] = "PROCESSED"

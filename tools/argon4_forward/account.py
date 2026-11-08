@@ -100,6 +100,52 @@ def _stage(policy, boundary):
         raise AccountRejected(str(exc)) from exc
 
 
+def _policy_risk_limits(policy=None):
+    """Read and validate configurable risk limits from policy (with v13r2 defaults)."""
+    src = policy if isinstance(policy, Mapping) else {}
+    risk_block = src.get("risk") if isinstance(src.get("risk"), Mapping) else {}
+
+    def dec_field(key, default):
+        raw = risk_block.get(key) if key in risk_block else src.get(key)
+        if raw is None:
+            return Decimal(str(default))
+        if isinstance(raw, bool):
+            raise AccountRejected("invalid policy risk limits")
+        return _d(raw)
+
+    def has_field(key):
+        return key in risk_block or key in src
+
+    single_frac = dec_field("single_stream_equity_fraction", "0.015")
+    tick_frac = dec_field("tick_equity_fraction", "0.022")
+    max_order = dec_field("max_order_usd", "200")
+    max_open = dec_field("max_open_risk_usd", "1000")
+    default_tick = max(Decimal("1200"), max_order) if has_field("max_order_usd") and not has_field("max_tick_budget_usd") else "1200"
+    max_tick = dec_field("max_tick_budget_usd", default_tick)
+    default_underlying = min(Decimal("500"), max_open) if has_field("max_open_risk_usd") and not has_field("max_underlying_open_risk_usd") else "500"
+    max_underlying = dec_field("max_underlying_open_risk_usd", default_underlying)
+    daily_loss = dec_field("daily_loss_fraction", "0.055")
+    if (not Decimal("0.005") <= single_frac <= Decimal("0.030")
+            or not Decimal("0.010") <= tick_frac <= Decimal("0.050")
+            or not Decimal("0.010") <= daily_loss <= Decimal("0.100")
+            or max_tick <= 0 or max_order <= 0 or max_open <= 0 or max_underlying <= 0
+            or max_order > max_tick or max_underlying > max_open):
+        raise AccountRejected("invalid policy risk limits")
+    return {
+        "single_stream_equity_fraction": single_frac,
+        "tick_equity_fraction": tick_frac,
+        "max_tick_budget_usd": max_tick,
+        "max_order_usd": max_order,
+        "max_open_risk_usd": max_open,
+        "max_underlying_open_risk_usd": max_underlying,
+        "daily_loss_fraction": daily_loss,
+        "max_tick_budget_atoms": _atoms(max_tick),
+        "max_order_atoms": _atoms(max_order),
+        "max_open_risk_atoms": _atoms(max_open),
+        "max_underlying_open_risk_atoms": _atoms(max_underlying),
+    }
+
+
 def multi_look_settings(policy):
     """Explicit v12-only admission; older policies retain one-look semantics."""
     if policy.get("engineering", {}).get("profile") != "argon4-latency-v12":
@@ -268,6 +314,7 @@ class Account:
         """Freeze one five-minute decision cohort's risk budget across polling/restarts."""
         stamp, boundary = _now(now), _ts(cohort_id)
         _safe(policy)
+        limits = _policy_risk_limits(policy)
         if boundary.timestamp() % 300 or not boundary <= stamp < boundary + timedelta(seconds=20):
             raise AccountRejected("cohort must be a current five-minute decision boundary")
         order = policy.get("order", [])
@@ -309,7 +356,7 @@ class Account:
                     streak += 1
                     day -= timedelta(days=1)
                 blocked = None
-                if day_start_equity <= 0 or today_pnl <= -day_start_equity * .055:
+                if day_start_equity <= 0 or Decimal(today_pnl) <= -Decimal(day_start_equity) * limits["daily_loss_fraction"]:
                     blocked = "DAILY_LOSS_LIMIT"
                 if streak >= 5:
                     until = policy.get("cooldown_until")
@@ -317,9 +364,9 @@ class Account:
                         blocked = "COOLDOWN_STATE_REQUIRED"
                     elif stamp < _ts(until):
                         blocked = "COOLDOWN_ACTIVE"
-                budget = max(0, min(int(Decimal(equity)*Decimal(".022")), 1_200_000_000,
-                                    a["cash_atoms"], 1_000_000_000-risk))
-                single = max(0, min(200_000_000, int(Decimal(equity)*Decimal(".015")*(Decimal(".5") if streak >= 4 else 1))))
+                budget = max(0, min(int(Decimal(equity)*limits["tick_equity_fraction"]), limits["max_tick_budget_atoms"],
+                                    a["cash_atoms"], limits["max_open_risk_atoms"]-risk))
+                single = max(0, min(limits["max_order_atoms"], int(Decimal(equity)*limits["single_stream_equity_fraction"]*(Decimal(".5") if streak >= 4 else 1))))
                 if not budget:
                     blocked = blocked or "NO_RISK_BUDGET"
                 plan_id = "cohort:" + hashlib.sha256((key+policy_hash).encode()).hexdigest()
@@ -345,17 +392,10 @@ class Account:
         return self.cohort_state(key)
 
     @staticmethod
-    def _higher_ranks_unlocked(con, cohort_key, rank, cohort_policy, v5=True):
-        higher = con.execute("SELECT rank,state,spent_atoms FROM cohort_streams WHERE cohort_id=? AND rank<?",
+    def _higher_ranks_unlocked(con, cohort_key, rank, cohort_policy=None, v5=True):
+        higher = con.execute("SELECT rank,state FROM cohort_streams WHERE cohort_id=? AND rank<?",
                              (cohort_key, rank)).fetchall()
-        if len(higher) != rank - 1:
-            return False
-        if not v5:
-            return all(r["state"] in LEGACY_UNLOCKED for r in higher)
-        exec_cfg = cohort_policy.get("execution") if isinstance(cohort_policy, Mapping) else None
-        cascade = isinstance(exec_cfg, Mapping) and exec_cfg.get("partial_fill_remainder_cascade") is True
-        return all(r["state"] in V5_UNLOCKED or (cascade and r["state"] == "PARTIAL" and r["spent_atoms"] > 0)
-                   for r in higher)
+        return len(higher) == rank - 1 and all(r["state"] in (V5_UNLOCKED if v5 else LEGACY_UNLOCKED) for r in higher)
 
     def record_cohort_gate(self, cohort_id, stream, decision_status, capacity_usd, receipt, now=None):
         """Persist an observed upper-layer capacity gate for an explicitly absent signal."""
@@ -775,8 +815,8 @@ class Account:
             raise AccountRejected("stale orderbook")
         limit = _d(limit_price)
         budget = _atoms(_d(stake))
-        max_limit = Decimal(".520") if _d(authorization.get("max_buy_price", ".515")) == Decimal(".520") else Decimal(".515")
-        if not 0 < limit <= max_limit or not 0 < budget <= 200_000_000:
+        pre_limits = _policy_risk_limits(getattr(self, "policy", None))
+        if not 0 < limit <= Decimal(".515") or budget <= 0 or (authorization.get("cohort_id") is None and budget > pre_limits["max_order_atoms"]):
             raise AccountRejected("order price or stake exceeds limit")
         asks = orderbook.get("asks")
         if not isinstance(asks, list):
@@ -824,6 +864,7 @@ class Account:
                 return {**json.loads(old["payload"]), "status": old["status"], "duplicate": True}
             recheck_admission()  # BEGIN IMMEDIATE may have waited for another writer.
             cohort = None
+            cohort_policy = None
             cohort_key = authorization.get("cohort_id")
             # A caller cannot strip cohort_id to escape an already recorded
             # stage through the legacy standalone-preview entry point. Only
@@ -876,6 +917,9 @@ class Account:
                 cohort_capacity = _atoms(_d(authorization.get("cohort_capacity_usd")))
                 if cohort_capacity <= 0 or budget > cohort_capacity:
                     raise AccountRejected("cohort observed capacity invalid")
+            limits = _policy_risk_limits(cohort_policy if cohort_policy is not None else (json.loads(latest["policy_json"]) if latest else getattr(self, "policy", None)))
+            if budget > limits["max_order_atoms"]:
+                raise AccountRejected("order price or stake exceeds limit")
             rank_use = con.execute("SELECT 1 FROM allocation_consumption WHERE plan_id=? AND rank=?",
                                    (authorization["plan_id"], authorization["rank"])).fetchone()
             if rank_use:
@@ -895,14 +939,7 @@ class Account:
                     raise AccountRejected("preceding allocation amount invalid")
                 consumed = con.execute("SELECT * FROM allocation_consumption WHERE plan_id=? AND signal_id=? AND rank=?",
                                        (authorization["plan_id"], required["signal_id"], required["rank"])).fetchone()
-                cascade_ok = (cohort is not None and v5
-                              and isinstance(cohort_policy.get("execution"), Mapping)
-                              and cohort_policy["execution"].get("partial_fill_remainder_cascade") is True
-                              and consumed is not None and consumed["spent_atoms"] > 0
-                              and consumed["spent_atoms"] + 2 >= threshold
-                              and threshold <= consumed["approved_atoms"])
-                if (consumed is None or ((consumed["approved_atoms"] != threshold or consumed["spent_atoms"] + 2 < threshold)
-                                         and not cascade_ok)):
+                if consumed is None or consumed["approved_atoms"] != threshold or consumed["spent_atoms"] + 2 < threshold:
                     raise AccountRejected("higher ranked capacity has not actually filled in this plan")
             previous = con.execute("SELECT payload FROM signals WHERE signal_id=?", (clean["signal_id"],)).fetchone()
             if previous is not None and previous[0] != _json(clean):
@@ -913,7 +950,7 @@ class Account:
             cash = con.execute("SELECT cash_atoms FROM account WHERE id=1").fetchone()[0]
             open_risk = con.execute("SELECT COALESCE(SUM(cost_atoms+fee_atoms),0) FROM orders WHERE status='OPEN'").fetchone()[0]
             coin_risk = con.execute("SELECT COALESCE(SUM(cost_atoms+fee_atoms),0) FROM orders WHERE status='OPEN' AND underlying=?", (clean["underlying"],)).fetchone()[0]
-            if budget > min(cash, 1_000_000_000 - open_risk, 500_000_000 - coin_risk):
+            if budget > min(cash, limits["max_open_risk_atoms"] - open_risk, limits["max_underlying_open_risk_atoms"] - coin_risk):
                 raise AccountRejected("cash or concurrent exposure limit exceeded")
             remaining = budget
             fills, cost, fees, quantity = [], 0, 0, Decimal(0)
@@ -1042,7 +1079,7 @@ class Account:
             self._snapshot(con, stamp)
         return result
 
-    def overview(self, now=None):
+    def overview(self, now=None, policy=None):
         stamp = _now(now)
         with self._connection() as con:
             a = dict(con.execute("SELECT * FROM account WHERE id=1").fetchone())
@@ -1050,6 +1087,19 @@ class Account:
             counts = dict(con.execute("SELECT status,COUNT(*) FROM orders GROUP BY status").fetchall())
             positions = [dict(o) for o in con.execute("SELECT order_id,signal_id,market_id,underlying,outcome,quantity,cost_atoms,fee_atoms,fill_at,window_end FROM orders WHERE status='OPEN'")]
             signal_count = con.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+            latest_policy_row = con.execute("SELECT policy_json FROM decision_cohorts ORDER BY cohort_id DESC LIMIT 1").fetchone() if policy is None else None
+        effective_policy = policy if policy is not None else (
+            json.loads(latest_policy_row[0]) if latest_policy_row else getattr(self, "policy", None)
+        )
+        try:
+            limits = _policy_risk_limits(effective_policy)
+        except AccountRejected:
+            limits = _policy_risk_limits(None)
+
+        def _num(d):
+            return int(d) if d == int(d) else float(d)
+
+        default_order = min(limits["max_order_usd"], (_d(_usd(a["initial_atoms"])) * limits["single_stream_equity_fraction"]).quantize(Decimal("0.000001"), rounding=ROUND_DOWN))
         locked = sum(p["cost_atoms"] + p["fee_atoms"] for p in positions)
         for p in positions:
             p["cost_usd"] = _usd(p.pop("cost_atoms"))
@@ -1075,7 +1125,12 @@ class Account:
                 "heartbeat_age_seconds": max(0.0, (stamp-_ts(runtime["heartbeat_at"])).total_seconds()),
                 "runtime_details": json.loads(runtime["details"]),
                 "ready_streams": [],
-                "risk_limits": {"default_order_usd": 150, "max_order_usd": 200, "max_stream_cohort_usd": 200, "max_total_open_cost_usd": 1000, "max_underlying_open_cost_usd": 500, "max_buy_price": .515},
+                "risk_limits": {"default_order_usd": _num(default_order),
+                                "max_order_usd": _num(limits["max_order_usd"]),
+                                "max_stream_cohort_usd": _num(limits["max_order_usd"]),
+                                "max_total_open_cost_usd": _num(limits["max_open_risk_usd"]),
+                                "max_underlying_open_cost_usd": _num(limits["max_underlying_open_risk_usd"]),
+                                "max_buy_price": .515},
                 "limitations": ["No real orders or signed transactions", "Model attestation must be verified by the upstream signal adapter", "Paper IOC fills use observed ask depth; they are not actual fills", "Open positions have no mark-to-market valuation"]}
 
     def ledger(self, limit=100):

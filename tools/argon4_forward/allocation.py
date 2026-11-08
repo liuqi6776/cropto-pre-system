@@ -23,6 +23,7 @@ import json
 from collections.abc import Mapping, Sequence
 from urllib.parse import urlsplit
 
+from .account import AccountRejected, _policy_risk_limits
 from .stage import DISABLED, StageRejected, stage_profile
 
 
@@ -194,11 +195,30 @@ def plan_waterfall(policy, candidates, equity, cash, open_risk, now, day_pnl=0,
         return result
     if stage["configured"]:
         result["execution_stage"] = stage
-    tick_budget = _money(min(eq * Decimal(".022"), Decimal(1200), available_cash,
-                             max(Decimal(0), Decimal(1000) - risk)))
+    try:
+        limits = _policy_risk_limits(policy)
+    except AccountRejected:
+        block("INVALID_RISK_LIMITS", "Policy risk limits are invalid or out of bounds")
+        return result
+
+    def _num_out(d):
+        return int(d) if d == int(d) else float(d)
+
+    result["limits"].update(
+        single_stream_equity_fraction=float(limits["single_stream_equity_fraction"]),
+        tick_equity_fraction=float(limits["tick_equity_fraction"]),
+        tick_hard_cap_usd=_num_out(limits["max_tick_budget_usd"]),
+        order_hard_cap_usd=_num_out(limits["max_order_usd"]),
+        stream_cohort_hard_cap_usd=_num_out(limits["max_order_usd"]),
+        open_risk_hard_cap_usd=_num_out(limits["max_open_risk_usd"]),
+        underlying_open_risk_hard_cap_usd=_num_out(limits["max_underlying_open_risk_usd"]),
+        daily_loss_fraction=float(limits["daily_loss_fraction"]),
+    )
+    tick_budget = _money(min(eq * limits["tick_equity_fraction"], limits["max_tick_budget_usd"], available_cash,
+                             max(Decimal(0), limits["max_open_risk_usd"] - risk)))
     result["initial_tick_budget_usd"] = result["unspent"] = float(tick_budget)
-    single_budget = _money(eq * Decimal(".015") * (Decimal(".5") if losing_days >= 4 else Decimal(1)))
-    effective_single = min(single_budget, Decimal(200))
+    single_budget = _money(eq * limits["single_stream_equity_fraction"] * (Decimal(".5") if losing_days >= 4 else Decimal(1)))
+    effective_single = min(single_budget, limits["max_order_usd"])
     result["single_stream_budget_usd"] = float(single_budget)
     result["effective_single_stream_budget_usd"] = float(effective_single)
     if day_result < 0:
@@ -209,7 +229,7 @@ def plan_waterfall(policy, candidates, equity, cash, open_risk, now, day_pnl=0,
         except (ValueError, TypeError, InvalidOperation):
             block("DAY_START_EQUITY_REQUIRED", "Daily loss guard requires the observed day-start equity")
             return result
-        if -day_result >= day_base * Decimal(".055"):
+        if -day_result >= day_base * limits["daily_loss_fraction"]:
             block("DAILY_LOSS_LIMIT", "Observed daily loss reached 5.5% of day-start equity")
             return result
     if losing_days >= 5:

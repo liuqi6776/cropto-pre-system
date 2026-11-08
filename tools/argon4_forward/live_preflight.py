@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .runtime_profile import engineering_profile, minimum_decision_delay, revision_fastpath_profile
 from .stage import stage_profile
-from .account import multi_look_settings
+from .account import AccountRejected, _policy_risk_limits, multi_look_settings
 
 
 def preparation_status(policy, config):
@@ -18,15 +18,24 @@ def preparation_status(policy, config):
     earliest = minimum_decision_delay(policy, engineering)
     multi_look = multi_look_settings(policy)
     revision_profile = revision_fastpath_profile(policy)
+    try:
+        risk_limits = _policy_risk_limits(policy)
+    except AccountRejected as exc:
+        raise ValueError(str(exc)) from exc
     disabled = (policy.get("live_enabled") is False and
                 config.get("live_enabled") is False and
                 config.get("mode") == "disabled" and
                 config.get("signer_connected") is False and
                 config.get("order_transport_connected") is False)
-    limits_match = (config.get("max_order_usd") == policy.get("max_order_usd") and
-                    config.get("max_open_risk_usd") == policy.get("max_open_risk_usd"))
+    risk_block = policy.get("risk") if isinstance(policy.get("risk"), dict) else {}
+    expected_order = float(risk_limits["max_order_usd"]) if ("max_order_usd" in policy or "max_order_usd" in risk_block or "max_order_usd" in config) else None
+    expected_open = float(risk_limits["max_open_risk_usd"]) if ("max_open_risk_usd" in policy or "max_open_risk_usd" in risk_block or "max_open_risk_usd" in config) else None
+    limits_match = (config.get("max_order_usd") == expected_order and
+                    config.get("max_open_risk_usd") == expected_open)
     return {"status": "DISABLED", "live_enabled": False,
             "configuration_safe": disabled, "risk_limits_match": limits_match,
+            "risk_limits": {k: (int(v) if v == int(v) else float(v))
+                            for k, v in risk_limits.items() if not k.endswith("_atoms")},
             "engineering": engineering, "policy_version": policy.get("version"),
             "min_decision_delay_seconds": earliest, "multi_look_ioc": multi_look,
             "aged_revision_fastpath": revision_profile,

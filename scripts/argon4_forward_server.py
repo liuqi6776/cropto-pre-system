@@ -80,7 +80,7 @@ class Application:
         live = load_json(ROOT / "config/argon4_live_preflight.json", {})
         pipeline = self.pipeline.status() if self.pipeline else {"active": False, "models": {}, "status": "NOT_ENABLED"}
         models = pipeline.get("models", {})
-        overview = self.account.overview()
+        overview = self.account.overview(policy=allocation)
         try:
             open_risk = split_open_risk(overview, clock=dict(getattr(self.pipeline, "clock", None) or {}))
         except RiskViewError:

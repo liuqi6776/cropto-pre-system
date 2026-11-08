@@ -14,6 +14,8 @@ from . import model
 ALL_STREAMS = {**model.STREAMS, "XRP_15m": ("XRPUSDT", 3, .85)}
 ALL_SYMBOLS = (*model.SYMBOLS, "XRPUSDT")
 _ORIGINAL_BUILD_FEATURE_FRAMES = model.build_feature_frames
+_ORIGINAL_LOAD_MODEL_BUNDLE = model.load_model_bundle
+_ORIGINAL_PREDICT_STREAM = model.predict_stream
 
 
 def build_feature_frames_v14(data_root=None, symbol="BTCUSDT", *, as_of=None, tail_rows=None):
@@ -43,11 +45,13 @@ def build_feature_frames_v14(data_root=None, symbol="BTCUSDT", *, as_of=None, ta
 
 
 def load_model_bundle_v14(stream, phase="deployment_q4", *, expected_manifest_sha256=None):
-    if stream in model.STREAMS:
+    if stream in model.STREAMS or model.load_model_bundle is not _ORIGINAL_LOAD_MODEL_BUNDLE:
+        if phase == "deployment_q4":
+            return model.load_model_bundle(stream, expected_manifest_sha256=expected_manifest_sha256)
         return model.load_model_bundle(stream, phase=phase, expected_manifest_sha256=expected_manifest_sha256)
     if stream not in ALL_STREAMS:
         raise model.ModelInputError("unknown stream or phase")
-    tree = ast.parse(inspect.getsource(model.load_model_bundle))
+    tree = ast.parse(inspect.getsource(_ORIGINAL_LOAD_MODEL_BUNDLE))
     namespace = dict(vars(model))
     namespace.update(STREAMS=ALL_STREAMS, MODEL_ROOT=model.MODEL_ROOT)
     ast.fix_missing_locations(tree)
@@ -56,10 +60,13 @@ def load_model_bundle_v14(stream, phase="deployment_q4", *, expected_manifest_sh
 
 
 def predict_stream_v14(stream, base_frame, v4_frame, decision_time, *, bundle=None, phase="deployment_q4", threshold_override=None):
-    if stream in model.STREAMS:
-        res = model.predict_stream(stream, base_frame, v4_frame, decision_time, bundle=bundle, phase=phase)
+    if stream in model.STREAMS or model.predict_stream is not _ORIGINAL_PREDICT_STREAM:
+        if phase == "deployment_q4":
+            res = model.predict_stream(stream, base_frame, v4_frame, decision_time, bundle=bundle)
+        else:
+            res = model.predict_stream(stream, base_frame, v4_frame, decision_time, bundle=bundle, phase=phase)
     elif stream in ALL_STREAMS:
-        tree = ast.parse(inspect.getsource(model.predict_stream))
+        tree = ast.parse(inspect.getsource(_ORIGINAL_PREDICT_STREAM))
         namespace = dict(vars(model))
         namespace.update(STREAMS=ALL_STREAMS, load_model_bundle=load_model_bundle_v14)
         ast.fix_missing_locations(tree)

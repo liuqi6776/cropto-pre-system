@@ -29,7 +29,6 @@ import numpy as np
 import pandas as pd
 
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT")
-ALL_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
 PROVENANCE = ("first_received_at", "receipt_sha256", "receipt_time_basis", "clock_evidence_sha256")
 PRICE_FIELDS = {1: "open", 2: "high", 3: "low", 4: "close", 5: "volume",
                 7: "quote_volume", 8: "count", 9: "taker_buy_base_volume", 10: "taker_buy_quote_volume"}
@@ -40,8 +39,9 @@ REVISION_SPECS = {
 }
 SAFE_ERROR = "REVISION_VIEW_NOT_COMMITTED"
 FAST_PROFILE = "argon4-aged-revision-v13"
-FAST_HOURLY_PROFILE = "argon4-aged-revision-v14"
 _RECOVERY_LOCK = threading.Lock()
+_COMMITTED_ARCHIVE_HASH_LOCK = threading.Lock()
+_COMMITTED_ARCHIVE_HASH_CACHE = {}
 
 
 class RevisionSafetyError(ValueError):
@@ -65,6 +65,32 @@ def _sha(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _cached_sha(path, cache_bucket):
+    resolved = Path(path).resolve()
+    st = resolved.stat()
+    key = str(resolved)
+    with _COMMITTED_ARCHIVE_HASH_LOCK:
+        cached = cache_bucket.get(key)
+    if cached is not None and cached[0] == st.st_size and cached[1] == st.st_mtime_ns:
+        return cached[2]
+    digest = _sha(resolved)
+    with _COMMITTED_ARCHIVE_HASH_LOCK:
+        cache_bucket[key] = (st.st_size, st.st_mtime_ns, digest)
+    return digest
+
+
+def _cached_inventory(root, cache_bucket):
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("RAW_VIEW_MISSING_OR_SYMLINK")
+    paths = []
+    for path in root.rglob("*"):
+        if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+            raise ValueError("RAW_VIEW_SYMLINK")
+        if path.is_file():
+            paths.append(path)
+    return {p.relative_to(root).as_posix(): _cached_sha(p, cache_bucket) for p in sorted(paths)}
 
 
 def _bytes_json(value):
@@ -108,32 +134,35 @@ def _verified_committed_state(runtime, state):
         folder = (revisions / state["revision_id"]).resolve()
         if folder.parent != revisions.resolve() or folder.is_symlink():
             raise ValueError(SAFE_ERROR)
+        cache_key = (str(folder), str(state.get("revision_id")), str(state.get("manifest_sha256")))
+        with _COMMITTED_ARCHIVE_HASH_LOCK:
+            cache_bucket = _COMMITTED_ARCHIVE_HASH_CACHE.setdefault(cache_key, {})
         manifest = folder / "manifest.json"
-        if _sha(manifest) != state["manifest_sha256"]:
+        if _cached_sha(manifest, cache_bucket) != state["manifest_sha256"]:
             raise ValueError(SAFE_ERROR)
         evidence = json.loads(manifest.read_text(encoding="utf-8"))
         if (evidence.get("status") != "COMMITTED" or evidence.get("revision_id") != state["revision_id"]
                 or evidence.get("view_effective_at") != state.get("view_effective_at")):
             raise ValueError(SAFE_ERROR)
-        if _inventory(folder / "raw_data") != evidence["before_files"]:
+        if _cached_inventory(folder / "raw_data", cache_bucket) != evidence["before_files"]:
             raise ValueError(SAFE_ERROR)
-        if _sha(folder / "prepared.json") != evidence["prepared_sha256"]:
+        if _cached_sha(folder / "prepared.json", cache_bucket) != evidence["prepared_sha256"]:
             raise ValueError(SAFE_ERROR)
         for relative, digest in evidence["after_files"].items():
             if digest != evidence["before_files"].get(relative):
                 proposed = folder / "proposed_raw_data" / relative
-                if not proposed.resolve().is_relative_to(folder) or _sha(proposed) != digest:
+                if not proposed.resolve().is_relative_to(folder) or _cached_sha(proposed, cache_bucket) != digest:
                     raise ValueError(SAFE_ERROR)
         for backup in evidence["sqlite_backups"]:
             snapshot = Path(backup["snapshot_path"])
-            if snapshot.resolve().parent != folder or _sha(snapshot) != backup["sha256"]:
+            if snapshot.resolve().parent != folder or _cached_sha(snapshot, cache_bucket) != backup["sha256"]:
                 raise ValueError(SAFE_ERROR)
         if evidence.get("mark_registry_update"):
             from .mark_revision_registry import verify_registry_archive
             verify_registry_archive(folder, evidence["mark_registry_update"])
         if evidence.get("recovery_validation_file"):
             recovery = folder / evidence["recovery_validation_file"]
-            if recovery.resolve().parent != folder or recovery.is_symlink() or _sha(recovery) != evidence["recovery_validation_sha256"]:
+            if recovery.resolve().parent != folder or recovery.is_symlink() or _cached_sha(recovery, cache_bucket) != evidence["recovery_validation_sha256"]:
                 raise ValueError(SAFE_ERROR)
         _time(state["view_effective_at"])
         return state
@@ -162,7 +191,7 @@ def _error_sources(errors):
         if not isinstance(error, dict):
             raise ValueError("UNSUPPORTED_REVISION_ERROR")
         parts = str(error.get("source", "")).split(":")
-        if (len(parts) != 3 or (parts[0], parts[2]) not in REVISION_SPECS or parts[1] not in ALL_SYMBOLS
+        if (len(parts) != 3 or (parts[0], parts[2]) not in REVISION_SPECS or parts[1] not in SYMBOLS
                 or error.get("error") not in ("CONFLICTING_CLOSED_OBSERVATION", "ValueError:CONFLICTING_CLOSED_OBSERVATION")):
             raise ValueError("UNSUPPORTED_REVISION_ERROR")
         sources.append(tuple(parts))
@@ -311,7 +340,7 @@ def _fast_context(context, validation_at):
         return None
     if (not isinstance(context, dict)
             or set(context) != {"profile", "cohort", "deadline", "minimum_spacing_seconds", "clock_evidence_sha256"}
-            or context["profile"] not in (FAST_PROFILE, FAST_HOURLY_PROFILE)
+            or context["profile"] != FAST_PROFILE
             or isinstance(context["minimum_spacing_seconds"], bool)
             or context["minimum_spacing_seconds"] != 2.0):
         raise ValueError("INVALID_FAST_REVISION_CONTEXT")
@@ -322,7 +351,7 @@ def _fast_context(context, validation_at):
     if (cohort != cohort.floor("5min") or deadline != cohort+pd.Timedelta(seconds=14)
             or not cohort <= validation_at <= deadline):
         raise ValueError("FAST_REVISION_OUTSIDE_INPUT_BUDGET")
-    return {"profile": context["profile"], "cohort": cohort.isoformat(), "deadline": deadline.isoformat(),
+    return {"profile": FAST_PROFILE, "cohort": cohort.isoformat(), "deadline": deadline.isoformat(),
             "minimum_spacing_seconds": 2.0, "clock_evidence_sha256": clock_hash}
 
 
@@ -391,14 +420,9 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
             fast = fast_context is not None
             if fast:
                 cohort = _time(fast_context["cohort"])
-                closed_at = pd.to_datetime(opened+spec["step_ms"], unit="ms", utc=True)
-                hourly_allowed = (fast_context.get("profile") == FAST_HOURLY_PROFILE
-                                  and interval == "1h" and kind in ("futures", "mark")
-                                  and (closed_at <= cohort-pd.Timedelta(minutes=5)
-                                       or (closed_at <= cohort and now >= cohort+pd.Timedelta(seconds=4))))
-                aged = ((kind == "futures" and interval == "5m"
-                         and closed_at <= cohort-pd.Timedelta(minutes=5))
-                        or hourly_allowed)
+                aged = (kind == "futures" and interval == "5m"
+                        and pd.to_datetime(opened+spec["step_ms"], unit="ms", utc=True)
+                        <= cohort-pd.Timedelta(minutes=5))
                 current_receipt = (cohort <= _time(latest["requested_at"])
                                    and latest["time_basis"] == "CALIBRATED_UTC_UPPER_BOUND"
                                    and latest["clock_evidence_sha256"] == fast_context["clock_evidence_sha256"])
@@ -466,9 +490,53 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
     return plans, pending
 
 
+def _is_valid_observations_prefix(source, prior_snapshot):
+    if prior_snapshot.stat().st_size < 4 * 1024 * 1024:
+        _audit_sqlite_backup(source, prior_snapshot)
+        return True
+    with sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True) as archived, \
+            sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as current:
+        for name in ("snapshots", "decisions"):
+            max_id = archived.execute('SELECT MAX(id) FROM "' + name + '"').fetchone()[0]
+            if max_id is not None:
+                old_row = archived.execute('SELECT * FROM "' + name + '" WHERE id=?', (max_id,)).fetchone()
+                live_row = current.execute('SELECT * FROM "' + name + '" WHERE id=?', (max_id,)).fetchone()
+                if old_row != live_row:
+                    return False
+    return True
+
+
 def _backup_sqlite(source, target):
     if not source.is_file():
         raise ValueError("AUDIT_DATABASE_MISSING")
+    if target.name == "observations.sqlite3" and not target.exists():
+        try:
+            revisions_dir = target.resolve().parent.parent
+            marker_path = revisions_dir / "view_state.json"
+            if marker_path.is_file():
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                if marker.get("status") == "COMMITTED" and marker.get("revision_id"):
+                    prior_folder = (revisions_dir / str(marker["revision_id"])).resolve()
+                    prior_manifest = prior_folder / "manifest.json"
+                    prior_snapshot = prior_folder / "observations.sqlite3"
+                    if (prior_folder.parent == revisions_dir.resolve()
+                            and prior_manifest.is_file() and prior_snapshot.is_file()
+                            and not prior_snapshot.is_symlink()):
+                        manifest_data = json.loads(prior_manifest.read_text(encoding="utf-8"))
+                        expected_sha = next(
+                            (b.get("sha256") for b in manifest_data.get("sqlite_backups", [])
+                             if Path(b.get("snapshot_path", "")).name == "observations.sqlite3"),
+                            None,
+                        )
+                        cache_key = (str(prior_folder), str(marker.get("revision_id")), str(marker.get("manifest_sha256")))
+                        with _COMMITTED_ARCHIVE_HASH_LOCK:
+                            cache_bucket = _COMMITTED_ARCHIVE_HASH_CACHE.setdefault(cache_key, {})
+                        if (expected_sha and _cached_sha(prior_snapshot, cache_bucket) == expected_sha
+                                and _is_valid_observations_prefix(source, prior_snapshot)):
+                            os.link(prior_snapshot, target)
+                            return {"source_path": str(source), "snapshot_path": str(target), "sha256": expected_sha}
+        except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+            target.unlink(missing_ok=True)
     # SQLite backup includes committed WAL contents; copying only the main file
     # could omit precisely the receipts/decisions this recovery must preserve.
     with target.open("xb"):
@@ -893,9 +961,7 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
             if not callable(now) or not callable(cutover_now):
                 raise ValueError("FAST_REVISION_CALIBRATED_CLOCK_CALLBACKS_REQUIRED")
             guards.append(_guard_evidence(cohort_guard, "BEFORE_VALIDATION", fast))
-            allowed_fast = ((("futures", "5m"), ("futures", "1h"), ("mark", "1h"))
-                            if fast.get("profile") == FAST_HOURLY_PROFILE else (("futures", "5m"),))
-            if any((kind, interval) not in allowed_fast for kind, _, interval in sources):
+            if any((kind, interval) != ("futures", "5m") for kind, _, interval in sources):
                 fast = None
         runtime, features, raw_root, revisions = _paths(runtime)
         before_files = _inventory(raw_root)

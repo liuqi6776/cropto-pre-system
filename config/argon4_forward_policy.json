@@ -1,23 +1,22 @@
 {
   "status": "CONFIRMED",
-  "version": "argon4-local311-independent65-20261107-v14",
+  "version": "argon4-local311-independent65-20261107-v13r2",
   "venue": "polymarket",
-  "ranking_source": "USER_CONFIRMED_V14_BEST_OF_8_HYBRID_GOLDEN_QUANTILE_NET_PROFIT; ARGON4_RESEARCH11.md fee-inclusive OOS empirical portfolio; same saved local models",
-  "ranking_label": "第三阶段 v14：精选 8 流 + 混合黄金阈值 BTC15(Q85) → ETH5(Q88) → SOL15(Q85) → SOL5(Q88) → ETH15(Q85) → BNB15(Q88) → BTC5(Q92) → XRP15(Q85)",
+  "ranking_source": "USER_CONFIRMED_STAGE2_LOCAL_FROZEN_RAW_WIN_RATE; same saved local models; historical research evidence remains exploratory",
+  "ranking_label": "第二阶段：本地原始胜率 BTC15 → ETH5 → SOL15 → SOL5 → BTC5",
   "order": [
     "BTC_15m",
     "ETH_5m",
     "SOL_15m",
     "SOL_5m",
-    "ETH_15m",
-    "BNB_15m",
     "BTC_5m",
-    "XRP_15m"
+    "ETH_15m",
+    "BNB_15m"
   ],
   "allocation_policy": "RANKED_CAPACITY_WATERFALL",
-  "capacity_policy": "Fresh verified signal-side executable ask depth within 0.515 (or 0.520 for top 3% >= Q97 high-confidence signals); explicit valid no-signal/not-due or verified price-limit failures skip; missing/stale/invalid evidence blocks",
-  "unlock_policy": "Next eligible rank is released after actual paper fills reach the current rank approved risk-capped budget, or when partial_fill_remainder_cascade unlocks positive partial fills with >= 4.0s remaining; verified skips consume no budget",
-  "execution_policy": "Persist each stream skip, approved target, observed depth and actual fill; partial fills with >= 4.0s remaining cascade remaining tick budget to lower ranks; never replay old cohorts",
+  "capacity_policy": "Fresh verified signal-side executable ask depth within 0.515; explicit valid no-signal/not-due or verified price-limit failures skip; missing/stale/invalid evidence blocks",
+  "unlock_policy": "Next eligible rank is released only after actual paper fills reach the current rank approved risk-capped budget; verified skips consume no budget",
+  "execution_policy": "Persist each stream skip, approved target, observed depth and actual fill; partial or unfilled approved targets block lower ranks; never replay old cohorts",
   "initial_capital_usd": 10000,
   "single_stream_equity_fraction": 0.015,
   "tick_equity_fraction": 0.022,
@@ -30,63 +29,49 @@
   "risk_limit_note": "200/1000/500 USD are proposed paper safety ceilings, not empirically established market capacity",
   "paper_trading_active": true,
   "live_enabled": false,
-  "ranking_confirmed_at": "2026-11-07T14:35:00+00:00",
+  "ranking_confirmed_at": "2026-11-07T07:11:56.924576+00:00",
   "historical_ranking_evidence": [
     {
       "stream": "BTC_15m",
-      "quantile": "Q85",
       "raw_wins": 2485,
       "signals": 4417,
       "raw_win_rate_pct": 56.25990491283677
     },
     {
       "stream": "ETH_5m",
-      "quantile": "Q88",
-      "raw_wins": 3042,
-      "signals": 5444,
-      "raw_win_rate_pct": 55.88
+      "raw_wins": 3765,
+      "signals": 6769,
+      "raw_win_rate_pct": 55.62121435958044
     },
     {
       "stream": "SOL_15m",
-      "quantile": "Q85",
       "raw_wins": 1121,
       "signals": 2029,
       "raw_win_rate_pct": 55.248891079349434
     },
     {
       "stream": "SOL_5m",
-      "quantile": "Q88",
-      "raw_wins": 2847,
-      "signals": 5193,
-      "raw_win_rate_pct": 54.82
+      "raw_wins": 3521,
+      "signals": 6460,
+      "raw_win_rate_pct": 54.5046439628483
+    },
+    {
+      "stream": "BTC_5m",
+      "raw_wins": 5795,
+      "signals": 10738,
+      "raw_win_rate_pct": 53.96721922145651
     },
     {
       "stream": "ETH_15m",
-      "quantile": "Q85",
       "raw_wins": 1405,
       "signals": 2606,
       "raw_win_rate_pct": 53.91404451266308
     },
     {
       "stream": "BNB_15m",
-      "quantile": "Q88",
-      "raw_wins": 961,
-      "signals": 1785,
-      "raw_win_rate_pct": 53.84
-    },
-    {
-      "stream": "BTC_5m",
-      "quantile": "Q92",
-      "raw_wins": 2925,
-      "signals": 5412,
-      "raw_win_rate_pct": 54.05
-    },
-    {
-      "stream": "XRP_15m",
-      "quantile": "Q85",
-      "raw_wins": 1003,
-      "signals": 1862,
-      "raw_win_rate_pct": 53.86680988184748
+      "raw_wins": 737,
+      "signals": 1389,
+      "raw_win_rate_pct": 53.059755219582435
     }
   ],
   "ranking_evidence_classification": "LOCAL_311_PLUS_INDEPENDENT_65_NOT_ORIGINAL_374_EXPLORATORY",
@@ -155,28 +140,7 @@
     "ETH_5m": "045c1df0747e445b6b4357e57ee919e516db8484eb55284feb59569fffb23239",
     "SOL_15m": "e3763beb9ba1e63b95dbe501b3cc265e1f005069289875af73f4b7e2e531242c",
     "SOL_5m": "d024c28dbb773a6470b132cbc1ebd152ebdb706d0db8ee3047487493b3f4f822",
-    "BNB_15m": "366484e02b2552e3acd095310b381d216b6f2016a39bd2fe001b1aad3660118f",
-    "XRP_15m": "237c9239e330127867f8cc9584e7190c2cde8c539d72af803293784a54da4e05"
-  },
-  "stream_thresholds": {
-    "BTC_15m": 1.3917254758813336,
-    "ETH_5m": 1.4998386255172687,
-    "SOL_15m": 1.369772495472675,
-    "SOL_5m": 1.4928184687808441,
-    "ETH_15m": 1.4194200053880608,
-    "BNB_15m": 1.485053040325434,
-    "BTC_5m": 1.6827811268623214,
-    "XRP_15m": 1.3023630294274378
-  },
-  "high_confidence_thresholds": {
-    "BTC_15m": 2.2314618376626747,
-    "ETH_5m": 2.236146541160879,
-    "SOL_15m": 2.134872027704176,
-    "SOL_5m": 2.18660975592201,
-    "ETH_15m": 2.184752833695418,
-    "BNB_15m": 2.22686779340807,
-    "BTC_5m": 2.1728332927709597,
-    "XRP_15m": 2.220220519572674
+    "BNB_15m": "366484e02b2552e3acd095310b381d216b6f2016a39bd2fe001b1aad3660118f"
   },
   "min_decision_delay_seconds": 4.0,
   "input_revision_policy": {
@@ -190,7 +154,7 @@
     "mark_registry_publication_required": true,
     "skip_effective_cohort": true,
     "aged_futures_fastpath": {
-      "profile": "argon4-aged-revision-v14",
+      "profile": "argon4-aged-revision-v13",
       "enabled": true,
       "minimum_bar_age_seconds": 300,
       "minimum_receipt_spacing_seconds": 2.0,
@@ -198,21 +162,18 @@
     }
   },
   "waterfall_semantics": "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1",
-  "previous_execution_version": "argon4-local311-independent65-20261107-v13r2",
-  "execution_change_authorized_at": "2026-11-07T14:35:00+00:00",
-  "execution_change_note": "v14 user-authorized comprehensive upgrade: (1) Zero rate-limit public data architecture with dynamic page_limit (Weight 1), preserved verified _cached_clock TTL, same-window 5m retry short-circuit, eliminated redundant post-commit HTTP refresh in reconcile_current_cohort, and spot endpoint migration to data-api.binance.vision with X-MBX-USED-WEIGHT-1M soft backoff; (2) 2.0s same-cohort revision fastpath extended to closed 1h futures and 1h mark klines, plus 0.60s borderline clock uncertainty ceiling after 8-sample retry; (3) Best-of-8 stream waterfall including XRP_15m and Hybrid Golden Quantile thresholds (Q85/Q88/Q92); (4) Waterfall partial-fill remainder cascade (>= 4.0s remaining) and top 3% (>= Q97) dynamic 0.520 limit price cap; (5) Three-stage capital scaling roadmap ($1k -> $10k -> $35k+). Live orders remain disabled.",
+  "previous_execution_version": "argon4-local311-independent65-20261107-v13r1",
+  "execution_change_authorized_at": "2026-11-07T11:29:43.444766+00:00",
+  "execution_change_note": "v13 user-authorized paper input repair: earliest +4s; aged futures 5m only, two independent same-clock current-cohort receipts with second request >= first receipt +2s, preserved archives and same-cohort admission only before any decision and within +14s; fresh all-input validation before scoring; legacy 60s maintenance remains fallback after abandoning current execution. Restart/recovery never inherits same-cohort admission. Clock may add two budgeted samples outside critical window while retaining 0.5s hard bound. Five-stream order, saved models/thresholds, 0.515 ask cap and capital caps unchanged. Eleven-stream research remains separate. No backfill or live orders. v13r1 fixes observed cold-start blockers: immutable calibrated warmup epoch, lower-bound cutoff and <=30s/TTL-1 budget with all diagnostics retained; completed warmup cohort is skipped. Legacy observed futures 1h price corrections use the existing 60s confirmation/archive/future-only path, never the 5m fast path. v13r2 adds bounded window-external maintenance after failed input validation; at most two attempts in T+70..180, legacy 60-second independent confirmation, fresh frozen calibrated clock per attempt, durable attempt claims, future-window-only publication. No scoring, execution, historical replay or threshold/risk changes.",
   "execution_stage": {
-    "id": "stage3-best-of-8-hybrid-v14-20261107",
+    "id": "stage2-local-winrate-v13r2-20261107",
     "status": "CONFIRMED",
     "enabled_streams": [
       "BTC_15m",
       "ETH_5m",
       "SOL_15m",
       "SOL_5m",
-      "ETH_15m",
-      "BNB_15m",
-      "BTC_5m",
-      "XRP_15m"
+      "BTC_5m"
     ],
     "effective_from": "2026-11-07T11:40:00+00:00"
   },
@@ -293,55 +254,10 @@
     "max_price_rechecks": 3,
     "price_recheck_interval_seconds": 2.5,
     "minimum_recheck_remaining_seconds": 3.0,
-    "last_recheck_start_after_boundary_seconds": 18.5,
-    "partial_fill_remainder_cascade": true,
-    "high_confidence_max_buy_price": 0.52
-  },
-  "capital_scaling_roadmap": {
-    "stage_1_live_parity_trial": {
-      "capital_usd": 1000,
-      "duration_hours": 48,
-      "single_stream_equity_fraction": 0.02,
-      "tick_equity_fraction": 0.04,
-      "max_order_usd": 20,
-      "max_tick_budget_usd": 40,
-      "max_open_risk_usd": 100,
-      "max_underlying_open_risk_usd": 50,
-      "daily_loss_fraction": 0.055
-    },
-    "stage_2_single_venue_capacity": {
-      "capital_usd": 10000,
-      "single_stream_equity_fraction": 0.015,
-      "tick_equity_fraction": 0.022,
-      "max_order_usd": 200,
-      "max_tick_budget_usd": 1200,
-      "max_open_risk_usd": 1000,
-      "max_underlying_open_risk_usd": 500,
-      "daily_loss_fraction": 0.055
-    },
-    "stage_3_three_pillar_derivatives": {
-      "capital_usd": 35000,
-      "pillars": [
-        {
-          "pillar": "POLYMARKET_CLOB_CORE",
-          "capital_allocation_usd": 10000,
-          "role": "Primary Binary Event Alpha ($0.515/$0.520 IOC Cap)"
-        },
-        {
-          "pillar": "BINANCE_OKX_PERP_SYNTHETIC_HOLD_TO_EXPIRY",
-          "capital_allocation_usd": 15000,
-          "role": "Overflow Execution for Top-Confidence Q95+ Signals"
-        },
-        {
-          "pillar": "DERIBIT_0DTE_VERTICAL_BULL_BEAR_SPREADS",
-          "capital_allocation_usd": 10000,
-          "role": "Capped-Loss Institutional Binary Approximation for 15m/1h Windows"
-        }
-      ]
-    }
+    "last_recheck_start_after_boundary_seconds": 18.5
   },
   "previous_execution_stage": {
-    "id": "stage2-local-winrate-v13r2-20261107",
+    "id": "stage2-local-winrate-v12r1-20261107",
     "status": "CONFIRMED",
     "enabled_streams": [
       "BTC_15m",
@@ -350,6 +266,6 @@
       "SOL_5m",
       "BTC_5m"
     ],
-    "effective_from": "2026-11-07T11:40:00+00:00"
+    "effective_from": "2026-11-07T08:20:00+00:00"
   }
 }

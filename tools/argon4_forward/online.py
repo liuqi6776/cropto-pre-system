@@ -121,6 +121,8 @@ class PublicInputsHTTP:
         self.path = Path(receipts_path)
         self.clock = clock
         self.min_spacing = min_spacing
+        self._base_min_spacing = min_spacing
+        self._weight_throttle_until = 0.0
         self.time_basis = time_basis
         self.clock_evidence_sha256 = clock_evidence_sha256
         # Only sending is serialized. Each worker owns its connection pool;
@@ -358,6 +360,9 @@ class PublicInputsHTTP:
             try:
                 _remaining(deadline_monotonic)
                 self._check_backoff(family)
+                if self._weight_throttle_until and time.monotonic() >= self._weight_throttle_until:
+                    self._weight_throttle_until = 0.0
+                    self.min_spacing = self._base_min_spacing
                 delay = self.min_spacing - (time.monotonic() - self._last_request)
                 if delay <= 0:
                     session = self._session_for_request()
@@ -384,8 +389,13 @@ class PublicInputsHTTP:
                 used_weight = headers.get("X-MBX-USED-WEIGHT-1M") or headers.get("x-mbx-used-weight-1m")
                 if used_weight is not None:
                     try:
-                        if float(used_weight) >= 1600:
-                            self.min_spacing = max(self.min_spacing, 1.0)
+                        weight_val = float(used_weight)
+                        if weight_val >= 1600:
+                            self._weight_throttle_until = time.monotonic() + 30.0
+                            self.min_spacing = max(self._base_min_spacing, 1.0)
+                        elif weight_val < 1200 or time.monotonic() >= self._weight_throttle_until:
+                            self._weight_throttle_until = 0.0
+                            self.min_spacing = self._base_min_spacing
                     except (TypeError, ValueError):
                         pass
                 if response.status_code in (418, 429):

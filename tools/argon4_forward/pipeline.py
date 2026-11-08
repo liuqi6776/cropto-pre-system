@@ -239,8 +239,6 @@ class ForwardPipeline:
                         budget = max(.1, until-.25)
                 kwargs = {"retry_borderline": extra_allowed,
                           "budget_monotonic": time.monotonic()+budget}
-                if extra_allowed and self._revision_fastpath.get("profile") == "argon4-aged-revision-v14":
-                    kwargs["borderline_max_uncertainty_seconds"] = .6
             self.clock = calibrate(transport=self.public_transport, **kwargs)
             self.clock["refresh_reason"] = reason
             self.observations.save("execution_clock", self.clock)
@@ -567,14 +565,6 @@ class ForwardPipeline:
                           "decision_at": decision_time.isoformat(), "valid_until": (cohort+timedelta(seconds=20)).isoformat(),
                           "window_start": cohort.isoformat(), "window_end": (cohort+timedelta(seconds=duration)).isoformat()}
                 decisions[stream].update(status="SIGNAL", signal=signal)
-                exec_cfg = policy.get("execution")
-                if isinstance(exec_cfg, dict) and exec_cfg.get("high_confidence_max_buy_price") is not None:
-                    q97_map = policy.get("high_confidence_thresholds")
-                    q97_th = (float(q97_map[stream]) if isinstance(q97_map, dict) and stream in q97_map
-                              else float(score.get("threshold_frozen", 0)) * 1.25)
-                    if q97_th > 0 and abs(float(score.get("z_v4", 0))) >= q97_th:
-                        decisions[stream]["high_confidence"] = True
-                        decisions[stream]["limit_price"] = float(exec_cfg["high_confidence_max_buy_price"])
         return decisions
 
     def set_input_clock(self, clock=None):
