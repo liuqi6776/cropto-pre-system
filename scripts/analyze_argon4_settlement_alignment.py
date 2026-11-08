@@ -197,35 +197,67 @@ def analyze_runtime_settlement_alignment(
 ) -> dict[str, Any]:
     runtime = Path(runtime_root)
     raw_root = Path(data_root) if data_root is not None else runtime / "features" / "raw_data"
-    account_db = runtime / "paper_account.sqlite3"
+    account_db = runtime / "account.sqlite3"
+    if not account_db.is_file():
+        account_db = runtime / "paper_account.sqlite3"
     rows: list[dict[str, Any]] = []
     if account_db.is_file():
         with sqlite3.connect(account_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0) as conn:
-            settled_rows = conn.execute(
-                "SELECT s.market_id, s.outcome, s.payload, p.payload "
-                "FROM settlements s LEFT JOIN positions p ON s.position_id = p.position_id "
-                "ORDER BY s.id ASC"
-            ).fetchall()
-        for market_id, winning_outcome, s_payload_raw, p_payload_raw in settled_rows:
-            s_payload = json.loads(s_payload_raw) if s_payload_raw else {}
-            p_payload = json.loads(p_payload_raw) if p_payload_raw else {}
-            stream = p_payload.get("stream") or s_payload.get("stream")
-            window_start = p_payload.get("window_start") or s_payload.get("window_start")
-            window_end = p_payload.get("window_end") or s_payload.get("window_end")
-            prediction_side = p_payload.get("outcome")
-            official_outcome = s_payload.get("winning_outcome") or winning_outcome
-            if stream and window_start and window_end and official_outcome in ("UP", "DOWN"):
-                rows.append(
-                    compute_settlement_alignment_row(
-                        raw_root,
-                        stream=stream,
-                        window_start=window_start,
-                        window_end=window_end,
-                        official_outcome=official_outcome,
-                        market_id=str(market_id),
-                        prediction_side=prediction_side,
-                    )
-                )
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if {"orders", "resolutions", "signals"} <= tables:
+                settled_rows = conn.execute(
+                    "SELECT o.market_id, o.outcome, o.window_end, o.payload, s.payload, r.payload "
+                    "FROM orders o "
+                    "JOIN resolutions r ON o.market_id = r.market_id "
+                    "LEFT JOIN signals s ON o.signal_id = s.signal_id "
+                    "ORDER BY o.fill_at ASC"
+                ).fetchall()
+                for market_id, pred_side, w_end_col, o_raw, s_raw, r_raw in settled_rows:
+                    o_pay = json.loads(o_raw) if o_raw else {}
+                    s_pay = json.loads(s_raw) if s_raw else {}
+                    r_pay = json.loads(r_raw) if r_raw else {}
+                    stream = s_pay.get("stream") or o_pay.get("stream")
+                    window_start = s_pay.get("window_start") or o_pay.get("venue_market", {}).get("window_start")
+                    window_end = s_pay.get("window_end") or w_end_col or o_pay.get("venue_market", {}).get("window_end")
+                    official_outcome = r_pay.get("outcome") or r_pay.get("winning_outcome")
+                    if stream and window_start and window_end and official_outcome in ("UP", "DOWN"):
+                        rows.append(
+                            compute_settlement_alignment_row(
+                                raw_root,
+                                stream=stream,
+                                window_start=window_start,
+                                window_end=window_end,
+                                official_outcome=official_outcome,
+                                market_id=str(market_id),
+                                prediction_side=pred_side,
+                            )
+                        )
+            elif "settlements" in tables:
+                settled_rows = conn.execute(
+                    "SELECT s.market_id, s.outcome, s.payload, p.payload "
+                    "FROM settlements s LEFT JOIN positions p ON s.position_id = p.position_id "
+                    "ORDER BY s.id ASC"
+                ).fetchall()
+                for market_id, winning_outcome, s_payload_raw, p_payload_raw in settled_rows:
+                    s_payload = json.loads(s_payload_raw) if s_payload_raw else {}
+                    p_payload = json.loads(p_payload_raw) if p_payload_raw else {}
+                    stream = p_payload.get("stream") or s_payload.get("stream")
+                    window_start = p_payload.get("window_start") or s_payload.get("window_start")
+                    window_end = p_payload.get("window_end") or s_payload.get("window_end")
+                    prediction_side = p_payload.get("outcome")
+                    official_outcome = s_payload.get("winning_outcome") or s_payload.get("outcome") or winning_outcome
+                    if stream and window_start and window_end and official_outcome in ("UP", "DOWN"):
+                        rows.append(
+                            compute_settlement_alignment_row(
+                                raw_root,
+                                stream=stream,
+                                window_start=window_start,
+                                window_end=window_end,
+                                official_outcome=official_outcome,
+                                market_id=str(market_id),
+                                prediction_side=prediction_side,
+                            )
+                        )
     summary = summarize_settlement_alignments(rows)
     return {
         "runtime_root": str(runtime),
@@ -237,7 +269,7 @@ def analyze_runtime_settlement_alignment(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Analyze Chainlink TWAP vs Binance 5m settlement label alignment.")
-    parser.add_argument("--runtime", type=Path, default=ROOT / "runtime" / "argon4_forward")
+    parser.add_argument("--runtime", type=Path, default=ROOT / "paper_runtime" / "argon4_forward_20261105")
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args(argv)
