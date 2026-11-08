@@ -499,25 +499,30 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
 def _is_valid_observations_prefix(source, prior_snapshot):
     source = Path(source).resolve()
     prior_snapshot = Path(prior_snapshot).resolve()
-    if prior_snapshot.stat().st_size < 4 * 1024 * 1024:
-        _audit_sqlite_backup(source, prior_snapshot)
-        return True
     with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived, \
             closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
-        arch_tables = {row[0] for row in archived.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        )}
-        live_tables = {row[0] for row in current.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        )}
-        if not arch_tables or arch_tables != live_tables or not arch_tables <= {"receipts", "snapshots", "decisions"}:
+        schemas = dict(archived.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+        live_schemas = dict(current.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+        if not schemas or schemas != live_schemas or not set(schemas) <= {"receipts", "snapshots", "decisions"}:
             return False
-        for name in arch_tables:
+        total_rows = sum(archived.execute('SELECT COUNT(*) FROM "' + name + '"').fetchone()[0] for name in schemas)
+        if total_rows <= 50000:
+            _audit_sqlite_backup(source, prior_snapshot)
+            return True
+        for name in schemas:
             max_id = archived.execute('SELECT MAX(id) FROM "' + name + '"').fetchone()[0]
             if max_id is not None:
-                old_row = archived.execute('SELECT * FROM "' + name + '" WHERE id=?', (max_id,)).fetchone()
-                live_row = current.execute('SELECT * FROM "' + name + '" WHERE id=?', (max_id,)).fetchone()
-                if old_row != live_row:
+                arch_cnt = archived.execute('SELECT COUNT(*) FROM "' + name + '"').fetchone()[0]
+                live_cnt = current.execute('SELECT COUNT(*) FROM "' + name + '" WHERE id<=?', (max_id,)).fetchone()[0]
+                if arch_cnt != live_cnt:
+                    return False
+                head_old = archived.execute('SELECT * FROM "' + name + '" ORDER BY id ASC LIMIT 64').fetchall()
+                head_live = current.execute('SELECT * FROM "' + name + '" ORDER BY id ASC LIMIT 64').fetchall()
+                if head_old != head_live:
+                    return False
+                tail_old = archived.execute('SELECT * FROM "' + name + '" ORDER BY id DESC LIMIT 64').fetchall()
+                tail_live = current.execute('SELECT * FROM "' + name + '" WHERE id<=? ORDER BY id DESC LIMIT 64', (max_id,)).fetchall()
+                if tail_old != tail_live:
                     return False
     return True
 

@@ -312,18 +312,37 @@ class ForwardPipeline:
                 )
                 raw_root = self.runtime / "features/raw_data"
                 rows = []
-                for item in result["settled"]:
-                    mid = item.get("market_id")
-                    pos = before_positions.get(mid, {})
-                    stream = item.get("stream") or pos.get("stream")
-                    w_start = item.get("window_start") or pos.get("window_start")
-                    w_end = item.get("window_end") or pos.get("window_end")
-                    outcome = item.get("winning_outcome") or item.get("outcome")
-                    pred_side = pos.get("outcome")
-                    if stream and w_start and w_end and outcome in ("UP", "DOWN"):
-                        rows.append(compute_settlement_alignment_row(
-                            raw_root, stream=stream, window_start=w_start, window_end=w_end,
-                            official_outcome=outcome, market_id=mid, prediction_side=pred_side))
+                with self.account._connection() as con:
+                    for item in result["settled"]:
+                        mid = item.get("market_id")
+                        res_obj = item.get("resolution") if isinstance(item.get("resolution"), dict) else {}
+                        outcome = res_obj.get("outcome") or item.get("winning_outcome") or item.get("outcome")
+                        order_row = con.execute(
+                            "SELECT signal_id, underlying, outcome, window_end, payload FROM orders WHERE market_id=? ORDER BY fill_at ASC LIMIT 1",
+                            (mid,),
+                        ).fetchone()
+                        sig_payload, order_payload = {}, {}
+                        if order_row is not None:
+                            order_payload = json.loads(order_row["payload"]) if order_row["payload"] else {}
+                            sig_row = con.execute("SELECT payload FROM signals WHERE signal_id=?", (order_row["signal_id"],)).fetchone()
+                            if sig_row and sig_row["payload"]:
+                                sig_payload = json.loads(sig_row["payload"])
+                        pos = before_positions.get(mid, {})
+                        venue_mkt = order_payload.get("venue_market") if isinstance(order_payload.get("venue_market"), dict) else {}
+                        stream = sig_payload.get("stream") or item.get("stream") or pos.get("stream")
+                        w_start = sig_payload.get("window_start") or venue_mkt.get("window_start") or item.get("window_start") or pos.get("window_start")
+                        w_end = (sig_payload.get("window_end") or venue_mkt.get("window_end")
+                                 or (order_row["window_end"] if order_row is not None else None)
+                                 or item.get("window_end") or pos.get("window_end"))
+                        pred_side = (order_row["outcome"] if order_row is not None else None) or sig_payload.get("outcome") or pos.get("outcome")
+                        if not stream and w_start and w_end and (order_row is not None or pos.get("underlying")):
+                            und = (order_row["underlying"] if order_row is not None else None) or pos.get("underlying")
+                            dur_min = int((pd.Timestamp(w_end) - pd.Timestamp(w_start)).total_seconds() // 60)
+                            stream = f"{und}_{dur_min}m"
+                        if stream and w_start and w_end and outcome in ("UP", "DOWN"):
+                            rows.append(compute_settlement_alignment_row(
+                                raw_root, stream=stream, window_start=w_start, window_end=w_end,
+                                official_outcome=outcome, market_id=str(mid), prediction_side=pred_side))
                 if rows:
                     self.observations.save("settlement_label_alignment", {
                         "rows": rows, "summary": summarize_settlement_alignments(rows)})
@@ -576,8 +595,7 @@ class ForwardPipeline:
                 raise ValueError("closed feature row does not match decision cohort")
             if symbol not in rv12_cache:
                 rv12_cache[symbol] = compute_ex_ante_rv12_bps(
-                    inputs.get("data_root"), symbol, as_of=now_lower, snapshot=snapshot,
-                    raw_frame=f.get("raw_target"))
+                    inputs.get("data_root"), symbol, as_of=now_lower, snapshot=snapshot)
             started = time.perf_counter()
             threshold_override = (policy.get("stream_thresholds", {}).get(stream)
                                   if isinstance(policy.get("stream_thresholds"), dict) else None)
@@ -1191,8 +1209,17 @@ class ForwardPipeline:
             if callable(capture_fn):
                 try:
                     self.set_input_clock()
-                    snap = capture_fn(now=calibrated_now(self.clock, upper=False), cohort_id=cohort.isoformat())
-                    self.observations.save("early_window_book_ticker", snap)
+                    now_upper = calibrated_now(self.clock)
+                    remaining_window = (cohort + timedelta(seconds=20) - now_upper).total_seconds()
+                    max_budget = float(ticker_cfg.get("max_budget_seconds", 0.8))
+                    if remaining_window > 6.5 and max_budget > 0:
+                        ticker_deadline = time.monotonic() + min(max_budget, remaining_window - 6.0)
+                        snap = capture_fn(
+                            now=calibrated_now(self.clock, upper=False),
+                            cohort_id=cohort.isoformat(),
+                            deadline_monotonic=ticker_deadline,
+                        )
+                        self.observations.save("early_window_book_ticker", snap)
                 except Exception as exc:
                     self.observations.save("early_window_book_ticker", {
                         "status": "ERROR", "cohort_id": cohort.isoformat(),

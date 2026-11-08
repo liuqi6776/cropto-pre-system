@@ -66,17 +66,22 @@ def load_model_bundle_v14(stream, phase="deployment_q4", *, expected_manifest_sh
 def compute_ex_ante_rv12_bps(data_root=None, symbol="BTCUSDT", *, as_of=None, snapshot=None, raw_frame=None):
     """Compute causal 1h realized body volatility (rv_12_bps) over last 12 closed 5m candles."""
     frame = None
-    if raw_frame is not None and isinstance(raw_frame, pd.DataFrame) and {"open", "close"} <= set(raw_frame.columns):
+    if (raw_frame is not None and isinstance(raw_frame, pd.DataFrame)
+            and len(raw_frame) >= 12 and {"open", "close"} <= set(raw_frame.columns)):
         frame = raw_frame
-    elif snapshot is not None and hasattr(snapshot, "_validated"):
-        target_name = f"{symbol}_5m_futures.parquet"
+    if frame is None and snapshot is not None and hasattr(snapshot, "_validated"):
+        target_names = {f"{symbol}_5m_futures.parquet", f"{symbol}_5m_futures_2023_2026.parquet"}
         for p, entry in snapshot._validated.items():
-            if getattr(p, "name", "") == target_name and isinstance(entry, tuple) and len(entry) >= 1:
-                frame = entry[0]
-                break
-    elif data_root is not None:
+            if getattr(p, "name", "") in target_names and isinstance(entry, tuple) and len(entry) >= 1:
+                candidate = entry[0]
+                if isinstance(candidate, pd.DataFrame) and len(candidate) >= 12:
+                    frame = candidate
+                    break
+    if frame is None and data_root is not None:
         try:
-            path = Path(str(data_root)) / "intraday" / f"{symbol}_5m_futures.parquet"
+            intraday_dir = Path(str(data_root)) / "intraday"
+            old_path = intraday_dir / f"{symbol}_5m_futures_2023_2026.parquet"
+            path = old_path if old_path.is_file() else intraday_dir / f"{symbol}_5m_futures.parquet"
             if path.is_file():
                 df = pd.read_parquet(path)
                 if not isinstance(df.index, pd.DatetimeIndex):
@@ -89,12 +94,15 @@ def compute_ex_ante_rv12_bps(data_root=None, symbol="BTCUSDT", *, as_of=None, sn
                 frame = df
         except Exception:
             frame = None
-    if frame is None or len(frame) == 0 or not ({"open", "close"} <= set(frame.columns)):
+    if frame is None or len(frame) < 12 or not ({"open", "close"} <= set(frame.columns)):
         return None
     tail = frame.tail(12)
+    if isinstance(tail.index, pd.DatetimeIndex) and len(tail.index) == 12:
+        if not np.all(np.diff(tail.index.asi8) == pd.Timedelta(minutes=5).value):
+            return None
     opens = tail["open"].to_numpy(dtype=float)
     closes = tail["close"].to_numpy(dtype=float)
-    if len(opens) == 0 or not (np.isfinite(opens).all() and np.isfinite(closes).all()) or (opens <= 0).any():
+    if len(opens) != 12 or not (np.isfinite(opens).all() and np.isfinite(closes).all()) or (opens <= 0).any():
         return None
     return float(np.mean(np.abs(closes - opens) / opens) * 10000.0)
 

@@ -194,14 +194,14 @@ class PaperExecutor:
                 raise AccountRejected("invalid ask level")
             if quantity > 0:
                 positive_prices.append(price)
-            if min_limit <= price <= Decimal(".515"):
+            if price <= Decimal(".515"):
                 capacity += quantity * (price + Account._fee_per_share(fee,price,stamp,market["market_id"],side))
-        if positive_prices and min(positive_prices) < min_limit:
+        best_positive_ask = min(positive_prices) if positive_prices else None
+        if best_positive_ask is not None and best_positive_ask < min_limit:
             capacity = Decimal(0)
         if capacity <= 0:
-            if allow_price_skip and positive_prices and (
-                min(positive_prices) < min_limit or min(positive_prices) > Decimal(".515")
-            ):
+            if allow_price_skip and best_positive_ask is not None and (
+                    best_positive_ask > Decimal(".515") or best_positive_ask < min_limit):
                 return adapted, fee, Decimal(0)
             raise AccountRejected("zero or unknown capacity cannot unlock a lower rank")
         capacity = capacity.quantize(Decimal(".000001"), rounding=ROUND_DOWN)

@@ -365,18 +365,35 @@ class Account:
                     daily[date] = daily.get(date, 0) + amount
                 today_pnl = daily.get(stamp.date(), 0)
                 day_start_equity = equity - today_pnl
+                until_raw = policy.get("cooldown_until")
+                until_ts = _ts(until_raw) if until_raw else None
                 streak, day = 0, stamp.date() - timedelta(days=1)
-                while daily.get(day, 0) < 0:
-                    streak += 1
-                    day -= timedelta(days=1)
+                while True:
+                    if day in daily:
+                        if daily[day] < 0:
+                            streak += 1
+                            day -= timedelta(days=1)
+                            continue
+                        break
+                    day_prefix = day.isoformat()
+                    was_cooldown_day = con.execute(
+                        "SELECT 1 FROM decision_cohorts WHERE substr(cohort_id,1,10)=? "
+                        "AND blocked_reason IN ('COOLDOWN_ACTIVE','COOLDOWN_STATE_REQUIRED') LIMIT 1",
+                        (day_prefix,),
+                    ).fetchone()
+                    if was_cooldown_day:
+                        day -= timedelta(days=1)
+                        continue
+                    break
                 blocked = None
                 if day_start_equity <= 0 or Decimal(today_pnl) <= -Decimal(day_start_equity) * limits["daily_loss_fraction"]:
                     blocked = "DAILY_LOSS_LIMIT"
-                if streak >= 5:
-                    until = policy.get("cooldown_until")
-                    if not until:
+                if until_ts is not None and stamp < until_ts:
+                    blocked = "COOLDOWN_ACTIVE"
+                elif streak >= 5:
+                    if until_ts is None:
                         blocked = "COOLDOWN_STATE_REQUIRED"
-                    elif stamp < _ts(until):
+                    elif stamp < until_ts:
                         blocked = "COOLDOWN_ACTIVE"
                 budget = max(0, min(int(Decimal(equity)*limits["tick_equity_fraction"]), limits["max_tick_budget_atoms"],
                                     a["cash_atoms"], limits["max_open_risk_atoms"]-risk,
@@ -984,10 +1001,15 @@ class Account:
                 raise AccountRejected("cash or concurrent exposure limit exceeded")
             remaining = budget
             min_buy = limits.get("min_buy_price", Decimal("0"))
-            positive_book_prices = [p for p, v in aggregated.items() if v > 0]
-            best_ask_price = min(positive_book_prices) if positive_book_prices else Decimal("0")
+            positive_available_prices = [
+                price for price, quoted_available in aggregated.items()
+                if quoted_available - (_d((con.execute("SELECT quantity FROM consumed_book_depth WHERE book_hash=? AND price=?",
+                                                       (book_hash, str(price))).fetchone() or [0])[0])) > 0
+            ]
+            if positive_available_prices and min(positive_available_prices) < min_buy:
+                raise AccountRejected("order price or stake exceeds limit")
             fills, cost, fees, quantity = [], 0, 0, Decimal(0)
-            for price, quoted_available in ([] if best_ask_price < min_buy else sorted(aggregated.items())):
+            for price, quoted_available in sorted(aggregated.items()):
                 consumed = con.execute("SELECT quantity FROM consumed_book_depth WHERE book_hash=? AND price=?",
                                        (book_hash, str(price))).fetchone()
                 previous_quantity = _d(consumed[0]) if consumed else Decimal(0)

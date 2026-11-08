@@ -284,6 +284,6 @@
     }
   },
   "early_window_book_ticker": {
-    "enabled": true
+    "enabled": false
   }
 }

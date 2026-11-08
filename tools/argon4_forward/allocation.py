@@ -232,7 +232,7 @@ def plan_waterfall(policy, candidates, equity, cash, open_risk, now, day_pnl=0,
         if -day_result >= day_base * limits["daily_loss_fraction"]:
             block("DAILY_LOSS_LIMIT", "Observed daily loss reached 5.5% of day-start equity")
             return result
-    if losing_days >= 5:
+    if policy.get("cooldown_until") is not None or losing_days >= 5:
         try:
             cooldown_until = _time(policy.get("cooldown_until"))
         except (ValueError, TypeError):

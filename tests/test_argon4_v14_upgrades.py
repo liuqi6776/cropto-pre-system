@@ -869,6 +869,46 @@ def test_v14r5_multilevel_orderbook_adverse_selection_guard_and_immediate_skip_w
     assert any(f["signal_id"].startswith("model:ETH_5m:") for f in res["fills"])
     assert not any(f["signal_id"].startswith("model:BTC_15m:") for f in res["fills"])
 
+    # 3. Fix 1: compute_ex_ante_rv12_bps ignores 1-row raw_frame and requires 12 closed 5m bars
+    intraday = tmp_path / "rv12_root" / "intraday"
+    intraday.mkdir(parents=True)
+    times12 = pd.date_range("2026-11-08T11:00:00Z", periods=12, freq="5min")
+    df12 = pd.DataFrame({"date": times12, "open_time": times12, "open": [100.0] * 12, "close": [100.2] * 12})
+    df12.to_parquet(intraday / "BTCUSDT_5m_futures.parquet", index=False)
+    one_row = df12.tail(1)
+    assert model_v14.compute_ex_ante_rv12_bps(
+        tmp_path / "rv12_root", "BTCUSDT", as_of="2026-11-08T12:00:04Z", raw_frame=one_row
+    ) == pytest.approx(20.0)
+    assert model_v14.compute_ex_ante_rv12_bps(None, "BTCUSDT", raw_frame=one_row) is None
+
+    # 4. Fix 3: 5-day losing streak cooldown stays COOLDOWN_ACTIVE when losing_days < 5 and cooldown_until is active
+    cd_policy = {**test_policy, "cooldown_until": (BOUNDARY + pd.Timedelta(days=3)).isoformat()}
+    plan_cd = allocation.plan_waterfall(cd_policy, [], 10000.0, 10000.0, 0.0, BOUNDARY.isoformat(), losing_days=0)
+    assert plan_cd["reasons"] == ["COOLDOWN_ACTIVE"]
+    cohort_cd = ledger.ensure_cohort((BOUNDARY + pd.Timedelta(days=1)).isoformat(), cd_policy, now=BOUNDARY + pd.Timedelta(days=1, seconds=1))
+    assert cohort_cd["blocked_reason"] == "COOLDOWN_ACTIVE"
+
+    # 5. Fix 4: _is_valid_observations_prefix detects tampering of row id=1 on >4MB observations.sqlite3
+    big_src = tmp_path / "big_live.sqlite3"
+    big_snap = tmp_path / "big_snap.sqlite3"
+    big_blob = "z" * (2100 * 1024)
+    with sqlite3.connect(big_src) as conn:
+        conn.execute("CREATE TABLE snapshots(id INTEGER PRIMARY KEY, payload TEXT)")
+        conn.execute("INSERT INTO snapshots(payload) VALUES(?)", (big_blob,))
+        conn.execute("INSERT INTO snapshots(payload) VALUES(?)", (big_blob,))
+    with sqlite3.connect(big_src) as src_c, sqlite3.connect(big_snap) as dst_c:
+        src_c.backup(dst_c)
+    assert big_snap.stat().st_size > 4 * 1024 * 1024
+    assert revisions._is_valid_observations_prefix(big_src, big_snap) is True
+    with sqlite3.connect(big_src) as conn:
+        conn.execute("UPDATE snapshots SET payload=? WHERE id=1", ("tampered" + big_blob[8:],))
+    with pytest.raises(ValueError, match="RECOVERY_SQLITE_OBSERVATION_PREFIX_MISMATCH"):
+        revisions._is_valid_observations_prefix(big_src, big_snap)
+
+    # 6. Fix 5: early_window_book_ticker defaults to enabled=False in production policy
+    assert policy["early_window_book_ticker"]["enabled"] is False
+
+
 
 
 
