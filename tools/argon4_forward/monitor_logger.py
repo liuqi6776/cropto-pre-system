@@ -314,7 +314,9 @@ class MonitorAuditLogger:
             elif dec_status == "DISABLED_BY_STAGE" or dec.get("stage_disabled"):
                 why = "DISABLED_BY_STAGE (当前执行阶段配置禁用该流)"
             elif dec_status == "NO_SIGNAL":
-                if pred.get("volatility_regime_guarded") is True:
+                if pred.get("volatility_regime_guarded") is True and (
+                    abs_z is None or not isinstance(threshold, (int, float)) or abs_z >= float(threshold)
+                ):
                     v_reason = pred.get("volatility_regime_reason", "VOLATILITY_REGIME_GUARD")
                     rv12 = pred.get("ex_ante_rv12_bps")
                     why = (f"VOLATILITY_REGIME_GUARD ({v_reason}: ex_ante_rv12_bps={rv12}, "

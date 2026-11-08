@@ -368,30 +368,43 @@ class Account:
                 until_raw = policy.get("cooldown_until")
                 until_ts = _ts(until_raw) if until_raw else None
                 streak, day = 0, stamp.date() - timedelta(days=1)
-                while True:
-                    if day in daily:
-                        if daily[day] < 0:
-                            streak += 1
-                            day -= timedelta(days=1)
-                            continue
+                while daily.get(day, 0) < 0:
+                    streak += 1
+                    day -= timedelta(days=1)
+                # Check if any historical 5-consecutive-losing-day streak occurred
+                # that has not yet been satisfied by a completed cooldown_until after it.
+                losing_dates = {d for d, amt in daily.items() if d < stamp.date() and amt < 0}
+                unsettled_five_loss_end = None
+                for d in sorted(losing_dates, reverse=True):
+                    if all((d - timedelta(days=offset)) in losing_dates for offset in range(5)):
+                        unsettled_five_loss_end = d
                         break
-                    day_prefix = day.isoformat()
-                    was_cooldown_day = con.execute(
-                        "SELECT 1 FROM decision_cohorts WHERE substr(cohort_id,1,10)=? "
-                        "AND blocked_reason IN ('COOLDOWN_ACTIVE','COOLDOWN_STATE_REQUIRED') LIMIT 1",
-                        (day_prefix,),
-                    ).fetchone()
-                    if was_cooldown_day:
-                        day -= timedelta(days=1)
-                        continue
-                    break
+                prior_cooldown_row = con.execute(
+                    "SELECT substr(cohort_id,1,10) FROM decision_cohorts "
+                    "WHERE blocked_reason='COOLDOWN_STATE_REQUIRED' "
+                    "ORDER BY cohort_id DESC LIMIT 1"
+                ).fetchone()
+                if prior_cooldown_row is not None:
+                    prior_cd_date = datetime.fromisoformat(prior_cooldown_row[0]).date()
+                    if unsettled_five_loss_end is None or prior_cd_date > unsettled_five_loss_end:
+                        unsettled_five_loss_end = prior_cd_date
+                cooldown_latched = False
+                if unsettled_five_loss_end is not None:
+                    # Cooldown remains latched unless an explicit cooldown_until AFTER the 5th losing day has already expired
+                    end_of_loss_day = datetime(
+                        unsettled_five_loss_end.year, unsettled_five_loss_end.month, unsettled_five_loss_end.day,
+                        23, 59, 59, tzinfo=timezone.utc
+                    )
+                    if until_ts is None or until_ts <= end_of_loss_day or stamp < until_ts:
+                        cooldown_latched = True
+                        streak = max(streak, 5)
                 blocked = None
                 if day_start_equity <= 0 or Decimal(today_pnl) <= -Decimal(day_start_equity) * limits["daily_loss_fraction"]:
                     blocked = "DAILY_LOSS_LIMIT"
                 if until_ts is not None and stamp < until_ts:
                     blocked = "COOLDOWN_ACTIVE"
-                elif streak >= 5:
-                    if until_ts is None:
+                elif streak >= 5 or cooldown_latched:
+                    if until_ts is None or (unsettled_five_loss_end is not None and until_ts.date() <= unsettled_five_loss_end):
                         blocked = "COOLDOWN_STATE_REQUIRED"
                     elif stamp < until_ts:
                         blocked = "COOLDOWN_ACTIVE"

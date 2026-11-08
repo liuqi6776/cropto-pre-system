@@ -225,6 +225,9 @@ def test_module5_production_policy_v14_and_all_8_bundles_loadable():
         manifest_path = q4_dir / f"{stream}.manifest.json"
         if not manifest_path.is_file():
             pytest.skip(f"local model manifest {stream} not present in source-only checkout")
+        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_data.get("sklearn_version") != model.sklearn.__version__:
+            pytest.skip("local model manifest sklearn_version does not match current interpreter")
         bundle = model_v14.load_model_bundle_v14(stream)
         assert bundle["manifest"]["stream"] == stream
 
@@ -889,24 +892,94 @@ def test_v14r5_multilevel_orderbook_adverse_selection_guard_and_immediate_skip_w
     assert cohort_cd["blocked_reason"] == "COOLDOWN_ACTIVE"
 
     # 5. Fix 4: _is_valid_observations_prefix detects tampering of row id=1 on >4MB observations.sqlite3
+    from contextlib import closing
     big_src = tmp_path / "big_live.sqlite3"
     big_snap = tmp_path / "big_snap.sqlite3"
     big_blob = "z" * (2100 * 1024)
-    with sqlite3.connect(big_src) as conn:
+    with closing(sqlite3.connect(big_src)) as conn, conn:
         conn.execute("CREATE TABLE snapshots(id INTEGER PRIMARY KEY, payload TEXT)")
         conn.execute("INSERT INTO snapshots(payload) VALUES(?)", (big_blob,))
         conn.execute("INSERT INTO snapshots(payload) VALUES(?)", (big_blob,))
-    with sqlite3.connect(big_src) as src_c, sqlite3.connect(big_snap) as dst_c:
+    with closing(sqlite3.connect(big_src)) as src_c, closing(sqlite3.connect(big_snap)) as dst_c:
         src_c.backup(dst_c)
     assert big_snap.stat().st_size > 4 * 1024 * 1024
     assert revisions._is_valid_observations_prefix(big_src, big_snap) is True
-    with sqlite3.connect(big_src) as conn:
+    with closing(sqlite3.connect(big_src)) as conn, conn:
         conn.execute("UPDATE snapshots SET payload=? WHERE id=1", ("tampered" + big_blob[8:],))
-    with pytest.raises(ValueError, match="RECOVERY_SQLITE_OBSERVATION_PREFIX_MISMATCH"):
-        revisions._is_valid_observations_prefix(big_src, big_snap)
+    assert revisions._is_valid_observations_prefix(big_src, big_snap) is False
 
     # 6. Fix 5: early_window_book_ticker defaults to enabled=False in production policy
     assert policy["early_window_book_ticker"]["enabled"] is False
+
+
+def test_v14r6_offline_day_preserves_5day_cooldown_and_50001_row_middle_tamper_detected(tmp_path):
+    """v14r6:
+    1. 5 consecutive losing days latch cooldown even if the system is powered off on Day 7 with 0 DB rows,
+       and only unlocks after an explicit cooldown_until after the 5th losing day has expired.
+    2. _is_valid_observations_prefix uses SQLite ATTACH + EXCEPT to verify 100% of rows even when >50,000 rows,
+       detecting tampering at middle row id=25000.
+    """
+    from contextlib import closing
+    from test_argon4_forward_execution import BOUNDARY, v5_policy
+
+    base_day = account._ts("2026-11-01T00:00:00Z")
+    ledger = account.Account(tmp_path / "cooldown_v14r6.sqlite3", initial_capital=10000, started_at=base_day - pd.Timedelta(seconds=1))
+    pol = v5_policy()
+
+    # Record 5 consecutive losing days (Nov 1 .. Nov 5) in events
+    with ledger._connection() as con:
+        for offset in range(5):
+            day_ts = base_day + pd.Timedelta(days=offset, hours=12)
+            ledger._event(
+                con,
+                "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+                {"market_id": f"m-{offset}", "realized_pnl_usd": -50.0},
+                day_ts,
+            )
+
+    # Day 6 (Nov 6): triggers COOLDOWN_STATE_REQUIRED
+    day6 = base_day + pd.Timedelta(days=5)
+    c6 = ledger.ensure_cohort(day6.isoformat(), pol, now=day6 + pd.Timedelta(seconds=1))
+    assert c6["blocked_reason"] == "COOLDOWN_STATE_REQUIRED"
+
+    # Day 7 (Nov 7): machine is powered off all day (no cohorts or settlements on Nov 7)
+    # Day 8 (Nov 8): machine restarts without cooldown_until -> MUST STILL be COOLDOWN_STATE_REQUIRED!
+    day8 = base_day + pd.Timedelta(days=7)
+    c8 = ledger.ensure_cohort(day8.isoformat(), pol, now=day8 + pd.Timedelta(seconds=1))
+    assert c8["blocked_reason"] == "COOLDOWN_STATE_REQUIRED"
+
+    # Day 8 + 5m: operator configures cooldown_until = Day 9 (Nov 9 00:00:00Z) -> COOLDOWN_ACTIVE on Day 8
+    day9 = base_day + pd.Timedelta(days=8)
+    pol_with_cd = {**pol, "cooldown_until": day9.isoformat()}
+    c8_active = ledger.ensure_cohort((day8 + pd.Timedelta(minutes=5)).isoformat(), pol_with_cd, now=day8 + pd.Timedelta(minutes=5, seconds=1))
+    assert c8_active["blocked_reason"] == "COOLDOWN_ACTIVE"
+
+    # Day 9 (Nov 9 00:00:00Z, at/after cooldown_until): cooldown has been satisfied and unlocks!
+    c9_unlocked = ledger.ensure_cohort(day9.isoformat(), pol_with_cd, now=day9 + pd.Timedelta(seconds=1))
+    assert c9_unlocked["blocked_reason"] is None
+    assert c9_unlocked["budget_usd"] > 0
+
+    # Verify >50,000 rows (50,001 rows) middle-row tamper detection at id=25000 via SQLite ATTACH + EXCEPT
+    src_50k = tmp_path / "obs_50001_live.sqlite3"
+    snap_50k = tmp_path / "obs_50001_snap.sqlite3"
+    with closing(sqlite3.connect(src_50k)) as conn, conn:
+        conn.execute("CREATE TABLE snapshots(id INTEGER PRIMARY KEY, recorded_at TEXT, status TEXT, payload TEXT)")
+        rows = [(i, "2026-11-08T00:00:00Z", "OK", f"row_payload_{i}") for i in range(1, 50002)]
+        conn.executemany("INSERT INTO snapshots(id, recorded_at, status, payload) VALUES(?,?,?,?)", rows)
+    with closing(sqlite3.connect(src_50k)) as s_conn, closing(sqlite3.connect(snap_50k)) as d_conn:
+        s_conn.backup(d_conn)
+
+    assert revisions._is_valid_observations_prefix(src_50k, snap_50k) is True
+    # Append row 50002 to live DB -> still a valid prefix
+    with closing(sqlite3.connect(src_50k)) as conn, conn:
+        conn.execute("INSERT INTO snapshots(id, recorded_at, status, payload) VALUES(?,?,?,?)", (50002, "2026-11-08T00:05:00Z", "OK", "row_payload_50002"))
+    assert revisions._is_valid_observations_prefix(src_50k, snap_50k) is True
+
+    # Mutate middle row id=25000 in live DB -> must return False!
+    with closing(sqlite3.connect(src_50k)) as conn, conn:
+        conn.execute("UPDATE snapshots SET payload='TAMPERED_MIDDLE_ROW' WHERE id=25000")
+    assert revisions._is_valid_observations_prefix(src_50k, snap_50k) is False
+
 
 
 

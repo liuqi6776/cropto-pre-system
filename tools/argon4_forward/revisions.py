@@ -496,34 +496,59 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
     return plans, pending
 
 
+_VERIFIED_PREFIX_PAIR_CACHE = {}
+
+
 def _is_valid_observations_prefix(source, prior_snapshot):
     source = Path(source).resolve()
     prior_snapshot = Path(prior_snapshot).resolve()
+    if not source.is_file() or not prior_snapshot.is_file() or source.is_symlink() or prior_snapshot.is_symlink():
+        return False
+    src_st, pri_st = source.stat(), prior_snapshot.stat()
+    with source.open("rb") as sf, prior_snapshot.open("rb") as pf:
+        src_hdr, pri_hdr = sf.read(100), pf.read(100)
+    pair_key = (
+        str(prior_snapshot), pri_st.st_dev, pri_st.st_ino, pri_st.st_size, pri_st.st_mtime_ns, pri_hdr,
+        str(source), src_st.st_dev, src_st.st_ino, src_st.st_size, src_st.st_mtime_ns, src_hdr,
+    )
+    with _COMMITTED_ARCHIVE_HASH_LOCK:
+        if _VERIFIED_PREFIX_PAIR_CACHE.get(pair_key) is True:
+            return True
     with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived, \
             closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
+        if archived.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            return False
         schemas = dict(archived.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
         live_schemas = dict(current.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
         if not schemas or schemas != live_schemas or not set(schemas) <= {"receipts", "snapshots", "decisions"}:
             return False
-        total_rows = sum(archived.execute('SELECT COUNT(*) FROM "' + name + '"').fetchone()[0] for name in schemas)
-        if total_rows <= 50000:
-            _audit_sqlite_backup(source, prior_snapshot)
-            return True
         for name in schemas:
-            max_id = archived.execute('SELECT MAX(id) FROM "' + name + '"').fetchone()[0]
-            if max_id is not None:
-                arch_cnt = archived.execute('SELECT COUNT(*) FROM "' + name + '"').fetchone()[0]
-                live_cnt = current.execute('SELECT COUNT(*) FROM "' + name + '" WHERE id<=?', (max_id,)).fetchone()[0]
+            primary = [row[1] for row in archived.execute('PRAGMA table_info("' + name + '")') if row[5]]
+            if primary != ["id"]:
+                return False
+    # Use SQLite C-engine ATTACH + EXCEPT to verify 100% of all rows (including middle rows > 50,000)
+    with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.execute("ATTACH DATABASE ? AS arch_db", (prior_snapshot.as_uri() + "?mode=ro",)).fetchall()
+        try:
+            for name in schemas:
+                max_id = conn.execute('SELECT MAX(id) FROM arch_db."' + name + '"').fetchall()[0][0]
+                arch_cnt = conn.execute('SELECT COUNT(*) FROM arch_db."' + name + '"').fetchall()[0][0]
+                if max_id is None or arch_cnt == 0:
+                    continue
+                live_cnt = conn.execute('SELECT COUNT(*) FROM main."' + name + '" WHERE id<=?', (max_id,)).fetchall()[0][0]
                 if arch_cnt != live_cnt:
                     return False
-                head_old = archived.execute('SELECT * FROM "' + name + '" ORDER BY id ASC LIMIT 64').fetchall()
-                head_live = current.execute('SELECT * FROM "' + name + '" ORDER BY id ASC LIMIT 64').fetchall()
-                if head_old != head_live:
+                mismatch = conn.execute(
+                    'SELECT 1 FROM (SELECT * FROM arch_db."' + name + '" '
+                    'EXCEPT SELECT * FROM main."' + name + '" WHERE id<=?) LIMIT 1',
+                    (max_id,),
+                ).fetchall()
+                if mismatch:
                     return False
-                tail_old = archived.execute('SELECT * FROM "' + name + '" ORDER BY id DESC LIMIT 64').fetchall()
-                tail_live = current.execute('SELECT * FROM "' + name + '" WHERE id<=? ORDER BY id DESC LIMIT 64', (max_id,)).fetchall()
-                if tail_old != tail_live:
-                    return False
+        finally:
+            conn.execute("DETACH DATABASE arch_db").fetchall()
+    with _COMMITTED_ARCHIVE_HASH_LOCK:
+        _VERIFIED_PREFIX_PAIR_CACHE[pair_key] = True
     return True
 
 
