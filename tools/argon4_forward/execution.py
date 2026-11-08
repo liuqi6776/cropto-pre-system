@@ -143,7 +143,7 @@ class PaperExecutor:
         raise AccountRejected("verified contract window is missing")
 
     @staticmethod
-    def _adapt(market, side, book, stamp, clock, allow_price_skip=False):
+    def _adapt(market, side, book, stamp, clock, allow_price_skip=False, min_buy_price=Decimal("0")):
         if (market.get("status") != "VERIFIED_MARKET" or market.get("active") is not True
                 or market.get("closed") is not False or market.get("accepting_orders") is not True
                 or not _ts(market["window_start"]) <= stamp < _ts(market["window_end"])):
@@ -186,6 +186,7 @@ class PaperExecutor:
                    "venue_market":contract}
         if not isinstance(book.get("asks"),list):
             raise AccountRejected("observed ask levels required")
+        min_limit = _d(min_buy_price) if min_buy_price else Decimal("0")
         capacity, positive_prices = Decimal(0), []
         for ask in book["asks"]:
             price, quantity = _d(ask["price"]), _d(ask["size"])
@@ -193,10 +194,10 @@ class PaperExecutor:
                 raise AccountRejected("invalid ask level")
             if quantity > 0:
                 positive_prices.append(price)
-            if price <= Decimal(".515"):
+            if min_limit <= price <= Decimal(".515"):
                 capacity += quantity * (price + Account._fee_per_share(fee,price,stamp,market["market_id"],side))
         if capacity <= 0:
-            if allow_price_skip and positive_prices and min(positive_prices) > Decimal(".515"):
+            if allow_price_skip and positive_prices and not any(min_limit <= p <= Decimal(".515") for p in positive_prices):
                 return adapted, fee, Decimal(0)
             raise AccountRejected("zero or unknown capacity cannot unlock a lower rank")
         capacity = capacity.quantize(Decimal(".000001"), rounding=ROUND_DOWN)
@@ -506,11 +507,13 @@ class PaperExecutor:
                 self._clock(clock,stamp)
                 if not stamp < _ts(cohort["expires_at"]):
                     raise AccountRejected("decision cohort expired")
-                book,fee,capacity = self._adapt(market,side,observed,stamp,clock,allow_price_skip=True)
+                book,fee,capacity = self._adapt(market,side,observed,stamp,clock,allow_price_skip=True,min_buy_price=limits["min_buy_price"])
                 if not _ts(signal["decision_at"]) < stamp-timedelta(seconds=2*float(_d(clock["uncertainty_seconds"]))):
                     raise AccountRejected("fill clock lower bound has not passed the decision")
                 if capacity == 0:
                     receipt = {"source":"OBSERVED_PRICE_LIMIT_CHECK","signal":signal,"orderbook":book,"fee_quote":fee}
+                    if limits["min_buy_price"] > 0:
+                        receipt["min_buy_price"] = float(limits["min_buy_price"])
                     if multi_look is not None:
                         completed = self.account.finish_book_look(cohort["cohort_id"],stream,look_claim[1],
                                                                  "PRICE_LIMIT_NOT_MET",receipt,now=now)

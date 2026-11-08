@@ -22,6 +22,9 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 RETURN_BUCKETS = ("<1_bps", "1_to_3_bps", "3_to_10_bps", ">10_bps")
+ASK_BUCKETS = ("DeepDiscount (<0.35)", "MidDiscount (0.35-0.44)", "NearPar (0.44-0.515)")
+ADVERSE_SELECTION_ZONES = ("NORMAL_ASK (>=0.37)", "TOXIC_DISCOUNT (<=0.36)")
+RV12_BUCKETS = ("UltraLow (<3_bps)", "Low (3_to_6_bps)", "Normal (6_to_15_bps)", "High (>15_bps)")
 
 
 def classify_return_bucket(abs_ret_bps: float) -> str:
@@ -33,6 +36,36 @@ def classify_return_bucket(abs_ret_bps: float) -> str:
     if val < 10.0:
         return "3_to_10_bps"
     return ">10_bps"
+
+
+def classify_ask_bucket(ask_price: float | None) -> str | None:
+    if ask_price is None:
+        return None
+    val = float(ask_price)
+    if val < 0.35:
+        return "DeepDiscount (<0.35)"
+    if val < 0.44:
+        return "MidDiscount (0.35-0.44)"
+    return "NearPar (0.44-0.515)"
+
+
+def classify_adverse_selection_zone(ask_price: float | None) -> str | None:
+    if ask_price is None:
+        return None
+    return "TOXIC_DISCOUNT (<=0.36)" if float(ask_price) < 0.365 else "NORMAL_ASK (>=0.37)"
+
+
+def classify_rv12_bucket(rv12_bps: float | None) -> str | None:
+    if rv12_bps is None:
+        return None
+    val = float(rv12_bps)
+    if val < 3.0:
+        return "UltraLow (<3_bps)"
+    if val < 6.0:
+        return "Low (3_to_6_bps)"
+    if val < 15.0:
+        return "Normal (6_to_15_bps)"
+    return "High (>15_bps)"
 
 
 def _symbol_for_position(stream: str | None = None, underlying: str | None = None, symbol: str | None = None) -> str:
@@ -58,6 +91,9 @@ def compute_settlement_alignment_row(
     market_id: str | None = None,
     prediction_side: str | None = None,
     symbol: str | None = None,
+    ask_price: float | None = None,
+    effective_price: float | None = None,
+    realized_pnl_usd: float | None = None,
 ) -> dict[str, Any]:
     official = str(official_outcome).upper()
     if official not in ("UP", "DOWN"):
@@ -94,6 +130,13 @@ def compute_settlement_alignment_row(
             "prediction_side": prediction_side,
         }
     window_bars = window_bars.sort_values("date")
+    pre_bars = frame.loc[dates < start_ts].sort_values("date").tail(12)
+    ex_ante_rv12_bps: float | None = None
+    if len(pre_bars) > 0:
+        p_opens = pre_bars["open"].astype(float)
+        p_closes = pre_bars["close"].astype(float)
+        if (p_opens > 0).all():
+            ex_ante_rv12_bps = float(((p_closes - p_opens).abs() / p_opens * 10000.0).mean())
     open_start = float(window_bars.iloc[0]["open"])
     close_end = float(window_bars.iloc[-1]["close"])
     total_vol = float(window_bars["volume"].sum()) if "volume" in window_bars.columns else 0.0
@@ -123,6 +166,13 @@ def compute_settlement_alignment_row(
         "vwap": vwap,
         "abs_ret_bps": abs_ret_bps,
         "return_bucket": ret_bucket,
+        "ex_ante_rv12_bps": ex_ante_rv12_bps,
+        "rv12_bucket": classify_rv12_bucket(ex_ante_rv12_bps),
+        "ask_price": float(ask_price) if ask_price is not None else None,
+        "effective_price": float(effective_price) if effective_price is not None else None,
+        "ask_bucket": classify_ask_bucket(ask_price),
+        "adverse_selection_zone": classify_adverse_selection_zone(ask_price),
+        "realized_pnl_usd": float(realized_pnl_usd) if realized_pnl_usd is not None else None,
         "official_outcome": official,
         "binance_point_outcome": binance_point_outcome,
         "binance_vwap_outcome": binance_vwap_outcome,
@@ -147,6 +197,7 @@ def _group_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "official_win_rate": None,
             "binance_point_win_rate": None,
             "win_rate_delta": None,
+            "realized_pnl_usd": 0.0,
         }
     point_hits = sum(1 for r in checked if r.get("point_aligned"))
     vwap_hits = sum(1 for r in checked if r.get("vwap_aligned"))
@@ -157,6 +208,7 @@ def _group_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         delta = off_win - pt_win
     else:
         off_win = pt_win = delta = None
+    total_pnl = sum(float(r["realized_pnl_usd"]) for r in checked if r.get("realized_pnl_usd") is not None)
     return {
         "count": n,
         "point_agreement_rate": point_hits / n,
@@ -164,6 +216,7 @@ def _group_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "official_win_rate": off_win,
         "binance_point_win_rate": pt_win,
         "win_rate_delta": delta,
+        "realized_pnl_usd": round(total_pnl, 4),
     }
 
 
@@ -177,6 +230,23 @@ def summarize_settlement_alignments(rows: list[dict[str, Any]]) -> dict[str, Any
         b: _group_metrics([r for r in checked if r.get("return_bucket") == b])
         for b in RETURN_BUCKETS
     }
+    by_ask_bucket = {
+        b: _group_metrics([r for r in checked if r.get("ask_bucket") == b])
+        for b in ASK_BUCKETS
+    }
+    by_adverse_zone = {
+        z: _group_metrics([r for r in checked if r.get("adverse_selection_zone") == z])
+        for z in ADVERSE_SELECTION_ZONES
+    }
+    by_rv12_bucket = {
+        b: _group_metrics([r for r in checked if r.get("rv12_bucket") == b])
+        for b in RV12_BUCKETS
+    }
+    guarded_subset = [
+        r for r in checked
+        if (r.get("ask_price") is None or float(r["ask_price"]) >= 0.365)
+        and (r.get("ex_ante_rv12_bps") is None or float(r["ex_ante_rv12_bps"]) >= 3.0)
+    ]
     disagreements = [r for r in checked if not r.get("point_aligned")]
     return {
         "total_records": len(rows),
@@ -185,6 +255,10 @@ def summarize_settlement_alignments(rows: list[dict[str, Any]]) -> dict[str, Any
         "by_stream": by_stream,
         "by_timeframe": by_timeframe,
         "by_return_bucket": by_bucket,
+        "by_ask_bucket": by_ask_bucket,
+        "by_adverse_selection_zone": by_adverse_zone,
+        "by_rv12_bucket": by_rv12_bucket,
+        "combined_guards_simulation": _group_metrics(guarded_subset),
         "disagreement_count": len(disagreements),
         "disagreements": disagreements[:50],
     }
@@ -220,6 +294,12 @@ def analyze_runtime_settlement_alignment(
                     window_start = s_pay.get("window_start") or o_pay.get("venue_market", {}).get("window_start")
                     window_end = s_pay.get("window_end") or w_end_col or o_pay.get("venue_market", {}).get("window_end")
                     official_outcome = r_pay.get("outcome") or r_pay.get("winning_outcome")
+                    qty = float(o_pay.get("quantity", 0.0) or 0.0)
+                    cost_usd = float(o_pay.get("cost_usd", 0.0) or 0.0)
+                    fee_usd = float(o_pay.get("fee_usd", 0.0) or 0.0)
+                    ask_px = (cost_usd / qty) if qty > 0 else None
+                    eff_px = ((cost_usd + fee_usd) / qty) if qty > 0 else None
+                    pnl_usd = (qty - (cost_usd + fee_usd)) if (pred_side == official_outcome) else -(cost_usd + fee_usd)
                     if stream and window_start and window_end and official_outcome in ("UP", "DOWN"):
                         rows.append(
                             compute_settlement_alignment_row(
@@ -230,6 +310,9 @@ def analyze_runtime_settlement_alignment(
                                 official_outcome=official_outcome,
                                 market_id=str(market_id),
                                 prediction_side=pred_side,
+                                ask_price=ask_px,
+                                effective_price=eff_px,
+                                realized_pnl_usd=pnl_usd,
                             )
                         )
             elif "settlements" in tables:

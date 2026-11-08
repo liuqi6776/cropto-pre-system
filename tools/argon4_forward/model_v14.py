@@ -100,17 +100,27 @@ def compute_ex_ante_rv12_bps(data_root=None, symbol="BTCUSDT", *, as_of=None, sn
 
 
 def apply_volatility_regime_guard(stream, prediction, *, ex_ante_rv12_bps=None, guard_config=None):
-    """Attach ex_ante_rv12_bps and optionally apply V5_Extreme volatility regime guard."""
+    """Attach ex_ante_rv12_bps and optionally apply V5_Extreme / UltraLow_TWAP volatility regime guard."""
     res = dict(prediction)
     if ex_ante_rv12_bps is not None:
         res["ex_ante_rv12_bps"] = float(ex_ante_rv12_bps)
     if isinstance(guard_config, dict) and guard_config.get("enabled") is True and ex_ante_rv12_bps is not None:
+        action = str(guard_config.get("action", "SKIP_OR_HALF_STAKE")).upper()
         limits = guard_config.get("max_rv12_bps")
         cap = limits.get(stream) if isinstance(limits, dict) else None
+        min_limits = guard_config.get("min_rv12_bps")
+        min_cap = min_limits.get(stream) if isinstance(min_limits, dict) else None
         if cap is not None and float(ex_ante_rv12_bps) > float(cap):
-            action = str(guard_config.get("action", "SKIP_OR_HALF_STAKE")).upper()
             res["volatility_regime_guarded"] = True
             res["volatility_regime_max_rv12_bps"] = float(cap)
+            res["volatility_regime_reason"] = "ABOVE_MAX_RV12_BPS"
+            res["volatility_regime_action"] = action
+            if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                res["selected"] = False
+        elif min_cap is not None and float(ex_ante_rv12_bps) < float(min_cap):
+            res["volatility_regime_guarded"] = True
+            res["volatility_regime_min_rv12_bps"] = float(min_cap)
+            res["volatility_regime_reason"] = "BELOW_MIN_RV12_BPS"
             res["volatility_regime_action"] = action
             if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
                 res["selected"] = False

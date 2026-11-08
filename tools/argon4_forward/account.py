@@ -127,9 +127,11 @@ def _policy_risk_limits(policy=None):
     max_active_open = dec_field("max_active_window_risk_usd", max_open)
     max_active_underlying = dec_field("max_underlying_active_risk_usd", min(max_underlying, max_active_open))
     daily_loss = dec_field("daily_loss_fraction", "0.055")
+    min_buy_price = dec_field("min_buy_price", "0")
     if (not Decimal("0.005") <= single_frac <= Decimal("0.030")
             or not Decimal("0.010") <= tick_frac <= Decimal("0.050")
             or not Decimal("0.010") <= daily_loss <= Decimal("0.100")
+            or not Decimal("0") <= min_buy_price <= Decimal("0.500")
             or max_tick <= 0 or max_order <= 0 or max_open <= 0 or max_underlying <= 0
             or max_active_open <= 0 or max_active_underlying <= 0
             or max_order > max_tick or max_underlying > max_open
@@ -146,6 +148,7 @@ def _policy_risk_limits(policy=None):
         "max_active_window_risk_usd": max_active_open,
         "max_underlying_active_risk_usd": max_active_underlying,
         "daily_loss_fraction": daily_loss,
+        "min_buy_price": min_buy_price,
         "max_tick_budget_atoms": _atoms(max_tick),
         "max_order_atoms": _atoms(max_order),
         "max_open_risk_atoms": _atoms(max_open),
@@ -675,6 +678,9 @@ class Account:
         skip_limit = _d(receipt.get("limit_price", ".515"))
         if skip_limit not in (Decimal(".515"), Decimal(".520")):
             raise AccountRejected("unsupported price skip limit")
+        min_limit = _d(receipt.get("min_buy_price", "0"))
+        if not Decimal("0") <= min_limit <= Decimal(".500"):
+            raise AccountRejected("unsupported min buy price limit")
         self._fee_per_share(fee, skip_limit, stamp, clean["market_id"], clean["outcome"])
         asks = book.get("asks")
         if not isinstance(asks, list) or not asks:
@@ -686,7 +692,7 @@ class Account:
                 raise AccountRejected("invalid price skip ask level")
             if size > 0:
                 positive.append(price)
-        if not positive or min(positive) <= skip_limit:
+        if not positive or any(min_limit <= p <= skip_limit for p in positive):
             raise AccountRejected("price skip requires all positive asks above the limit")
         return clean
 
@@ -973,13 +979,14 @@ class Account:
                             limits["max_underlying_active_risk_atoms"] - active_coin_risk):
                 raise AccountRejected("cash or concurrent exposure limit exceeded")
             remaining = budget
+            min_buy = limits.get("min_buy_price", Decimal("0"))
             fills, cost, fees, quantity = [], 0, 0, Decimal(0)
             for price, quoted_available in sorted(aggregated.items()):
                 consumed = con.execute("SELECT quantity FROM consumed_book_depth WHERE book_hash=? AND price=?",
                                        (book_hash, str(price))).fetchone()
                 previous_quantity = _d(consumed[0]) if consumed else Decimal(0)
                 available = max(Decimal(0), quoted_available - previous_quantity)
-                if price > limit or remaining <= 0 or available == 0:
+                if price > limit or price < min_buy or remaining <= 0 or available == 0:
                     continue
                 fee_ps = self._fee_per_share(fee_quote, price, stamp, clean["market_id"], clean["outcome"])
                 qty = min(available, Decimal(remaining) / MICRO / (price + fee_ps)).quantize(QTY_STEP, rounding=ROUND_DOWN)

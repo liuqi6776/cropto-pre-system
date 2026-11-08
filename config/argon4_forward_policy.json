@@ -275,7 +275,12 @@
       "ETH_5m": 35.0,
       "ETH_15m": 35.0
     },
-    "action": "SKIP_OR_HALF_STAKE"
+    "action": "SKIP_OR_HALF_STAKE",
+    "min_rv12_bps": {
+      "BTC_5m": 3.0,
+      "ETH_5m": 3.0,
+      "SOL_5m": 3.0
+    }
   },
   "early_window_book_ticker": {
     "enabled": true

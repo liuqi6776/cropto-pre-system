@@ -509,6 +509,107 @@ def test_v14r2_patch4_ex_ante_rv12_bps_and_volatility_regime_guard(tmp_path):
     )
     assert res_on["selected"] is False
     assert res_on["volatility_regime_guarded"] is True
+    assert res_on["volatility_regime_reason"] == "ABOVE_MAX_RV12_BPS"
+
+    # Enabled guard also skips ultra-low volatility when rv12 (1.8) < min_rv12_bps (3.0)
+    res_low = model_v14.apply_volatility_regime_guard(
+        "BTC_5m", {**base_pred, "stream": "BTC_5m"}, ex_ante_rv12_bps=1.8,
+        guard_config={"enabled": True, "min_rv12_bps": {"BTC_5m": 3.0}, "action": "SKIP_OR_HALF_STAKE"},
+    )
+    assert res_low["selected"] is False
+    assert res_low["volatility_regime_guarded"] is True
+    assert res_low["volatility_regime_min_rv12_bps"] == pytest.approx(3.0)
+    assert res_low["volatility_regime_reason"] == "BELOW_MIN_RV12_BPS"
+
+
+def test_v14r3_min_buy_price_adverse_selection_guard_and_settlement_buckets(tmp_path):
+    """v14r3: min_buy_price skips deep-discount adverse selection asks (<0.37) and analyzer buckets by ask & rv12."""
+    from tools.argon4_forward.execution import PaperExecutor
+    from scripts.analyze_argon4_settlement_alignment import (
+        compute_settlement_alignment_row,
+        summarize_settlement_alignments,
+    )
+
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    assert policy["volatility_regime_guard"]["min_rv12_bps"] == {"BTC_5m": 3.0, "ETH_5m": 3.0, "SOL_5m": 3.0}
+    policy["min_buy_price"] = 0.37
+    limits = account._policy_risk_limits(policy)
+    assert limits["min_buy_price"] == Decimal("0.37")
+
+    market = {
+        "status": "VERIFIED_MARKET",
+        "active": True,
+        "closed": False,
+        "accepting_orders": True,
+        "market_id": "m-1",
+        "condition_id": "c-1",
+        "protocol": "polymarket_clob",
+        "asset": "BTC",
+        "duration_seconds": 300,
+        "window_start": "2026-11-08T12:00:00+00:00",
+        "window_end": "2026-11-08T12:05:00+00:00",
+        "outcome_ids": {"UP": "tok-up", "DOWN": "tok-down"},
+        "metadata_received_at": "2026-11-08T12:00:04+00:00",
+        "metadata_sha256": "a" * 64,
+        "fee": {"status": "KNOWN_DISABLED", "fees_enabled": False},
+        "resolution": {"source": "chainlink"},
+    }
+    book_toxic = {
+        "status": "OBSERVED",
+        "asset_id": "tok-up",
+        "condition_id": "c-1",
+        "source_at": "2026-11-08T12:00:05+00:00",
+        "received_at": "2026-11-08T12:00:05.100000+00:00",
+        "asks": [{"price": "0.24", "size": "500"}],
+    }
+    clock = {
+        "server_minus_local_seconds": 0.0,
+        "uncertainty_seconds": 0.05,
+        "receipt_sha256": "b" * 64,
+    }
+    stamp = account._ts("2026-11-08T12:00:05.200000+00:00")
+    adapted, fee, cap = PaperExecutor._adapt(
+        market, "UP", book_toxic, stamp, clock, allow_price_skip=True, min_buy_price=Decimal("0.37")
+    )
+    assert cap == Decimal(0)
+
+    # Verify analyzer ask_bucket, adverse_selection_zone, and combined_guards_simulation
+    intraday = tmp_path / "intraday"
+    intraday.mkdir(parents=True)
+    times = pd.date_range("2026-11-08T11:00:00Z", periods=13, freq="5min")
+    opens = [100.0] * 13
+    closes = [100.05] * 13  # 5.0 bps per bar -> rv12 = 5.0 bps
+    df = pd.DataFrame({"date": times, "open": opens, "close": closes, "volume": [10.0] * 13, "quote_volume": [1000.5] * 13})
+    df.to_parquet(intraday / "BTCUSDT_5m_futures.parquet", index=False)
+
+    r_good = compute_settlement_alignment_row(
+        tmp_path,
+        stream="BTC_5m",
+        window_start="2026-11-08T12:00:00Z",
+        window_end="2026-11-08T12:05:00Z",
+        official_outcome="UP",
+        prediction_side="UP",
+        ask_price=0.45,
+        effective_price=0.455,
+        realized_pnl_usd=180.0,
+    )
+    r_toxic = compute_settlement_alignment_row(
+        tmp_path,
+        stream="BTC_5m",
+        window_start="2026-11-08T12:00:00Z",
+        window_end="2026-11-08T12:05:00Z",
+        official_outcome="DOWN",
+        prediction_side="UP",
+        ask_price=0.24,
+        effective_price=0.245,
+        realized_pnl_usd=-150.0,
+    )
+    summary = summarize_settlement_alignments([r_good, r_toxic])
+    assert summary["by_adverse_selection_zone"]["NORMAL_ASK (>=0.37)"]["count"] == 1
+    assert summary["by_adverse_selection_zone"]["TOXIC_DISCOUNT (<=0.36)"]["count"] == 1
+    assert summary["combined_guards_simulation"]["count"] == 1
+    assert summary["combined_guards_simulation"]["official_win_rate"] == 1.0
+    assert summary["combined_guards_simulation"]["realized_pnl_usd"] == pytest.approx(180.0)
 
 
 def test_v14r2_patch5_early_window_book_ticker(tmp_path, monkeypatch):
