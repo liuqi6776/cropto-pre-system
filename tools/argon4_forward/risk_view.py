@@ -64,7 +64,11 @@ def _bounds(clock, now):
         if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
                for v in (offset, uncertainty, calibrated)):
             raise ValueError("invalid numeric calibration")
-        if (clock.get("source") != SOURCE or not 0 <= uncertainty <= .5
+        borderline_completed = (isinstance(clock.get("borderline_retry"), Mapping)
+                                and clock["borderline_retry"].get("status") == "COMPLETED"
+                                and len(clock.get("receipts", ())) == 8)
+        max_uncertainty = .6 if borderline_completed else .5
+        if (clock.get("source") != SOURCE or not 0 <= uncertainty <= max_uncertainty
                 or not re.fullmatch(r"[0-9a-f]{64}", str(clock.get("receipt_sha256", "")))):
             raise ValueError("unverified calibration")
         age = time.monotonic() - calibrated

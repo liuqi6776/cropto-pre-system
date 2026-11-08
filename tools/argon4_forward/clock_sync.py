@@ -103,7 +103,8 @@ def _transport_samples(count, receipts, result, transport, budget_monotonic, epo
             raise
 
 
-def calibrate(samples=6, *, transport=None, retry_borderline=False, budget_monotonic=None):
+def calibrate(samples=6, *, transport=None, retry_borderline=False, budget_monotonic=None,
+              borderline_max_uncertainty_seconds=.5):
     """Keep the 0.5s acceptance bound; optionally try two more real samples.
 
     Defaults retain the original six observations. Extra sampling requires an
@@ -114,6 +115,11 @@ def calibrate(samples=6, *, transport=None, retry_borderline=False, budget_monot
         raise ValueError("clock sample count out of range")
     if not isinstance(retry_borderline, bool) or (retry_borderline and samples != 6):
         raise ValueError("borderline retry requires the six-sample baseline")
+    if (isinstance(borderline_max_uncertainty_seconds, bool)
+            or not isinstance(borderline_max_uncertainty_seconds, (int, float))
+            or not math.isfinite(borderline_max_uncertainty_seconds)
+            or not .5 <= borderline_max_uncertainty_seconds <= .6):
+        raise ValueError("invalid borderline uncertainty limit")
     if budget_monotonic is not None and (isinstance(budget_monotonic, bool)
             or not isinstance(budget_monotonic, (int, float)) or not math.isfinite(budget_monotonic)):
         raise ValueError("invalid clock budget")
@@ -123,7 +129,8 @@ def calibrate(samples=6, *, transport=None, retry_borderline=False, budget_monot
         from .polymarket_transport import PublicPolymarketTransport
         with PublicPolymarketTransport() as owned:
             result = calibrate(samples, transport=owned, retry_borderline=retry_borderline,
-                               budget_monotonic=budget_monotonic)
+                               budget_monotonic=budget_monotonic,
+                               borderline_max_uncertainty_seconds=borderline_max_uncertainty_seconds)
         if time.monotonic() >= budget_monotonic:
             result.update(status="UNCALIBRATED", error="ValueError", error_code="CLOCK_DEADLINE_EXCEEDED")
             if result.get("borderline_retry", {}).get("status") == "COMPLETED":
@@ -169,7 +176,11 @@ def calibrate(samples=6, *, transport=None, retry_borderline=False, budget_monot
         result.update(calibrated_at_local=stamp.isoformat(), calibrated_monotonic=time.monotonic(),
                       observed_at=project_local(stamp, result).isoformat())
         _check_budget(budget_monotonic, epoch)
-        result["status"] = "CALIBRATED" if result["uncertainty_seconds"] <= .5 else "UNCERTAINTY_TOO_LARGE"
+        limit = (float(borderline_max_uncertainty_seconds)
+                 if retry is not None and retry["status"] == "COMPLETED" else .5)
+        if retry is not None and retry["status"] == "COMPLETED" and limit > .5:
+            retry["accepted_uncertainty_limit_seconds"] = limit
+        result["status"] = "CALIBRATED" if result["uncertainty_seconds"] <= limit else "UNCERTAINTY_TOO_LARGE"
     except (requests.RequestException, ValueError, UnicodeError) as exc:
         result["error"] = type(exc).__name__
         if retry is not None and retry["status"] in ("COLLECTING", "COMPLETED"):

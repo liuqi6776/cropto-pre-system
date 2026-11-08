@@ -25,6 +25,7 @@ STREAMS = {
     "SOL_15m": ("SOL", 900), "SOL_5m": ("SOL", 300),
     "BNB_15m": ("BNB", 900),
 }
+ALL_STREAMS = {**STREAMS, "XRP_15m": ("XRP", 900)}
 MICRO = Decimal("1000000")
 QTY_STEP = Decimal("0.00000001")
 V5_SEMANTICS = "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1"
@@ -269,8 +270,11 @@ class Account:
         _safe(policy)
         if boundary.timestamp() % 300 or not boundary <= stamp < boundary + timedelta(seconds=20):
             raise AccountRejected("cohort must be a current five-minute decision boundary")
-        if (policy.get("status") != "CONFIRMED" or set(policy.get("order", [])) != set(STREAMS)
-                or len(policy.get("order", [])) != 7 or not policy.get("version") or not policy.get("ranking_source")):
+        order = policy.get("order", [])
+        valid_streams = set(STREAMS) if isinstance(order, (tuple, list)) and len(order) == 7 else (
+            set(ALL_STREAMS) if isinstance(order, (tuple, list)) and len(order) == 8 else None)
+        if (policy.get("status") != "CONFIRMED" or valid_streams is None or set(order) != valid_streams
+                or not policy.get("version") or not policy.get("ranking_source")):
             raise AccountRejected("confirmed complete ranking policy required")
         if policy.get("waterfall_semantics") not in (None, V5_SEMANTICS):
             raise AccountRejected("unsupported waterfall semantics")
@@ -340,12 +344,25 @@ class Account:
                         "receipt_sha256": hashlib.sha256(encoded.encode()).hexdigest()}, stamp)
         return self.cohort_state(key)
 
+    @staticmethod
+    def _higher_ranks_unlocked(con, cohort_key, rank, cohort_policy, v5=True):
+        higher = con.execute("SELECT rank,state,spent_atoms FROM cohort_streams WHERE cohort_id=? AND rank<?",
+                             (cohort_key, rank)).fetchall()
+        if len(higher) != rank - 1:
+            return False
+        if not v5:
+            return all(r["state"] in LEGACY_UNLOCKED for r in higher)
+        exec_cfg = cohort_policy.get("execution") if isinstance(cohort_policy, Mapping) else None
+        cascade = isinstance(exec_cfg, Mapping) and exec_cfg.get("partial_fill_remainder_cascade") is True
+        return all(r["state"] in V5_UNLOCKED or (cascade and r["state"] == "PARTIAL" and r["spent_atoms"] > 0)
+                   for r in higher)
+
     def record_cohort_gate(self, cohort_id, stream, decision_status, capacity_usd, receipt, now=None):
         """Persist an observed upper-layer capacity gate for an explicitly absent signal."""
         stamp = _now(now)
         key = _iso(_ts(cohort_id))
         _safe(receipt)
-        if decision_status not in ("NO_SIGNAL", "NOT_DUE") or stream not in STREAMS:
+        if decision_status not in ("NO_SIGNAL", "NOT_DUE") or stream not in ALL_STREAMS:
             raise AccountRejected("explicit no-signal or not-due state required")
         capacity = _atoms(_d(capacity_usd))
         if capacity <= 0 or not receipt.get("source") or not receipt.get("sha256"):
@@ -363,7 +380,7 @@ class Account:
                 raise AccountRejected("eligible-signal policy requires an explicit skip receipt")
             order = policy["order"]
             rank = order.index(stream)+1
-            if decision_status == "NOT_DUE" and (STREAMS[stream][1] != 900 or _ts(key).timestamp()%900 == 0):
+            if decision_status == "NOT_DUE" and (ALL_STREAMS[stream][1] != 900 or _ts(key).timestamp()%900 == 0):
                 raise AccountRejected("stream is actually due at this boundary")
             existing = con.execute("SELECT * FROM cohort_streams WHERE cohort_id=? AND stream=?", (key,stream)).fetchone()
             if existing:
@@ -388,7 +405,7 @@ class Account:
         stamp, boundary = current_time(), _ts(cohort_id)
         key = _iso(boundary)
         _safe(receipt)
-        if (stream not in STREAMS or decision_status not in ("NO_SIGNAL", "NOT_DUE", "PRICE_LIMIT_NOT_MET")
+        if (stream not in ALL_STREAMS or decision_status not in ("NO_SIGNAL", "NOT_DUE", "PRICE_LIMIT_NOT_MET")
                 or not isinstance(receipt, Mapping)):
             raise AccountRejected("explicit validated skip receipt required")
         clean = None
@@ -408,7 +425,7 @@ class Account:
             if stream in _stage(policy, boundary)["disabled_streams"]:
                 raise AccountRejected("stream is disabled by the frozen execution stage")
             rank = policy["order"].index(stream)+1
-            due = int(boundary.timestamp()) % STREAMS[stream][1] == 0
+            due = int(boundary.timestamp()) % ALL_STREAMS[stream][1] == 0
             if decision_status == "NOT_DUE":
                 if due or receipt.get("source") != "UTC_COHORT_SCHEDULE":
                     raise AccountRejected("stream is actually due or schedule proof is missing")
@@ -446,8 +463,7 @@ class Account:
                 if previous["state"] != decision_status or previous["receipt_json"] != encoded:
                     raise AccountRejected("conflicting decision cohort skip")
             else:
-                higher = con.execute("SELECT state FROM cohort_streams WHERE cohort_id=? AND rank<?", (key,rank)).fetchall()
-                if len(higher) != rank-1 or any(r["state"] not in V5_UNLOCKED for r in higher):
+                if not self._higher_ranks_unlocked(con, key, rank, policy, v5=True):
                     raise AccountRejected("higher cohort ranks are not unlocked")
                 con.execute("INSERT INTO cohort_streams VALUES(?,?,?,?,0,0,0,?,?)", (
                     key,stream,rank,decision_status,clean["signal_id"] if clean else None,encoded))
@@ -475,13 +491,12 @@ class Account:
         settings = multi_look_settings(policy)
         if settings is None or policy.get("waterfall_semantics") != V5_SEMANTICS:
             raise AccountRejected("multi-look is not enabled for this cohort")
-        if stream not in STREAMS or stream in _stage(policy, _ts(key))["disabled_streams"]:
+        if stream not in ALL_STREAMS or stream in _stage(policy, _ts(key))["disabled_streams"]:
             raise AccountRejected("book look stream is unavailable")
         if con.execute("SELECT 1 FROM cohort_streams WHERE cohort_id=? AND stream=?", (key, stream)).fetchone():
             raise AccountRejected("book look stream is already terminal")
         rank = policy["order"].index(stream) + 1
-        higher = con.execute("SELECT state FROM cohort_streams WHERE cohort_id=? AND rank<?", (key, rank)).fetchall()
-        if len(higher) != rank-1 or any(r["state"] not in V5_UNLOCKED for r in higher):
+        if not Account._higher_ranks_unlocked(con, key, rank, policy, v5=True):
             raise AccountRejected("higher cohort ranks are not unlocked")
         return cohort, settings
 
@@ -604,7 +619,10 @@ class Account:
         source, received = _ts(book.get("observed_at")), _ts(book.get("received_at"))
         if not _ts(clean["decision_at"]) <= source <= received <= stamp or (stamp-source).total_seconds() > 2:
             raise AccountRejected("price skip book is stale or future")
-        self._fee_per_share(fee, Decimal(".515"), stamp, clean["market_id"], clean["outcome"])
+        skip_limit = _d(receipt.get("limit_price", ".515"))
+        if skip_limit not in (Decimal(".515"), Decimal(".520")):
+            raise AccountRejected("unsupported price skip limit")
+        self._fee_per_share(fee, skip_limit, stamp, clean["market_id"], clean["outcome"])
         asks = book.get("asks")
         if not isinstance(asks, list) or not asks:
             raise AccountRejected("nonempty observed asks required for price skip")
@@ -615,7 +633,7 @@ class Account:
                 raise AccountRejected("invalid price skip ask level")
             if size > 0:
                 positive.append(price)
-        if not positive or min(positive) <= Decimal(".515"):
+        if not positive or min(positive) <= skip_limit:
             raise AccountRejected("price skip requires all positive asks above the limit")
         return clean
 
@@ -631,7 +649,7 @@ class Account:
             raise AccountRejected("validated model inputs required")
         if not re.fullmatch(r"[0-9a-fA-F]{64}", str(signal["model_sha256"])):
             raise AccountRejected("model SHA256 required")
-        spec = STREAMS.get(signal["stream"])
+        spec = ALL_STREAMS.get(signal["stream"])
         if spec is None or signal["underlying"] != spec[0] or signal["outcome"] not in ("UP", "DOWN"):
             raise AccountRejected("unknown stream, underlying or outcome")
         available, decision, expiry, start, end = (_ts(signal[k]) for k in (
@@ -734,7 +752,7 @@ class Account:
             raise AccountRejected("ranked capacity allocation authorization required")
         if authorization.get("signal_id") != clean["signal_id"] or authorization.get("market_id") != clean["market_id"]:
             raise AccountRejected("allocation authorization does not match signal")
-        if not isinstance(authorization.get("rank"), int) or not 1 <= authorization["rank"] <= 7:
+        if not isinstance(authorization.get("rank"), int) or not 1 <= authorization["rank"] <= len(ALL_STREAMS):
             raise AccountRejected("allocation rank required")
         if not _ts(authorization.get("planned_at")) <= stamp < _ts(authorization.get("valid_until")) <= _ts(clean["valid_until"]):
             raise AccountRejected("allocation authorization is future or expired")
@@ -757,7 +775,8 @@ class Account:
             raise AccountRejected("stale orderbook")
         limit = _d(limit_price)
         budget = _atoms(_d(stake))
-        if not 0 < limit <= Decimal(".515") or not 0 < budget <= 200_000_000:
+        max_limit = Decimal(".520") if _d(authorization.get("max_buy_price", ".515")) == Decimal(".520") else Decimal(".515")
+        if not 0 < limit <= max_limit or not 0 < budget <= 200_000_000:
             raise AccountRejected("order price or stake exceeds limit")
         asks = orderbook.get("asks")
         if not isinstance(asks, list):
@@ -852,9 +871,7 @@ class Account:
                     raise AccountRejected("persistent cohort budget exceeded")
                 if con.execute("SELECT 1 FROM cohort_streams WHERE cohort_id=? AND stream=?", (cohort_key,clean["stream"])).fetchone():
                     raise AccountRejected("stream already consumed this decision cohort")
-                higher = con.execute("SELECT rank,state FROM cohort_streams WHERE cohort_id=? AND rank<?", (cohort_key,authorization["rank"])).fetchall()
-                unlocked = V5_UNLOCKED if v5 else LEGACY_UNLOCKED
-                if len(higher) != authorization["rank"]-1 or any(r["state"] not in unlocked for r in higher):
+                if not self._higher_ranks_unlocked(con, cohort_key, authorization["rank"], cohort_policy, v5=v5):
                     raise AccountRejected("higher cohort capacity is not fully satisfied")
                 cohort_capacity = _atoms(_d(authorization.get("cohort_capacity_usd")))
                 if cohort_capacity <= 0 or budget > cohort_capacity:
@@ -878,8 +895,14 @@ class Account:
                     raise AccountRejected("preceding allocation amount invalid")
                 consumed = con.execute("SELECT * FROM allocation_consumption WHERE plan_id=? AND signal_id=? AND rank=?",
                                        (authorization["plan_id"], required["signal_id"], required["rank"])).fetchone()
-                if (consumed is None or consumed["approved_atoms"] != threshold
-                        or consumed["spent_atoms"] + 2 < threshold):
+                cascade_ok = (cohort is not None and v5
+                              and isinstance(cohort_policy.get("execution"), Mapping)
+                              and cohort_policy["execution"].get("partial_fill_remainder_cascade") is True
+                              and consumed is not None and consumed["spent_atoms"] > 0
+                              and consumed["spent_atoms"] + 2 >= threshold
+                              and threshold <= consumed["approved_atoms"])
+                if (consumed is None or ((consumed["approved_atoms"] != threshold or consumed["spent_atoms"] + 2 < threshold)
+                                         and not cascade_ok)):
                     raise AccountRejected("higher ranked capacity has not actually filled in this plan")
             previous = con.execute("SELECT payload FROM signals WHERE signal_id=?", (clean["signal_id"],)).fetchone()
             if previous is not None and previous[0] != _json(clean):

@@ -26,17 +26,18 @@ import pandas as pd
 import requests
 
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT")
+ALL_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
 BASIS_SYMBOLS = SYMBOLS[:3]
 BINANCE_DOC = "https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data"
 SPOT_DOC = "https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/market"
 DVOL_DOC = "https://docs.deribit.com/api-reference/market-data/public-get_volatility_index_data"
 ENDPOINTS = {
     "clock": ("https://fapi.binance.com", "/fapi/v1/time"),
-    "spot_clock": ("https://api.binance.com", "/api/v3/time"),
+    "spot_clock": ("https://data-api.binance.vision", "/api/v3/time"),
     "futures": ("https://fapi.binance.com", "/fapi/v1/klines"),
     "mark": ("https://fapi.binance.com", "/fapi/v1/markPriceKlines"),
     "funding": ("https://fapi.binance.com", "/fapi/v1/fundingRate"),
-    "spot": ("https://api.binance.com", "/api/v3/klines"),
+    "spot": ("https://data-api.binance.vision", "/api/v3/klines"),
     "dvol": ("https://www.deribit.com", "/api/v2/public/get_volatility_index_data"),
 }
 STEPS = {"5m": pd.Timedelta(minutes=5), "1h": pd.Timedelta(hours=1),
@@ -100,7 +101,7 @@ def _parameters(kind, params):
             raise ValueError("Unsupported DVOL request")
         start, end = params["start_timestamp"], params["end_timestamp"]
     else:
-        if params["symbol"] not in SYMBOLS:
+        if params["symbol"] not in ALL_SYMBOLS:
             raise ValueError("Unsupported symbol")
         if kind != "funding" and params["interval"] not in ("5m", "1h", "4h"):
             raise ValueError("Unsupported interval")
@@ -379,13 +380,21 @@ class PublicInputsHTTP:
             timeout = (4, 12) if remaining is None else (min(2., remaining), min(3.5, remaining))
             with session.get(url, timeout=timeout, allow_redirects=False, stream=True,
                              headers={"User-Agent": "argon4-public-paper-inputs/1"}) as response:
+                headers = getattr(response, "headers", None) or {}
+                used_weight = headers.get("X-MBX-USED-WEIGHT-1M") or headers.get("x-mbx-used-weight-1m")
+                if used_weight is not None:
+                    try:
+                        if float(used_weight) >= 1600:
+                            self.min_spacing = max(self.min_spacing, 1.0)
+                    except (TypeError, ValueError):
+                        pass
                 if response.status_code in (418, 429):
                     # Persist the observed status/Retry-After before waiting
                     # for a body that might stall beyond this generation. An
                     # incomplete body is explicitly not a completed receipt.
                     self._pending_backoff[family] = self._backoff_now()[0] + pd.Timedelta(
                         seconds=3615 if response.status_code == 418 else 75)
-                    self._record_backoff(family, None, getattr(response, "headers", {}).get("Retry-After"),
+                    self._record_backoff(family, None, headers.get("Retry-After"),
                                          response.status_code)
                 _remaining(deadline_monotonic)
                 chunks, size = [], 0
@@ -462,12 +471,16 @@ class OnlineInputs:
     """
     def __init__(self, runtime_root, *, window_days=20, client=None, clock=_now,
                  max_clock_skew_seconds=2.0, time_basis="SYSTEM_UTC", clock_evidence_sha256=None,
-                 http_min_spacing_seconds=1.0):
+                 http_min_spacing_seconds=1.0, symbols=SYMBOLS):
         if not 15 <= window_days <= 60:
             raise ValueError("Online warmup requires 15 to 60 days")
         if (isinstance(http_min_spacing_seconds, bool) or not math.isfinite(http_min_spacing_seconds)
                 or not .25 <= http_min_spacing_seconds <= 60):
             raise ValueError("Online HTTP spacing must be finite and within 0.25 to 60 seconds")
+        symbols = tuple(symbols)
+        if not symbols or any(symbol not in ALL_SYMBOLS for symbol in symbols):
+            raise ValueError("Unsupported online input symbols")
+        self.symbols = symbols
         self.root = Path(runtime_root) / "features"
         self.data_root = self.root / "raw_data"
         self.state_path = self.root / "online_state.json"
@@ -609,9 +622,16 @@ class OnlineInputs:
         path = self._path(kind, symbol, interval)
         old = self._read(path)
         step = STEPS[interval]
-        if interval != "5m" and self._closed_cache_complete(
+        context = self._guard_generation()
+        cohort_id = context[2] if context is not None else None
+        if self._closed_cache_complete(
                 old, "date", step, cutoff.floor(step)-step,
-                min_rows=int(pd.Timedelta(days=15)/step)):
+                min_rows=int(pd.Timedelta(days=15)/step)) and (
+                interval != "5m" or (
+                    cohort_id is not None
+                    and not str(cohort_id).startswith("maintenance:")
+                    and _utc(old["first_received_at"].iloc[-1]) >= cutoff.floor(step)
+                )):
             # The closed data is already held. This creates no new receipt and
             # preserves its first-received time; freshness is candle based.
             return str(path)
@@ -619,9 +639,11 @@ class OnlineInputs:
         end = cutoff.floor(step) - pd.Timedelta(milliseconds=1)
         rows = []
         while start <= end:
+            needed_bars = int((end - start) // step) + 4
+            page_limit = min(1000, max(10, needed_bars))
             try:
                 payload, receipt = self._get(kind, {"symbol": symbol, "interval": interval,
-                    "startTime": _ms(start), "endTime": _ms(end), "limit": 1000})
+                    "startTime": _ms(start), "endTime": _ms(end), "limit": page_limit})
             except Exception:
                 # Preserve already received, validated pages when a later page
                 # fails. Snapshot still blocks on missing coverage/errors.
@@ -657,7 +679,7 @@ class OnlineInputs:
             if next_start <= start:
                 raise ValueError("Kline pagination stalled")
             start = next_start
-            if len(payload) < 1000:
+            if len(payload) < page_limit:
                 break
         new = pd.DataFrame(rows)
         if not new.empty:
@@ -690,8 +712,9 @@ class OnlineInputs:
                  else pd.Timestamp(old.date.max()) - pd.Timedelta(days=2))
         rows = []
         while start <= cutoff:
+            page_limit = 1000 if old.empty else 30
             payload, receipt = self._get("funding", {"symbol": symbol, "startTime": _ms(start),
-                                                "endTime": _ms(cutoff), "limit": 1000})
+                                                "endTime": _ms(cutoff), "limit": page_limit})
             self._checked(f"{symbol}:funding", receipt)
             if not isinstance(payload, list):
                 raise ValueError("Invalid funding response")
@@ -710,7 +733,7 @@ class OnlineInputs:
             if following <= start:
                 raise ValueError("Funding pagination stalled")
             start = following
-            if len(payload) < 1000:
+            if len(payload) < page_limit:
                 break
         merged = _merge(old, pd.DataFrame(rows), ["date"])
         if merged.empty:
@@ -882,10 +905,10 @@ class OnlineInputs:
                                getattr(self, "_cached_clock_identity", None) == context[4:])
             jobs = [] if cached_clock_ok else [("clock", self._check_clock, ())]
             if not auxiliary:
-                jobs += [(f"futures:{s}:5m", self._candles, ("futures", s, "5m", cutoff)) for s in SYMBOLS]
-            jobs += [(f"{k}:{s}:1h", self._candles, (k, s, "1h", cutoff)) for s in SYMBOLS for k in ("futures", "mark")]
+                jobs += [(f"futures:{s}:5m", self._candles, ("futures", s, "5m", cutoff)) for s in self.symbols]
+            jobs += [(f"{k}:{s}:1h", self._candles, (k, s, "1h", cutoff)) for s in self.symbols for k in ("futures", "mark")]
             jobs += [(f"{k}:{s}:4h", self._candles, (k, s, "4h", cutoff)) for s in BASIS_SYMBOLS for k in ("futures", "spot")]
-            jobs += [(s, self._funding, (s, cutoff)) for s in SYMBOLS]
+            jobs += [(s, self._funding, (s, cutoff)) for s in self.symbols]
             jobs += [("dvol", self._dvol, (cutoff,))]
 
             def execute(job_list):
@@ -907,7 +930,8 @@ class OnlineInputs:
             if not cached_clock_ok:
                 clock = results.get("clock", {"status": "UNAVAILABLE"})
             _remaining(deadline_monotonic)
-            self._cached_clock = clock if auxiliary else None
+            self._cached_clock = (clock if (auxiliary or cohort_id is not None)
+                                  and isinstance(clock, dict) and clock.get("status") == "VERIFIED" else None)
             self._cached_clock_identity = context[4:]
             if auxiliary:
                 return {"status": "AUXILIARY_PREFETCH_COMPLETE" if not errors else "BLOCKED",
@@ -957,7 +981,7 @@ class OnlineInputs:
         return self._batch(now, deadline_monotonic, cohort_id, auxiliary=True)
 
     def _source_specs(self):
-        for symbol in SYMBOLS:
+        for symbol in self.symbols:
             for kind, interval in (("futures", "5m"), ("futures", "1h"), ("mark", "1h")):
                 yield f"{symbol}:{kind}:{interval}", self._path(kind, symbol, interval), "date", STEPS[interval], None
             yield f"{symbol}:funding", self._path("funding", symbol), "date", None, None
@@ -1064,14 +1088,14 @@ class OnlineInputs:
                     "clock_evidence_sha256": self.clock_evidence_sha256,
                     "requested_cutoff": self.state.get("requested_cutoff"),
                     "refresh_completed_at": self.state.get("refresh_completed_at"),
-                    "latest_closed_5m": _iso(min(latest5)) if len(latest5) == 4 else None,
+                    "latest_closed_5m": _iso(min(latest5)) if len(latest5) == len(self.symbols) else None,
                     "feature_available_at": _iso(max(available)) if available else None,
                     "clock": clock, "sources": sources, "gaps": gaps, "errors": errors}
 
     def mark_registry_evidence(self):
         """Evidence only. The caller registers these files before model use."""
         result = []
-        for symbol in SYMBOLS:
+        for symbol in self.symbols:
             path = self._path("mark", symbol, "1h")
             frame = self._read(path)
             if frame.empty:

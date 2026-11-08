@@ -7,7 +7,15 @@ if (Test-Path -LiteralPath (Join-Path $runtimePath 'maintenance_pause.json')) {
     return
 }
 $serverPath = Join-Path $PSScriptRoot 'argon4_forward_server.py'
-$pythonPath = Join-Path $workspacePath '.venv\Scripts\python.exe'
+$pythonPath = if (Test-Path -LiteralPath 'C:\Users\liuqi\anaconda3\envs\min_env\python.exe') {
+    'C:\Users\liuqi\anaconda3\envs\min_env\python.exe'
+} else {
+    Join-Path $workspacePath '.venv\Scripts\python.exe'
+}
+$sitePackages = Join-Path $workspacePath '.venv\Lib\site-packages'
+if (Test-Path -LiteralPath $sitePackages) {
+    $env:PYTHONPATH = if ($env:PYTHONPATH) { "$sitePackages;$env:PYTHONPATH" } else { $sitePackages }
+}
 $paperPolicy = Get-Content -LiteralPath (Join-Path $workspacePath 'config\argon4_forward_policy.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 New-Item -ItemType Directory -Path $runtimePath -Force | Out-Null
 $panelStatus = $null
@@ -28,12 +36,24 @@ if (-not $panelStatus -and -not $existingService) {
     # race if two launchers start between this probe and Start-Process.
     $portProbe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 8897)
     try { $portProbe.Start() } catch { throw 'Port 8897 is occupied; refusing a second paper process.' } finally { $portProbe.Stop() }
-    $processArgs = @('-B', '-u', ('"' + $serverPath + '"'), '--port', '8897')
-    if ($paperPolicy.paper_trading_active -eq $true) { $processArgs += '--enable-paper' }
-    Start-Process -FilePath $pythonPath -ArgumentList $processArgs -WorkingDirectory $workspacePath -WindowStyle Hidden -RedirectStandardOutput (Join-Path $runtimePath 'server.stdout.log') -RedirectStandardError (Join-Path $runtimePath 'server.stderr.log') | Out-Null
+    $stdoutLog = Join-Path $runtimePath 'server.stdout.log'
+    $stderrLog = Join-Path $runtimePath 'server.stderr.log'
+    $paperFlag = if ($paperPolicy.paper_trading_active -eq $true) { ' --enable-paper' } else { '' }
+    $cmdLine = "cmd.exe /c `"`"$pythonPath`" -B -u `"$serverPath`" --port 8897$paperFlag 1>`"$stdoutLog`" 2>`"$stderrLog`"`""
+    $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+    $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine = $cmdLine
+        CurrentDirectory = $workspacePath
+        ProcessStartupInformation = $startup
+    }
+    if ($created.ReturnValue -ne 0) {
+        $processArgs = @('-B', '-u', ('"' + $serverPath + '"'), '--port', '8897')
+        if ($paperPolicy.paper_trading_active -eq $true) { $processArgs += '--enable-paper' }
+        Start-Process -FilePath $pythonPath -ArgumentList $processArgs -WorkingDirectory $workspacePath -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog | Out-Null
+    }
 }
 $ready = $false
-for ($attempt = 0; $attempt -lt 30; $attempt++) {
+for ($attempt = 0; $attempt -lt 60; $attempt++) {
     try {
         $panelStatus = Invoke-RestMethod -Uri 'http://127.0.0.1:8897/api/status' -TimeoutSec 2
         if ($panelStatus.strategy -eq 'ARGON4_SEVEN_STREAM_PRIORITY_WATERFALL' -and $panelStatus.live_enabled -eq $false) { $ready = $true; break }

@@ -33,13 +33,14 @@ def _identity(path):
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
-def required_paths(data_root):
+def required_paths(data_root, symbols=None):
     root = Path(data_root).resolve()
+    coins = tuple(symbols or reference.SYMBOLS)
     paths = []
-    for coin in reference.SYMBOLS:
+    for coin in coins:
         old = root / "intraday" / f"{coin}_5m_futures_2023_2026.parquet"
         paths.append(old if old.exists() else root / "intraday" / f"{coin}_5m_futures.parquet")
-    for coin in reference.SYMBOLS:
+    for coin in coins:
         paths.extend(root / "auxiliary" / name for name in (
             f"{coin}_8h_funding.parquet", f"{coin}_1h_mark.parquet", f"{coin}_1h_futures.parquet"))
     paths.extend(root / "auxiliary" / name for name in
@@ -116,11 +117,14 @@ class FeatureSnapshot:
     rejects concurrent replacement; after capture it uses the captured bytes,
     even if the next observation is subsequently published on disk.
     """
-    def __init__(self, data_root, *, as_of, expected_sources=None):
+    def __init__(self, data_root, *, as_of, expected_sources=None, symbols=None):
         self._root = Path(data_root).resolve()
         self._cutoff = reference._timestamp(as_of)
         if not self.root.is_relative_to(reference.ROOT):
             raise reference.ModelInputError("unsupported local feature source or symbol")
+        if symbols is None and isinstance(expected_sources, dict) and any(str(k).startswith("XRPUSDT:") for k in expected_sources):
+            symbols = (*reference.SYMBOLS, "XRPUSDT")
+        self._symbols = tuple(symbols or reference.SYMBOLS)
         self._lock = threading.RLock()
         self._closed = False
         self._raw, self._validated = {}, {}
@@ -135,7 +139,7 @@ class FeatureSnapshot:
                         raise reference.ModelInputError("inconsistent expected source hashes")
                     expected[path] = entry["sha256"]
         identities = {}
-        for path in required_paths(self.root):
+        for path in required_paths(self.root, symbols=self._symbols):
             path = path.resolve()
             if not path.is_relative_to(self.root) or path.suffix != ".parquet":
                 raise reference.ModelInputError("only explicit local parquet sources are accepted")
@@ -254,7 +258,7 @@ class FeatureSnapshot:
             return frame, availability, fingerprint
 
     def build(self, symbol="BTCUSDT", *, tail_rows=1):
-        if symbol not in reference.SYMBOLS:
+        if symbol not in self._symbols:
             raise reference.ModelInputError("unsupported local feature source or symbol")
         if self._closed:
             raise reference.ModelInputError("feature snapshot already closed")
@@ -267,7 +271,11 @@ class FeatureSnapshot:
             fingerprints[str(p.relative_to(reference.ROOT))] = fingerprint
             return frame
 
-        for p in tuple(self._raw)[:len(reference.SYMBOLS)]:
+        intraday_paths = tuple(self._raw)[:len(self._symbols)]
+        target_paths = intraday_paths[:len(reference.SYMBOLS)]
+        if symbol not in reference.SYMBOLS:
+            target_paths = (*target_paths, next(p for p in intraday_paths if p.name.startswith(symbol + "_")))
+        for p in target_paths:
             coin = p.name.split("_")[0]
             frames[coin] = reader(p)
         idx = frames[symbol].index
@@ -277,9 +285,11 @@ class FeatureSnapshot:
         if not pd.Timedelta(0) <= self.cutoff - effective_close <= pd.Timedelta(minutes=5):
             raise reference.ModelInputError("latest observed closed candle is stale")
         with _fresh_modules(self._codes, reader, self.root) as (base_module, expert_module):
+            if symbol not in getattr(base_module, "CORE_SYMBOLS", reference.SYMBOLS):
+                base_module.CORE_SYMBOLS = (*reference.SYMBOLS, symbol)
             bundle = base_module.build_clean_room_bundle(symbol)
             base = pd.concat([bundle["features"], bundle["spec_features"]], axis=1).astype(np.float32)
-            ofi = sum((2 * frame.taker_buy_quote_volume - frame.quote_volume) / (frame.quote_volume + 1e-12) for frame in frames.values()) / 4
+            ofi = sum((2 * frame.taker_buy_quote_volume - frame.quote_volume) / (frame.quote_volume + 1e-12) for frame in tuple(frames.values())[:4]) / 4
             expert = expert_module.build_coin_own_structural_and_v4_mag_gap(frames[symbol], frames["BTCUSDT"], ofi)
         if base.shape[1] != 311 or expert.shape[1] != 65 or not base.index.equals(expert.index):
             raise reference.ModelInputError("unexpected verified feature schema")

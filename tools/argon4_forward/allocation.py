@@ -27,6 +27,7 @@ from .stage import DISABLED, StageRejected, stage_profile
 
 
 STREAMS = {"BTC_15m", "ETH_15m", "BTC_5m", "ETH_5m", "SOL_15m", "SOL_5m", "BNB_15m"}
+ALL_STREAMS = {*STREAMS, "XRP_15m"}
 ATOM = Decimal("0.000001")
 ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1 = "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1"
 PRICE_LIMIT = Decimal(".515")
@@ -158,8 +159,10 @@ def plan_waterfall(policy, candidates, equity, cash, open_risk, now, day_pnl=0,
         block("POLICY_NOT_CONFIRMED", "Ranking policy has not been explicitly confirmed")
         return result
     order = policy.get("order")
-    if (not isinstance(order, (tuple, list)) or len(order) != 7
-            or any(not isinstance(s, str) for s in order) or set(order) != STREAMS
+    valid_streams = STREAMS if isinstance(order, (tuple, list)) and len(order) == 7 else (
+        ALL_STREAMS if isinstance(order, (tuple, list)) and len(order) == 8 else None)
+    if (valid_streams is None
+            or any(not isinstance(s, str) for s in order) or set(order) != valid_streams
             or not isinstance(policy.get("ranking_source"), str) or not policy["ranking_source"].strip()
             or not isinstance(policy.get("version"), str) or not policy["version"].strip()):
         block("INVALID_RANKING_POLICY", "A versioned complete ranking and its source are required")
@@ -232,7 +235,7 @@ def plan_waterfall(policy, candidates, equity, cash, open_risk, now, day_pnl=0,
             raise ValueError("invalid candidates")
         for candidate in entries:
             name = candidate.get("stream")
-            if name not in STREAMS or name in by_stream:
+            if name not in valid_streams or name in by_stream:
                 raise ValueError("duplicate or unknown candidate")
             by_stream[name] = candidate
     except (ValueError, TypeError, AttributeError):

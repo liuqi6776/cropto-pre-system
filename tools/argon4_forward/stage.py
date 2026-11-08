@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 
 STREAMS = frozenset(("BTC_15m", "ETH_5m", "ETH_15m", "SOL_15m", "SOL_5m", "BTC_5m", "BNB_15m"))
+ALL_STREAMS = frozenset((*STREAMS, "XRP_15m"))
 SEMANTICS = "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1"
 DISABLED = "DISABLED_BY_STAGE"
 
@@ -43,8 +44,10 @@ def stage_profile(policy, cohort=None):
         return {"configured": False, "id": None, "status": "ALL_STREAMS",
                 "enabled_streams": list(order), "disabled_streams": [],
                 "effective_from": None, "live_enabled": False}
-    if (not isinstance(order, list) or len(order) != 7 or any(not isinstance(s, str) for s in order)
-            or set(order) != STREAMS or policy.get("status") != "CONFIRMED"
+    valid_streams = STREAMS if isinstance(order, list) and len(order) == 7 else (
+        ALL_STREAMS if isinstance(order, list) and len(order) == 8 else None)
+    if (valid_streams is None or any(not isinstance(s, str) for s in order)
+            or set(order) != valid_streams or policy.get("status") != "CONFIRMED"
             or policy.get("waterfall_semantics") != SEMANTICS):
         raise StageRejected("stage requires a confirmed complete eligible-budget ranking")
     if (not isinstance(spec, Mapping) or set(spec) != {"id", "status", "enabled_streams", "effective_from"}
@@ -53,7 +56,7 @@ def stage_profile(policy, cohort=None):
         raise StageRejected("stage requires a complete confirmed specification")
     enabled = spec["enabled_streams"]
     if (not isinstance(enabled, list) or not enabled or any(not isinstance(s, str) for s in enabled)
-            or len(set(enabled)) != len(enabled) or not set(enabled) <= STREAMS
+            or len(set(enabled)) != len(enabled) or not set(enabled) <= valid_streams
             or enabled != [s for s in order if s in enabled]):
         raise StageRejected("stage allowlist must be unique and follow the confirmed ranking")
     effective = _utc(spec["effective_from"])

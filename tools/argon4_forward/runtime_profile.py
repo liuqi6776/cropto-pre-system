@@ -22,12 +22,17 @@ V12_ENGINEERING = {
 }
 
 AGED_REVISION_PROFILE = "argon4-aged-revision-v13"
+V14_AGED_REVISION_PROFILE = "argon4-aged-revision-v14"
 AGED_REVISION_FASTPATH = {
     "profile": AGED_REVISION_PROFILE,
     "enabled": True,
     "minimum_bar_age_seconds": 300,
     "minimum_receipt_spacing_seconds": 2.0,
     "same_cohort_before_prediction_only": True,
+}
+V14_AGED_REVISION_FASTPATH = {
+    **AGED_REVISION_FASTPATH,
+    "profile": V14_AGED_REVISION_PROFILE,
 }
 
 
@@ -42,7 +47,9 @@ def revision_fastpath_profile(policy):
     if not isinstance(value, dict) or set(value) != set(AGED_REVISION_FASTPATH):
         raise ValueError("invalid aged revision profile")
     for key, expected in AGED_REVISION_FASTPATH.items():
-        if isinstance(expected, bool):
+        if key == "profile":
+            valid = value[key] in (AGED_REVISION_PROFILE, V14_AGED_REVISION_PROFILE)
+        elif isinstance(expected, bool):
             valid = type(value[key]) is bool and value[key] is expected
         else:
             valid = not isinstance(value[key], bool) and value[key] == expected

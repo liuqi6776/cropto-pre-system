@@ -18,7 +18,7 @@ import threading
 import time
 
 from .clock_sync import calibrated_now, project_local, utc
-from .polymarket import STREAMS, validate_book
+from .polymarket import ALL_STREAMS, STREAMS, validate_book
 from .polymarket_transport import PublicPolymarketTransport, SOURCE, public_url
 from .stage import stage_profile
 
@@ -198,7 +198,11 @@ class BookTelemetry:
         lower = calibrated_now(clock, upper=False)
         upper = calibrated_now(clock, upper=True)
         uncertainty = float(clock["uncertainty_seconds"])
-        if (not 0 <= uncertainty <= .5 or upper < lower
+        borderline_completed = (isinstance(clock.get("borderline_retry"), dict)
+                                and clock["borderline_retry"].get("status") == "COMPLETED"
+                                and len(clock.get("receipts", ())) == 8)
+        max_uncertainty = .6 if borderline_completed else .5
+        if (not 0 <= uncertainty <= max_uncertainty or upper < lower
                 or clock.get("source") != "POLYMARKET_CLOB_SERVER_TIME"
                 or not re.fullmatch(r"[0-9a-fA-F]{64}", str(clock.get("receipt_sha256", "")))):
             raise ValueError("clock uncertainty invalid")
@@ -209,7 +213,7 @@ class BookTelemetry:
         profile = stage_profile(policy, cohort)
         policy_hash = hashlib.sha256(_json(policy).encode()).hexdigest()
         for stream in profile["enabled_streams"]:
-            if stream not in STREAMS or int(cohort.timestamp()) % STREAMS[stream][1]:
+            if stream not in ALL_STREAMS or int(cohort.timestamp()) % ALL_STREAMS[stream][1]:
                 continue
             for offset in OFFSETS:
                 for outcome in ("UP", "DOWN"):
@@ -521,7 +525,7 @@ class BookTelemetry:
         seen_at = _iso(observed_at or datetime.now(timezone.utc))
         with self._db_lock, self._connection() as db:
             for stream, decision in decisions.items():
-                if stream not in STREAMS or not isinstance(decision, dict):
+                if stream not in ALL_STREAMS or not isinstance(decision, dict):
                     continue
                 prediction = decision.get("prediction")
                 if prediction and (not prediction.get("feature_bar_open") or not prediction.get("decision_time")

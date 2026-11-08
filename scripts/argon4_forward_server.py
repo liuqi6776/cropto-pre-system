@@ -16,6 +16,9 @@ import threading
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
+_VENV_SITE = ROOT / ".venv/Lib/site-packages"
+if _VENV_SITE.is_dir() and str(_VENV_SITE) not in sys.path:
+    sys.path.insert(0, str(_VENV_SITE))
 sys.path.insert(0, str(ROOT))
 from tools.argon4_forward.account import Account
 from tools.argon4_forward.monitor import ObservationStore, collect_reference_snapshot, utcnow
@@ -48,6 +51,8 @@ class Application:
         self.runtime = Path(runtime)
         self.account = Account(self.runtime / "account.sqlite3", initial_capital=capital, currency="USD")
         self.observations = ObservationStore(self.runtime / "observations.sqlite3")
+        from tools.argon4_forward.monitor_logger import MonitorAuditLogger
+        self.monitor_log = MonitorAuditLogger(self.runtime)
         self.stop = threading.Event()
         self.started_at = utcnow()
         self.last_cycle = None
@@ -58,7 +63,7 @@ class Application:
         self.telemetry = None
         if enable_paper:
             from tools.argon4_forward.pipeline import ForwardPipeline
-            self.pipeline = ForwardPipeline(self.account, self.runtime, self.observations)
+            self.pipeline = ForwardPipeline(self.account, self.runtime, self.observations, monitor_log=self.monitor_log)
             policy_provider = lambda: load_json(ROOT / "config/argon4_forward_policy.json", {})
             if engineering_profile(policy_provider())["book_telemetry"]:
                 from tools.argon4_forward.book_telemetry import BookTelemetry
@@ -112,6 +117,7 @@ class Application:
                 "pipeline": pipeline,
                 "engineering": engineering,
                 "book_telemetry": self.telemetry.status() if self.telemetry else {"status": "DISABLED"},
+                "monitor_audit": self.monitor_log.summary(),
                 "backtest": load_json(ROOT / "reports/argon4_local_v4_20261106/summary.json", {}),
                 "streams": [{"stream": s, "status": DISABLED if s in stage["disabled_streams"] else "LOCAL_MODEL_LOADED" if s in models else "WAITING_FOR_MODEL",
                              "stage_enabled": s in stage["enabled_streams"], "model": models.get(s)} for s in allocation.get("order", STREAMS)],
@@ -126,6 +132,7 @@ class Application:
                                 "盘口观察不证明挂单成交；模拟结算须来自平台官方结果", "本机运行时采集，关机或休眠期间不补造观测"]}
 
     def cycle(self):
+        self.monitor_log.heartbeat("market_observer")
         try:
             backoff = binance_backoff(self.runtime)
             if backoff:
@@ -136,12 +143,19 @@ class Application:
                 # reference quotes; Polymarket executable books remain separate.
                 reference = {"status": "MODEL_INPUT_FEED_ONLY", "quotes": [], "observed_at": utcnow()}
             else:
-                reference = collect_reference_snapshot()
+                with self.monitor_log.phase("market_observer", "collect_reference_snapshot", slow_warn_seconds=12.0):
+                    reference = collect_reference_snapshot()
             self.observations.save("reference", reference)
             try:
-                from tools.argon4_forward.polymarket import collect_market_snapshot
-                markets = collect_market_snapshot(transport=self.market_transport)
+                from tools.argon4_forward.polymarket import ALL_STREAMS, STREAMS as PM_STREAMS, collect_market_snapshot
+                policy_order = load_json(ROOT / "config/argon4_forward_policy.json", {}).get("order", ())
+                target_streams = ALL_STREAMS if "XRP_15m" in policy_order else PM_STREAMS
+                with self.monitor_log.phase("market_observer", "collect_market_snapshot", slow_warn_seconds=15.0):
+                    markets = collect_market_snapshot(streams=target_streams, transport=self.market_transport)
             except Exception as exc:
+                self.monitor_log.record("WARN", "MARKET_SNAPSHOT_FAILED",
+                    f"Polymarket盘口采集失败: {type(exc).__name__}: {exc}",
+                    error_type=type(exc).__name__, error=str(exc)[:200])
                 markets = {"status": "UNAVAILABLE", "observed_at": utcnow(), "streams": {},
                            "errors": [type(exc).__name__]}
             self.observations.save("polymarket", markets)
@@ -151,13 +165,18 @@ class Application:
                 self.account.heartbeat("WAITING_FOR_MODEL", BLOCKERS[0]["message"], details={"last_observation": self.last_cycle})
         except Exception as exc:
             self.last_error = type(exc).__name__
+            self.monitor_log.record("ERROR", "OBSERVER_CYCLE_ERROR",
+                f"监控主循环异常: {type(exc).__name__}: {exc}",
+                error_type=type(exc).__name__, error=str(exc)[:200])
 
     def worker(self, interval):
+        self.monitor_log.start_watchdog()
         try:
             while not self.stop.is_set():
                 self.cycle()
                 self.stop.wait(interval)
         finally:
+            self.monitor_log.close()
             self.market_transport.close()
 
 
@@ -245,6 +264,14 @@ def main():
     server.RequestHandlerClass = handler_for(app, args.port)
     (runtime / "service.json").write_text(json.dumps({"pid": os.getpid(), "started_at": app.started_at,
         "url": f"http://127.0.0.1:{args.port}", "mode": "LOCAL_MODEL_PAPER" if args.enable_paper else "OBSERVING_ONLY", "live_enabled": False}), encoding="utf-8")
+    app.monitor_log.record(
+        "INFO",
+        "SERVICE_STARTED",
+        f"ARGON-4 本地监控与模拟服务已启动: http://127.0.0.1:{args.port} (mode={'LOCAL_MODEL_PAPER' if args.enable_paper else 'OBSERVING_ONLY'})",
+        pid=os.getpid(),
+        port=args.port,
+        enable_paper=bool(args.enable_paper),
+    )
     worker = threading.Thread(target=app.worker, args=(args.interval,), daemon=True)
     worker.start()
     pipeline_worker = None

@@ -51,6 +51,7 @@ research_dependencies/
 !/research/argon4_local_v4_20261106/**/README.md
 /research/argon4_gen4_candidate_20261106/
 /research/argon4_gen4_sparse_candidate_20261106/
+/research/argon4_research11_20261107/
 /reports/**
 !/reports/**/
 !/reports/**/*.py

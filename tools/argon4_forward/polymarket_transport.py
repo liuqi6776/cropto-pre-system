@@ -38,7 +38,7 @@ def public_url(kind, value=None):
         raise ValueError("endpoint is not allowed")
     value = str(value)
     if kind == "market":
-        if not re.fullmatch(r"(?:btc|eth|sol|bnb)-updown-(?:5|15)m-[0-9]{10}", value):
+        if not re.fullmatch(r"(?:btc|eth|sol|bnb|xrp)-updown-(?:5|15)m-[0-9]{10}", value):
             raise ValueError("invalid market lookup")
     elif not re.fullmatch(r"[1-9][0-9]{0,77}", value):
         raise ValueError("invalid outcome identifier")

@@ -21,8 +21,19 @@ from .runtime_profile import (engineering_profile, minimum_decision_delay, V12_P
 
 ROOT = Path(__file__).resolve().parents[2]
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT")
+ALL_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
 _MARK_REGISTRY_LOCK = threading.RLock()
 _MARK_REGISTRY_CACHE = {}
+
+
+def _policy_symbols(policy, profile=None):
+    if not isinstance(policy, dict):
+        return SYMBOLS
+    disabled = set((profile or {}).get("disabled_streams", ()))
+    active_streams = [s for s in policy.get("order", ()) if s not in disabled]
+    if any(str(s).startswith("XRP_") for s in active_streams):
+        return (*SYMBOLS, "XRPUSDT")
+    return SYMBOLS
 
 
 def save_json(path, value):
@@ -54,7 +65,7 @@ def _register_online_marks(data_root):
         raise ValueError("online mark registry scope mismatch")
     path = ROOT / "archive/catalog/mark_candle_registry.json"
     registry_raw = path.read_bytes()
-    originals = {symbol: (root / "auxiliary" / f"{symbol}_1h_mark.parquet") for symbol in SYMBOLS}
+    originals = {symbol: (root / "auxiliary" / f"{symbol}_1h_mark.parquet") for symbol in ALL_SYMBOLS}
     raw_sources = {symbol: target.read_bytes() for symbol, target in originals.items() if target.exists()}
     source_hashes = tuple((symbol, hashlib.sha256(raw).hexdigest()) for symbol, raw in raw_sources.items())
     identity = (hashlib.sha256(registry_raw).hexdigest(), source_hashes)
@@ -64,7 +75,7 @@ def _register_online_marks(data_root):
         return {"status": "UNCHANGED_VERIFIED", "source_count": len(raw_sources)}
     registry = json.loads(registry_raw)
     refs = []
-    for symbol in SYMBOLS:
+    for symbol in ALL_SYMBOLS:
         target = originals[symbol]
         if symbol not in raw_sources:
             continue
@@ -106,8 +117,11 @@ def _register_online_marks(data_root):
 
 
 class ForwardPipeline:
-    def __init__(self, account, runtime, observations):
+    def __init__(self, account, runtime, observations, monitor_log=None):
         self.account, self.runtime, self.observations = account, Path(runtime), observations
+        from .monitor_logger import MonitorAuditLogger
+        self.monitor_log = monitor_log or MonitorAuditLogger(self.runtime)
+        self._last_logged_block_key = None
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.state = {"status": "PREPARING", "active": False, "models": {}, "decisions": {},
@@ -168,7 +182,8 @@ class ForwardPipeline:
         self.account.heartbeat(state["status"], state.get("reason"), details={"pipeline": state["status"]})
 
     def load_ready(self):
-        from .model import STREAMS, load_model_bundle
+        from .model import STREAMS
+        from .model_v14 import ALL_STREAMS, load_model_bundle_v14 as load_model_bundle
         policy = json.loads((ROOT / "config/argon4_forward_policy.json").read_text(encoding="utf-8"))
         if not policy.get("paper_trading_active") or policy.get("ranking_model_scope") != "LOCAL_SELF_TRAINED_OOS":
             self.abandon_prepared("PAPER_DISABLED")
@@ -177,8 +192,10 @@ class ForwardPipeline:
         profile = stage_profile(policy)
         with self.lock:
             self.state["stage"] = profile
-        for stream in STREAMS:
-            # The seven saved artifacts and policy pins remain untouched. A
+        order = policy.get("order")
+        target_streams = order if isinstance(order, list) and set(order) <= set(ALL_STREAMS) else STREAMS
+        for stream in target_streams:
+            # The saved artifacts and policy pins remain untouched. A
             # disabled stream need not load or validate a model for new work.
             if stream in profile["disabled_streams"]:
                 continue
@@ -222,6 +239,8 @@ class ForwardPipeline:
                         budget = max(.1, until-.25)
                 kwargs = {"retry_borderline": extra_allowed,
                           "budget_monotonic": time.monotonic()+budget}
+                if extra_allowed and self._revision_fastpath.get("profile") == "argon4-aged-revision-v14":
+                    kwargs["borderline_max_uncertainty_seconds"] = .6
             self.clock = calibrate(transport=self.public_transport, **kwargs)
             self.clock["refresh_reason"] = reason
             self.observations.save("execution_clock", self.clock)
@@ -240,8 +259,8 @@ class ForwardPipeline:
 
     def refresh_market(self, stream, boundary, existing=None):
         """One exact public lookup only when the executor reaches a signal."""
-        from .polymarket import STREAMS, _get_public, validate_market
-        asset, duration, _ = STREAMS[stream]
+        from .polymarket import ALL_STREAMS, _get_public, validate_market
+        asset, duration, _ = ALL_STREAMS[stream]
         now = calibrated_now(self.clock)
         if not boundary <= now < boundary + timedelta(seconds=20):
             raise ValueError("market refresh outside decision window")
@@ -356,10 +375,17 @@ class ForwardPipeline:
         if not self._revision_fastpath.get("enabled"):
             return inputs, None
         errors = inputs.get("errors", [])
+        allow_hourly = self._revision_fastpath.get("profile") == "argon4-aged-revision-v14"
+        def _supported_fast_source(source):
+            text = str(source or "")
+            if text.startswith("futures:") and text.endswith(":5m"):
+                return True
+            if allow_hourly and (text.startswith("futures:") or text.startswith("mark:")) and text.endswith(":1h"):
+                return True
+            return False
         if not errors or any(e.get("error") not in (
                 "CONFLICTING_CLOSED_OBSERVATION", "ValueError:CONFLICTING_CLOSED_OBSERVATION")
-                or not str(e.get("source", "")).startswith("futures:")
-                or not str(e.get("source", "")).endswith(":5m") for e in errors):
+                or not _supported_fast_source(e.get("source")) for e in errors):
             return inputs, None
         deadline = cohort+timedelta(seconds=engineering["input_deadline_after_boundary_seconds"])
         clock = dict(self.clock)
@@ -379,9 +405,11 @@ class ForwardPipeline:
                 try:
                     if any(not f.done() for f in getattr(self.inputs, "_outstanding", ())):
                         raise ValueError("REVISION_INPUT_WORKERS_BUSY")
+                    extra_kwargs = ({"mark_registry_path": ROOT / "archive/catalog/mark_candle_registry.json"}
+                                    if any(str(e.get("source", "")).startswith("mark:") for e in inputs["errors"]) else {})
                     revision = reconcile_confirmed_price_revisions(self.runtime, inputs["errors"],
                         now=lambda: calibrated_now(clock), cutover_now=lambda: calibrated_now(clock),
-                        fast_context=context, cohort_guard=guard)
+                        fast_context=context, cohort_guard=guard, **extra_kwargs)
                 finally:
                     self.inputs._lock.release()
                 self.observations.save("input_revision_reconciliation", revision)
@@ -456,7 +484,7 @@ class ForwardPipeline:
                          reason="等待下一个实时决策窗口；不补发历史订单")
 
     def prepare_decisions(self, policy, inputs, cohort):
-        from .model import build_feature_frames, predict_stream
+        from .model_v14 import build_feature_frames_v14 as build_feature_frames, predict_stream_v14 as predict_stream
         profile = stage_profile(policy, cohort)
         now_lower = calibrated_now(self.clock, upper=False)
         now_upper = calibrated_now(self.clock)
@@ -519,7 +547,12 @@ class ForwardPipeline:
             if f["base"].index[-1].to_pydatetime() + timedelta(minutes=5) != cohort:
                 raise ValueError("closed feature row does not match decision cohort")
             started = time.perf_counter()
-            score = predict_stream(stream, f["base"], f["expert"], calibrated_now(self.clock), bundle=self.bundles[stream])
+            threshold_override = (policy.get("stream_thresholds", {}).get(stream)
+                                  if isinstance(policy.get("stream_thresholds"), dict) else None)
+            score_kwargs = {"bundle": self.bundles[stream]}
+            if threshold_override is not None:
+                score_kwargs["threshold_override"] = threshold_override
+            score = predict_stream(stream, f["base"], f["expert"], calibrated_now(self.clock), **score_kwargs)
             self._decision_timing["inference_seconds"][stream] = time.perf_counter()-started
             if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
                 raise ValueError("missed feature decision window")
@@ -534,6 +567,14 @@ class ForwardPipeline:
                           "decision_at": decision_time.isoformat(), "valid_until": (cohort+timedelta(seconds=20)).isoformat(),
                           "window_start": cohort.isoformat(), "window_end": (cohort+timedelta(seconds=duration)).isoformat()}
                 decisions[stream].update(status="SIGNAL", signal=signal)
+                exec_cfg = policy.get("execution")
+                if isinstance(exec_cfg, dict) and exec_cfg.get("high_confidence_max_buy_price") is not None:
+                    q97_map = policy.get("high_confidence_thresholds")
+                    q97_th = (float(q97_map[stream]) if isinstance(q97_map, dict) and stream in q97_map
+                              else float(score.get("threshold_frozen", 0)) * 1.25)
+                    if q97_th > 0 and abs(float(score.get("z_v4", 0))) >= q97_th:
+                        decisions[stream]["high_confidence"] = True
+                        decisions[stream]["limit_price"] = float(exec_cfg["high_confidence_max_buy_price"])
         return decisions
 
     def set_input_clock(self, clock=None):
@@ -728,7 +769,7 @@ class ForwardPipeline:
         gaps = inputs.get("gaps") or []
         if inputs.get("errors") or not gaps or inputs.get("status") != "BLOCKED":
             return False
-        allowed = {f"{symbol}:futures:5m" for symbol in SYMBOLS}
+        allowed = {f"{symbol}:futures:5m" for symbol in ALL_SYMBOLS}
         for gap in gaps:
             if not isinstance(gap, dict) or gap.get("source") not in allowed or gap.get("error") != "LATEST_CLOSED_BAR_MISSING":
                 return False
@@ -810,6 +851,12 @@ class ForwardPipeline:
         self.observations.save("paper_execution_abandoned", {
             "cohort": pending["cohort"].isoformat(), "reason": reason, "result": outcome})
         timing = self.finish_timing(reason)
+        self.monitor_log.log_cohort_blocked(
+            pending["cohort"].isoformat(),
+            reason,
+            f"待重检或待执行状态中止: {reason}",
+            prior_fills_count=len(pending.get("fills") or []),
+        )
         with self.lock:
             self.state.update(execution=outcome, timing=timing)
 
@@ -826,10 +873,12 @@ class ForwardPipeline:
         """Reuse the exact score and clock within one live cohort; never rescore."""
         from .execution import PaperExecutor
         started = time.perf_counter()
-        outcome = PaperExecutor(self.account, policy).process_cohort(
-            cohort.isoformat(), decisions, self.observations.latest("polymarket"),
-            now=lambda: self.execution_now(clock), book_refresh=self.refresh_book,
-            clock=clock, market_refresh=self.refresh_market)
+        with self.monitor_log.phase("pipeline", "execute_priority_waterfall",
+                                    cohort=cohort.isoformat(), slow_warn_seconds=5.0):
+            outcome = PaperExecutor(self.account, policy).process_cohort(
+                cohort.isoformat(), decisions, self.observations.latest("polymarket"),
+                now=lambda: self.execution_now(clock), book_refresh=self.refresh_book,
+                clock=clock, market_refresh=self.refresh_market)
         self._pending_timing["execution_seconds"] = self._pending_timing.get("execution_seconds", 0)+time.perf_counter()-started
         self._pending_timing["execution_passes"] = self._pending_timing.get("execution_passes", 0)+1
         self._pending_timing.setdefault("first_execution_completed_after_boundary_seconds", (calibrated_now(clock)-cohort).total_seconds())
@@ -854,6 +903,7 @@ class ForwardPipeline:
         else:
             self._pending_execution = None
             timing = self.finish_timing(outcome.get("status", "COMPLETE"))
+        self.monitor_log.log_cohort_execution(cohort.isoformat(), policy, decisions, outcome, timing)
         self.publish(status="PAPER_WAITING_PRICE_RECHECK" if waiting else "PAPER_CYCLE_COMPLETE",
             active=True, reason="当前优先流价格未达限价，等待本窗口内重检；下层暂不占预算" if waiting else None,
             models=models, inputs=inputs, revision=None, decisions=decisions,
@@ -886,9 +936,16 @@ class ForwardPipeline:
             pending["cohort"], pending["decisions"], pending["clock"], pending["fills"])
         return True
 
+    def _log_block_once(self, key, cohort, code, reason, **extra):
+        if self._last_logged_block_key == key:
+            return
+        self._last_logged_block_key = key
+        self.monitor_log.log_cohort_blocked(cohort, code, reason, **extra)
+
     def cycle(self):
         from .online import OnlineInputs
         from .revisions import ensure_view_committed
+        self.monitor_log.heartbeat("pipeline")
         # Turning off new predictions or a model-pin failure must not freeze
         # previously recorded positions awaiting official final settlement.
         # Final official settlement is still required; move this read-only poll
@@ -896,7 +953,8 @@ class ForwardPipeline:
         # Each fetch checks this guard again; running GETs remain bounded by
         # their transport and entry still fails closed if scheduling is late.
         if not self._settlement_guard():
-            self.poll_settlements({})
+            with self.monitor_log.phase("pipeline", "poll_settlements", slow_warn_seconds=10.0):
+                self.poll_settlements({})
         policy = self.load_ready()
         if policy is None:
             self.abandon_prepared("PAPER_DISABLED")
@@ -907,6 +965,8 @@ class ForwardPipeline:
         models = {s: {"version": b["manifest"]["model_version"], "sha256": b["manifest"]["model_sha256"]} for s,b in self.bundles.items()}
         if (self.runtime / "verification_pause.json").is_file():
             self.abandon_prepared("VERIFICATION_PAUSE")
+            self._log_block_once(("VERIFICATION_PAUSE",), None, "VERIFICATION_PAUSE",
+                                 "完整检查期间暂停新预测与输入更新")
             self.publish(status="VERIFICATION_PAUSE", active=False, models=models,
                          reason="完整检查期间暂停新预测与输入更新；市场观察和已有仓位官方结算继续")
             return
@@ -917,6 +977,9 @@ class ForwardPipeline:
             until = datetime.fromisoformat(backoff["blocked_until_utc"].replace("Z", "+00:00"))
             if datetime.now(timezone.utc) < until:
                 self.abandon_prepared("PUBLIC_RATE_LIMIT_BACKOFF")
+                self._log_block_once(("PUBLIC_RATE_LIMIT_BACKOFF", backoff.get("blocked_until_utc")),
+                                     None, "PUBLIC_RATE_LIMIT_BACKOFF",
+                                     "公开行情限流暂停；等待供应商解除限制", backoff=backoff)
                 self.publish(status="PUBLIC_RATE_LIMIT_BACKOFF", active=False, models=models, backoff=backoff,
                              reason="公开行情限流暂停；本地模型已保存，等待供应商解除限制")
                 return
@@ -924,9 +987,14 @@ class ForwardPipeline:
             self.update_clock()
             effective = datetime.fromisoformat(revision_view["view_effective_at"].replace("Z", "+00:00"))
             next_window = cohort_at(effective) + timedelta(minutes=5)
-            if (cohort_at(calibrated_now(self.clock, upper=False)) < next_window
+            current_cohort = cohort_at(calibrated_now(self.clock, upper=False))
+            if (current_cohort < next_window
                     and not self._same_cohort_view_admitted(revision_view)):
                 self.abandon_prepared("REVISION_CUTOVER_WINDOW")
+                self._log_block_once(("REVISION_CUTOVER_WINDOW", current_cohort.isoformat(), revision_view.get("revision_id")),
+                                     current_cohort.isoformat(), "REVISION_CUTOVER_WINDOW",
+                                     "输入修订已归档并核验；切换完成所在窗口跳过",
+                                     revision_id=revision_view.get("revision_id"))
                 self.publish(status="REVISION_WAITING_FUTURE_WINDOW", active=False, models=models,
                              revision=revision_view, decisions={},
                              execution={"status": "NOT_EVALUATED", "fills": [], "blocked": ["REVISION_CUTOVER_WINDOW"]},
@@ -941,6 +1009,9 @@ class ForwardPipeline:
             # skewed host clock must not indefinitely prevent price-revision
             # maintenance. Never relabel old receipts or suppress diagnostics.
             collector_kwargs, refresh_kwargs = {}, {}
+            active_symbols = _policy_symbols(policy, stage_profile(policy))
+            if active_symbols != SYMBOLS:
+                collector_kwargs["symbols"] = active_symbols
             if self._revision_fastpath.get("enabled"):
                 self.update_clock()
                 warmup_clock = deepcopy(self.clock)
@@ -949,14 +1020,15 @@ class ForwardPipeline:
                                       warmup_clock["calibrated_monotonic"]+59)
                 if warmup_deadline <= time.monotonic():
                     raise ValueError("warmup clock budget exhausted")
-                collector_kwargs = {"clock": lambda: calibrated_now(warmup_clock),
-                    "time_basis": "CALIBRATED_UTC_UPPER_BOUND",
-                    "clock_evidence_sha256": warmup_clock["receipt_sha256"]}
+                collector_kwargs.update(clock=lambda: calibrated_now(warmup_clock),
+                    time_basis="CALIBRATED_UTC_UPPER_BOUND",
+                    clock_evidence_sha256=warmup_clock["receipt_sha256"])
                 refresh_kwargs = {"now": calibrated_now(warmup_clock, upper=False),
                                   "deadline_monotonic": warmup_deadline}
             collector = OnlineInputs(self.runtime, **collector_kwargs)
             try:
-                warmup = collector.refresh(**refresh_kwargs)
+                with self.monitor_log.phase("pipeline", "warmup_refresh", slow_warn_seconds=15.0):
+                    warmup = collector.refresh(**refresh_kwargs)
             finally:
                 close = getattr(collector, "close", None)
                 if close:
@@ -973,6 +1045,17 @@ class ForwardPipeline:
                     # the window it finishes in. Refresh again next window.
                     self.last_cohort = cohort_at(calibrated_now(warmup_clock))
             revision = self.reconcile_inputs(collector, warmup) if not self.warmup_complete else None
+            if not self.warmup_complete:
+                self.monitor_log.log_cohort_blocked(
+                    None, "PAPER_WARMUP", "热身阶段模型输入尚未就绪，热身阶段不下单",
+                    gaps=warmup.get("gaps"), errors=warmup.get("errors"),
+                )
+            else:
+                self.monitor_log.record(
+                    "INFO", "WARMUP_COMPLETED",
+                    f"模型输入热身核验完成，等待下一实时决策窗口 (当前窗口={self.last_cohort.isoformat() if self.last_cohort else 'N/A'} 跳过不补单)",
+                    active_symbols=list(active_symbols), status=warmup.get("status"),
+                )
             self.publish(status="PAPER_WARMUP", active=False, models=models, inputs=warmup,
                          revision=revision, decisions={},
                          reason="正在补齐并核验模型真实输入；观测冲突须重复确认并保留旧版本，热身阶段不下单")
@@ -982,6 +1065,9 @@ class ForwardPipeline:
         profile = stage_profile(policy)
         if profile["configured"] and cohort_at(now_lower) < datetime.fromisoformat(profile["effective_from"]):
             self.abandon_prepared("STAGE_WAITING_ACTIVATION")
+            self._log_block_once(("STAGE_WAITING_ACTIVATION", profile["effective_from"]),
+                                 cohort_at(now_lower).isoformat(), "STAGE_WAITING_ACTIVATION",
+                                 "新阶段等待指定的未来窗口启用", effective_from=profile["effective_from"])
             self.publish(status="STAGE_WAITING_ACTIVATION", active=False, models=models,
                          decisions={s: disabled_decision(profile) for s in profile["disabled_streams"]},
                          reason="新阶段等待指定的未来窗口启用；已有仓位继续按官方结果结算")
@@ -991,15 +1077,19 @@ class ForwardPipeline:
         spacing = policy.get("input_http_min_spacing_seconds", 1.0)
         if isinstance(spacing, bool) or not isinstance(spacing, (int, float)) or not math.isfinite(spacing) or not .25 <= spacing <= 1:
             raise ValueError("unsupported live public-input request spacing")
-        if self.inputs is not None and self._input_spacing != spacing:
+        active_symbols = _policy_symbols(policy, profile)
+        if self.inputs is not None and (self._input_spacing != spacing or getattr(self.inputs, "symbols", SYMBOLS) != active_symbols):
             close = getattr(self.inputs, "close", None)
             if close:
                 close()
             self.inputs = None
-        self.inputs = self.inputs or OnlineInputs(self.runtime, clock=lambda: calibrated_now(self.clock),
-                                                  time_basis="CALIBRATED_UTC_UPPER_BOUND",
-                                                  clock_evidence_sha256=self.clock["receipt_sha256"],
-                                                  http_min_spacing_seconds=spacing)
+        input_kwargs = {"clock": lambda: calibrated_now(self.clock),
+                        "time_basis": "CALIBRATED_UTC_UPPER_BOUND",
+                        "clock_evidence_sha256": self.clock["receipt_sha256"],
+                        "http_min_spacing_seconds": spacing}
+        if active_symbols != SYMBOLS:
+            input_kwargs["symbols"] = active_symbols
+        self.inputs = self.inputs or OnlineInputs(self.runtime, **input_kwargs)
         self._input_spacing = spacing
         cohort = cohort_at(now_lower)
         elapsed = (now_lower-cohort).total_seconds()
@@ -1018,10 +1108,14 @@ class ForwardPipeline:
             "started_at": calibrated_now(self.clock).isoformat(), "started_monotonic": time.perf_counter(),
             "http_min_spacing_seconds": spacing, "policy_version": policy["version"]}
         started = time.perf_counter()
-        inputs = self.refresh_decision_inputs(engineering, cohort, now_lower)
+        with self.monitor_log.phase("pipeline", "refresh_decision_inputs",
+                                    cohort=cohort.isoformat(), slow_warn_seconds=6.0):
+            inputs = self.refresh_decision_inputs(engineering, cohort, now_lower)
         revision = None
         if inputs.get("status") not in ("READY", "COMPLETE", "OBSERVED"):
-            inputs, revision = self.reconcile_current_cohort(policy, engineering, cohort, inputs)
+            with self.monitor_log.phase("pipeline", "reconcile_current_cohort",
+                                        cohort=cohort.isoformat(), slow_warn_seconds=6.0):
+                inputs, revision = self.reconcile_current_cohort(policy, engineering, cohort, inputs)
         self._pending_timing["input_refresh_seconds"] = time.perf_counter()-started
         self.observations.save("model_inputs", inputs)
         if inputs.get("status") not in ("READY", "COMPLETE", "OBSERVED"):
@@ -1042,18 +1136,32 @@ class ForwardPipeline:
                 repaired = self.reconcile_inputs(self.inputs, maintenance)
                 if repaired is not None:
                     revision = repaired
+            finished_timing = self.finish_timing("INPUTS_NOT_VALIDATED")
+            self.monitor_log.log_cohort_blocked(
+                cohort.isoformat(),
+                "INPUTS_NOT_VALIDATED",
+                "模型输入存在缺口或观测冲突，本轮跳过；已确认修订仅供未来窗口使用",
+                errors=inputs.get("errors"),
+                gaps=inputs.get("gaps"),
+                revision_status=(revision or {}).get("status"),
+                input_refresh_seconds=self._pending_timing.get("input_refresh_seconds") if self._pending_timing else None,
+            )
             self.publish(status="PAPER_DATA_BLOCKED", active=True, inputs=inputs, models=models,
                          revision=revision, decisions={}, last_attempt_cohort=cohort.isoformat(),
-                         timing=self.finish_timing("INPUTS_NOT_VALIDATED"),
+                         timing=finished_timing,
                          execution={"status": "NOT_EVALUATED", "fills": [], "blocked": ["INPUTS_NOT_VALIDATED"]},
                          reason="模型输入存在缺口或观测冲突，本轮跳过；已确认修订仅供未来窗口使用")
             return
         started = time.perf_counter()
-        registered = register_online_marks(inputs["data_root"])
+        with self.monitor_log.phase("pipeline", "register_online_marks",
+                                    cohort=cohort.isoformat(), slow_warn_seconds=3.0):
+            registered = register_online_marks(inputs["data_root"])
         self._pending_timing["mark_registration_seconds"] = time.perf_counter()-started
         self._pending_timing["mark_registration"] = registered
         started = time.perf_counter()
-        decisions = self.prepare_decisions(policy, inputs, cohort)
+        with self.monitor_log.phase("pipeline", "prepare_decisions",
+                                    cohort=cohort.isoformat(), slow_warn_seconds=5.0):
+            decisions = self.prepare_decisions(policy, inputs, cohort)
         self._pending_timing["decisions_seconds"] = time.perf_counter()-started
         self.observations.save("prediction_decisions", {"cohort": cohort.isoformat(), "decisions": decisions})
         # The observation worker discovers current AND next contracts. Reuse its
@@ -1067,12 +1175,20 @@ class ForwardPipeline:
         self.execute_prepared(policy, inputs, models, cohort, decisions, dict(self.clock))
 
     def worker(self):
+        self.monitor_log.start_watchdog()
         try:
             while not self.stop.is_set():
                 try:
                     self.cycle()
                 except Exception as exc:
                     self.abandon_prepared("CHECK_FAILED_DURING_RECHECK")
+                    self.monitor_log.log_cohort_blocked(
+                        self.last_cohort.isoformat() if self.last_cohort else None,
+                        "PIPELINE_CYCLE_EXCEPTION",
+                        f"本地模拟检查未通过：{type(exc).__name__}: {exc}",
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:240],
+                    )
                     self.publish(status="PAPER_BLOCKED", active=False,
                                  timing=self.finish_timing("FAILED", exc),
                                  reason="本地模拟检查未通过："+type(exc).__name__)
@@ -1081,6 +1197,7 @@ class ForwardPipeline:
             self.close()
 
     def close(self):
+        self.monitor_log.close()
         close = getattr(self.inputs, "close", None)
         if close:
             close()

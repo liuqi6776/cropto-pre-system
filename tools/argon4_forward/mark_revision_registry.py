@@ -19,7 +19,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
 ENDPOINT = "https://fapi.binance.com/fapi/v1/markPriceKlines"
-SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"}
+SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"}
 SNAPSHOTS = ("mark_registry_before.json", "mark_registry_proposed.json")
 APPEND_PROOF_FILE = "mark_append_baseline_proofs.json"
 

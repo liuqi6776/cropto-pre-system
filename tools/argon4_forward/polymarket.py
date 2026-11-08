@@ -30,6 +30,10 @@ STREAMS = {
     "SOL_5m": ("sol", 300, "Solana"),
     "BNB_15m": ("bnb", 900, "BNB"),
 }
+ALL_STREAMS = {
+    **STREAMS,
+    "XRP_15m": ("xrp", 900, "XRP"),
+}
 MAX_BOOK_AGE_SECONDS = 90
 MAX_CLOCK_LEAD_SECONDS = 10
 
@@ -115,7 +119,7 @@ def parse_fee(market):
 
 def validate_market(market, stream, expected_start, now):
     """Validate an actual Gamma response. Never derive missing times from a slug."""
-    asset, duration, name = STREAMS[stream]
+    asset, duration, name = ALL_STREAMS[stream]
     expected_start, now = _utc(expected_start), _utc(now)
     slug = f"{asset}-updown-{duration // 60}m-{int(expected_start.timestamp())}"
     if not isinstance(market, dict) or market.get("slug") != slug:
@@ -227,8 +231,8 @@ def validate_book(book, outcome_id, condition_id, received_at):
             "source_hash": book.get("hash"), "execution_enabled": False}
 
 
-def collect_market_snapshot(now=None, *, transport=None, getter=None):
-    """Collect current/next windows, bounded to 14 Gamma + 28 book GETs.
+def collect_market_snapshot(now=None, *, transport=None, getter=None, streams=None):
+    """Collect current/next windows, bounded to 2*N Gamma + 4*N book GETs.
 
     `now` is a timezone-aware datetime, UTC ISO string, or epoch seconds. It
     controls discovery only; response receipt times always use the real clock.
@@ -240,12 +244,13 @@ def collect_market_snapshot(now=None, *, transport=None, getter=None):
                   (lambda kind, value: _get_public(kind, value, transport=transport))
                   if transport is not None else _get_public)
     now = _utc(now)
+    active_streams = streams if isinstance(streams, dict) else STREAMS
     snapshot = {"requested_at": _iso(now), "observed_at": None, "source": SOURCE,
                 "status": "WAITING_MODEL", "market_data_status": "UNAVAILABLE",
                 "streams": {}, "errors": [], "receipts": [],
                 "execution_enabled": False}
     jobs = []
-    for stream, (asset, duration, _) in STREAMS.items():
+    for stream, (asset, duration, _) in active_streams.items():
         floor = int(now.timestamp()) // duration * duration
         snapshot["streams"][stream] = {"status": "WAITING_MODEL", "market_status": "NOT_FOUND",
                                         "current": None, "next": None, "errors": []}
@@ -330,6 +335,6 @@ def collect_market_snapshot(now=None, *, transport=None, getter=None):
                     quality_complete = False
                 if any(book is None or book["status"] != "OBSERVED" for book in market["books"].values()):
                     quality_complete = False
-    snapshot["market_data_status"] = "COMPLETE" if complete == 14 and not snapshot["errors"] and quality_complete else ("PARTIAL" if complete else "UNAVAILABLE")
+    snapshot["market_data_status"] = "COMPLETE" if complete == 2 * len(active_streams) and not snapshot["errors"] and quality_complete else ("PARTIAL" if complete else "UNAVAILABLE")
     snapshot["observed_at"] = _iso(None)
     return snapshot

@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT")
+ALL_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
 PROVENANCE = ("first_received_at", "receipt_sha256", "receipt_time_basis", "clock_evidence_sha256")
 PRICE_FIELDS = {1: "open", 2: "high", 3: "low", 4: "close", 5: "volume",
                 7: "quote_volume", 8: "count", 9: "taker_buy_base_volume", 10: "taker_buy_quote_volume"}
@@ -39,6 +40,7 @@ REVISION_SPECS = {
 }
 SAFE_ERROR = "REVISION_VIEW_NOT_COMMITTED"
 FAST_PROFILE = "argon4-aged-revision-v13"
+FAST_HOURLY_PROFILE = "argon4-aged-revision-v14"
 _RECOVERY_LOCK = threading.Lock()
 
 
@@ -160,7 +162,7 @@ def _error_sources(errors):
         if not isinstance(error, dict):
             raise ValueError("UNSUPPORTED_REVISION_ERROR")
         parts = str(error.get("source", "")).split(":")
-        if (len(parts) != 3 or (parts[0], parts[2]) not in REVISION_SPECS or parts[1] not in SYMBOLS
+        if (len(parts) != 3 or (parts[0], parts[2]) not in REVISION_SPECS or parts[1] not in ALL_SYMBOLS
                 or error.get("error") not in ("CONFLICTING_CLOSED_OBSERVATION", "ValueError:CONFLICTING_CLOSED_OBSERVATION")):
             raise ValueError("UNSUPPORTED_REVISION_ERROR")
         sources.append(tuple(parts))
@@ -309,7 +311,7 @@ def _fast_context(context, validation_at):
         return None
     if (not isinstance(context, dict)
             or set(context) != {"profile", "cohort", "deadline", "minimum_spacing_seconds", "clock_evidence_sha256"}
-            or context["profile"] != FAST_PROFILE
+            or context["profile"] not in (FAST_PROFILE, FAST_HOURLY_PROFILE)
             or isinstance(context["minimum_spacing_seconds"], bool)
             or context["minimum_spacing_seconds"] != 2.0):
         raise ValueError("INVALID_FAST_REVISION_CONTEXT")
@@ -320,7 +322,7 @@ def _fast_context(context, validation_at):
     if (cohort != cohort.floor("5min") or deadline != cohort+pd.Timedelta(seconds=14)
             or not cohort <= validation_at <= deadline):
         raise ValueError("FAST_REVISION_OUTSIDE_INPUT_BUDGET")
-    return {"profile": FAST_PROFILE, "cohort": cohort.isoformat(), "deadline": deadline.isoformat(),
+    return {"profile": context["profile"], "cohort": cohort.isoformat(), "deadline": deadline.isoformat(),
             "minimum_spacing_seconds": 2.0, "clock_evidence_sha256": clock_hash}
 
 
@@ -389,9 +391,14 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
             fast = fast_context is not None
             if fast:
                 cohort = _time(fast_context["cohort"])
-                aged = (kind == "futures" and interval == "5m"
-                        and pd.to_datetime(opened+spec["step_ms"], unit="ms", utc=True)
-                        <= cohort-pd.Timedelta(minutes=5))
+                closed_at = pd.to_datetime(opened+spec["step_ms"], unit="ms", utc=True)
+                hourly_allowed = (fast_context.get("profile") == FAST_HOURLY_PROFILE
+                                  and interval == "1h" and kind in ("futures", "mark")
+                                  and (closed_at <= cohort-pd.Timedelta(minutes=5)
+                                       or (closed_at <= cohort and now >= cohort+pd.Timedelta(seconds=4))))
+                aged = ((kind == "futures" and interval == "5m"
+                         and closed_at <= cohort-pd.Timedelta(minutes=5))
+                        or hourly_allowed)
                 current_receipt = (cohort <= _time(latest["requested_at"])
                                    and latest["time_basis"] == "CALIBRATED_UTC_UPPER_BOUND"
                                    and latest["clock_evidence_sha256"] == fast_context["clock_evidence_sha256"])
@@ -886,7 +893,9 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
             if not callable(now) or not callable(cutover_now):
                 raise ValueError("FAST_REVISION_CALIBRATED_CLOCK_CALLBACKS_REQUIRED")
             guards.append(_guard_evidence(cohort_guard, "BEFORE_VALIDATION", fast))
-            if any((kind, interval) != ("futures", "5m") for kind, _, interval in sources):
+            allowed_fast = ((("futures", "5m"), ("futures", "1h"), ("mark", "1h"))
+                            if fast.get("profile") == FAST_HOURLY_PROFILE else (("futures", "5m"),))
+            if any((kind, interval) not in allowed_fast for kind, _, interval in sources):
                 fast = None
         runtime, features, raw_root, revisions = _paths(runtime)
         before_files = _inventory(raw_root)
