@@ -10,6 +10,7 @@ archived view, never the current view before its recorded effective time.
 """
 from __future__ import annotations
 
+from contextlib import closing
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -496,12 +497,22 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
 
 
 def _is_valid_observations_prefix(source, prior_snapshot):
+    source = Path(source).resolve()
+    prior_snapshot = Path(prior_snapshot).resolve()
     if prior_snapshot.stat().st_size < 4 * 1024 * 1024:
         _audit_sqlite_backup(source, prior_snapshot)
         return True
-    with sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True) as archived, \
-            sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as current:
-        for name in ("snapshots", "decisions"):
+    with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived, \
+            closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
+        arch_tables = {row[0] for row in archived.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )}
+        live_tables = {row[0] for row in current.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )}
+        if not arch_tables or arch_tables != live_tables or not arch_tables <= {"receipts", "snapshots", "decisions"}:
+            return False
+        for name in arch_tables:
             max_id = archived.execute('SELECT MAX(id) FROM "' + name + '"').fetchone()[0]
             if max_id is not None:
                 old_row = archived.execute('SELECT * FROM "' + name + '" WHERE id=?', (max_id,)).fetchone()
@@ -511,44 +522,52 @@ def _is_valid_observations_prefix(source, prior_snapshot):
     return True
 
 
-def _prior_committed_observations(revisions_dir, source):
+def _prior_committed_observations(revisions_dir, source, *, include_delta_max_id=False):
     try:
         revisions_dir = Path(revisions_dir).resolve()
+        source = Path(source).resolve()
         marker_path = revisions_dir / "view_state.json"
         if not marker_path.is_file():
-            return None, None
+            return (None, None, None) if include_delta_max_id else (None, None)
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
         if marker.get("status") != "COMMITTED" or not marker.get("revision_id"):
-            return None, None
+            return (None, None, None) if include_delta_max_id else (None, None)
         prior_folder = (revisions_dir / str(marker["revision_id"])).resolve()
         prior_manifest = prior_folder / "manifest.json"
         prior_snapshot = prior_folder / "observations.sqlite3"
         if (prior_folder.parent != revisions_dir
                 or not prior_manifest.is_file() or not prior_snapshot.is_file()
                 or prior_snapshot.is_symlink()):
-            return None, None
+            return (None, None, None) if include_delta_max_id else (None, None)
         manifest_data = json.loads(prior_manifest.read_text(encoding="utf-8"))
-        expected_sha = next(
-            (b.get("sha256") for b in manifest_data.get("sqlite_backups", [])
+        obs_entry = next(
+            (b for b in manifest_data.get("sqlite_backups", [])
              if Path(b.get("snapshot_path", "")).name == "observations.sqlite3"),
             None,
         )
+        expected_sha = obs_entry.get("sha256") if obs_entry else None
+        prior_covered_max = (obs_entry.get("delta_max_id") or {}) if obs_entry else {}
         cache_key = (str(prior_folder), str(marker.get("revision_id")), str(marker.get("manifest_sha256")))
         with _COMMITTED_ARCHIVE_HASH_LOCK:
             cache_bucket = _COMMITTED_ARCHIVE_HASH_CACHE.setdefault(cache_key, {})
         if (expected_sha and _cached_sha(prior_snapshot, cache_bucket) == expected_sha
                 and _is_valid_observations_prefix(source, prior_snapshot)):
+            if include_delta_max_id:
+                return prior_snapshot, expected_sha, prior_covered_max
             return prior_snapshot, expected_sha
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
         pass
-    return None, None
+    return (None, None, None) if include_delta_max_id else (None, None)
 
 
-def _write_observations_delta(source, prior_snapshot, delta_path):
+def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_max=None):
+    source = Path(source).resolve()
+    prior_snapshot = Path(prior_snapshot).resolve()
     delta_rows_by_table = {}
+    delta_max_ids = {}
     schemas = {}
-    with sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True) as archived, \
-            sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as current:
+    with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived, \
+            closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
         live_tables = dict(current.execute(
             "SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('receipts','snapshots','decisions')"
         ))
@@ -558,20 +577,24 @@ def _write_observations_delta(source, prior_snapshot, delta_path):
         for name, create_sql in live_tables.items():
             prior_max = (archived.execute('SELECT COALESCE(MAX(id), 0) FROM "' + name + '"').fetchone()[0]
                          if name in arch_tables else 0)
-            rows = current.execute('SELECT * FROM "' + name + '" WHERE id > ? ORDER BY id', (prior_max,)).fetchall()
+            start_id = max(int(prior_max or 0), int((prior_covered_max or {}).get(name, 0) or 0))
+            live_max = current.execute('SELECT COALESCE(MAX(id), 0) FROM "' + name + '"').fetchone()[0]
+            delta_max_ids[name] = int(live_max or start_id)
+            rows = current.execute('SELECT * FROM "' + name + '" WHERE id > ? ORDER BY id', (start_id,)).fetchall()
             if rows:
                 schemas[name] = create_sql
                 delta_rows_by_table[name] = rows
     if not delta_rows_by_table:
-        return {}
+        return {"delta_max_id": delta_max_ids} if delta_max_ids else {}
     with delta_path.open("xb"):
         pass
-    with sqlite3.connect(delta_path) as delta_db:
-        for name, rows in delta_rows_by_table.items():
-            delta_db.execute(schemas[name])
-            placeholders = ",".join("?" for _ in rows[0])
-            delta_db.executemany('INSERT INTO "' + name + '" VALUES(' + placeholders + ')', rows)
-    return {"delta_snapshot_path": str(delta_path), "delta_sha256": _sha(delta_path)}
+    with closing(sqlite3.connect(delta_path)) as delta_db:
+        with delta_db:
+            for name, rows in delta_rows_by_table.items():
+                delta_db.execute(schemas[name])
+                placeholders = ",".join("?" for _ in rows[0])
+                delta_db.executemany('INSERT INTO "' + name + '" VALUES(' + placeholders + ')', rows)
+    return {"delta_snapshot_path": str(delta_path), "delta_sha256": _sha(delta_path), "delta_max_id": delta_max_ids}
 
 
 def _backup_sqlite(source, target):
@@ -581,10 +604,14 @@ def _backup_sqlite(source, target):
         delta_path = target.with_name("observations_delta.sqlite3")
         try:
             revisions_dir = target.resolve().parent.parent
-            prior_snapshot, expected_sha = _prior_committed_observations(revisions_dir, source)
+            prior_snapshot, expected_sha, prior_covered_max = _prior_committed_observations(
+                revisions_dir, source, include_delta_max_id=True
+            )
             if prior_snapshot is not None and expected_sha is not None:
                 os.link(prior_snapshot, target)
-                delta_info = _write_observations_delta(source, prior_snapshot, delta_path)
+                delta_info = _write_observations_delta(
+                    source, prior_snapshot, delta_path, prior_covered_max=prior_covered_max
+                )
                 return {"source_path": str(source), "snapshot_path": str(target),
                         "sha256": expected_sha, **delta_info}
         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):

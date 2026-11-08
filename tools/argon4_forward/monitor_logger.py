@@ -314,17 +314,39 @@ class MonitorAuditLogger:
             elif dec_status == "DISABLED_BY_STAGE" or dec.get("stage_disabled"):
                 why = "DISABLED_BY_STAGE (当前执行阶段配置禁用该流)"
             elif dec_status == "NO_SIGNAL":
-                if abs_z is not None and isinstance(threshold, (int, float)):
+                if pred.get("volatility_regime_guarded") is True:
+                    v_reason = pred.get("volatility_regime_reason", "VOLATILITY_REGIME_GUARD")
+                    rv12 = pred.get("ex_ante_rv12_bps")
+                    why = (f"VOLATILITY_REGIME_GUARD ({v_reason}: ex_ante_rv12_bps={rv12}, "
+                           f"|z_v4|={abs_z:.4f} >= 阈值={float(threshold):.4f}, 方向={side})"
+                           if abs_z is not None and isinstance(threshold, (int, float))
+                           else f"VOLATILITY_REGIME_GUARD ({v_reason}: ex_ante_rv12_bps={rv12}, 方向={side})")
+                elif abs_z is not None and isinstance(threshold, (int, float)):
                     why = f"BELOW_THRESHOLD (模型置信度 |z_v4|={abs_z:.4f} < 阈值={float(threshold):.4f}, 方向={side})"
                 else:
                     why = "BELOW_THRESHOLD (模型分数未达阈值)"
             elif dec_status == "SIGNAL":
+                best_ask_val = st_out.get("best_ask")
+                min_buy_val = st_out.get("min_buy_price")
+                is_below_min_buy = (
+                    isinstance(best_ask_val, (int, float))
+                    and isinstance(min_buy_val, (int, float))
+                    and float(best_ask_val) < float(min_buy_val)
+                )
                 if st_status == "PRICE_LIMIT_NOT_MET":
-                    why = (f"PRICE_LIMIT_NOT_MET (信号触发 方向={side}, 但盘口最优卖价 best_ask={st_out.get('best_ask')} "
-                           f"> 限价上限 limit_price={st_out.get('limit_price')})")
+                    if is_below_min_buy:
+                        why = (f"ADVERSE_SELECTION_GUARD (信号触发 方向={side}, 但盘口最优卖价 best_ask={best_ask_val} "
+                               f"< 逆向选择保护下限 min_buy_price={min_buy_val})")
+                    else:
+                        why = (f"PRICE_LIMIT_NOT_MET (信号触发 方向={side}, 但盘口最优卖价 best_ask={best_ask_val} "
+                               f"> 限价上限 limit_price={st_out.get('limit_price')})")
                 elif st_status == "WAITING_PRICE_RECHECK":
-                    why = (f"WAITING_PRICE_RECHECK (信号触发 方向={side}, best_ask={st_out.get('best_ask')} > "
-                           f"limit_price={st_out.get('limit_price')}, 等待窗口内第 {st_out.get('attempt')} 次重检 @ {st_out.get('next_retry_at')})")
+                    if is_below_min_buy:
+                        why = (f"WAITING_PRICE_RECHECK (信号触发 方向={side}, best_ask={best_ask_val} < "
+                               f"min_buy_price={min_buy_val}, 等待窗口内第 {st_out.get('attempt')} 次重检 @ {st_out.get('next_retry_at')})")
+                    else:
+                        why = (f"WAITING_PRICE_RECHECK (信号触发 方向={side}, best_ask={best_ask_val} > "
+                               f"limit_price={st_out.get('limit_price')}, 等待窗口内第 {st_out.get('attempt')} 次重检 @ {st_out.get('next_retry_at')})")
                 elif st_status == "UNREACHED":
                     why = f"UNREACHED ({st_out.get('reason', 'COHORT_BUDGET_EXHAUSTED')}: 高优先级流已用尽本窗口预算)"
                 elif st_status == "ERROR":

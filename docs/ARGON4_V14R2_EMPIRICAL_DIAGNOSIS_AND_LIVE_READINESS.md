@@ -99,3 +99,7 @@ The entire drop from `56.25%` (Binance K-line win rate) to `37.50%` (Polymarket 
    - `config/argon4_forward_policy.json` pre-populates `"min_rv12_bps": {"BTC_5m": 3.0, "ETH_5m": 3.0, "SOL_5m": 3.0}` under `"volatility_regime_guard"`.
 3. **Enhanced Settlement & Adverse-Selection Analyzer (`scripts/analyze_argon4_settlement_alignment.py`)**:
    - Automatically computes and reports `by_ask_bucket`, `by_adverse_selection_zone`, `by_rv12_bucket`, and `combined_guards_simulation` alongside Chainlink TWAP vs. Binance 5m point/VWAP alignment.
+4. **Live Runtime Activation & `revisions.py` Fastpath Fix (`v14r4`)**:
+   - **Activated Both Guards in `config/argon4_forward_policy.json`**: Set `"min_buy_price": 0.37` and `"volatility_regime_guard": {"enabled": true, ...}` in the active policy, and updated `tools/argon4_forward/monitor_logger.py` and `execution.py` to log explicit `VOLATILITY_REGIME_GUARD` and `ADVERSE_SELECTION_GUARD` audit entries.
+   - **Fixed `_is_valid_observations_prefix` & Chained Delta in `tools/argon4_forward/revisions.py`**: Live `observations.sqlite3` (`982 MB`) contains only the `snapshots` table (whereas test fixtures used `decisions`). Querying actual tables from `sqlite_master` and tracking `delta_max_id` across chained hardlinked revisions reduces `_backup_sqlite` from `5.24s` (which previously caused `FAST_REVISION_COHORT_GUARD_FAILED` at `BEFORE_CUTOVER`) down to `< 2ms` (`0 bytes` extra disk usage per revision).
+

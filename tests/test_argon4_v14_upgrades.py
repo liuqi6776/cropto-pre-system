@@ -648,3 +648,101 @@ def test_v14r2_patch5_early_window_book_ticker(tmp_path, monkeypatch):
     finally:
         collector.close()
 
+
+def test_v14r4_snapshots_only_large_observations_hardlink_chained_delta_and_active_guards(runtime, tmp_path):
+    """v14r4: >4MB snapshots-only observations.sqlite3 hardlinks across chained revisions and policy guards are active."""
+    # Replace observations.sqlite3 with a snapshots-only table (matching live runtime schema)
+    obs_path = runtime / "observations.sqlite3"
+    with sqlite3.connect(obs_path) as conn:
+        conn.execute("DROP TABLE IF EXISTS decisions")
+        conn.execute(
+            "CREATE TABLE snapshots(id INTEGER PRIMARY KEY, recorded_at TEXT, status TEXT, payload TEXT)"
+        )
+        # Pad payload to exceed 4 MB so _is_valid_observations_prefix takes the fast O(1) prefix branch
+        big_payload = "x" * (2100 * 1024)
+        conn.execute("INSERT INTO snapshots(recorded_at,status,payload) VALUES(?,?,?)", ("t1", "OK", big_payload))
+        conn.execute("INSERT INTO snapshots(recorded_at,status,payload) VALUES(?,?,?)", ("t2", "OK", big_payload))
+    assert obs_path.stat().st_size > 4 * 1024 * 1024
+
+    # First revision: full backup
+    _add_receipt(runtime)
+    _add_receipt(runtime, "2026-11-06T01:40:05Z")
+    res1 = revisions.reconcile_confirmed_price_revisions(runtime, [_error()], NOW)
+    assert res1["status"] == "COMMITTED"
+    archive1 = Path(res1["archive_path"])
+
+    # Add row #3 between revision 1 and revision 2
+    with sqlite3.connect(obs_path) as conn:
+        conn.execute("INSERT INTO snapshots(recorded_at,status,payload) VALUES(?,?,?)", ("t3", "OK", "delta_row_3"))
+
+    changed2 = list(NEW)
+    changed2[4], changed2[8] = "104.5", 29
+    _add_receipt(runtime, "2026-11-06T01:50:05Z", changed2)
+    _add_receipt(runtime, "2026-11-06T01:55:05Z", changed2)
+    res2 = revisions.reconcile_confirmed_price_revisions(runtime, [_error()], NOW + pd.Timedelta(minutes=15))
+    assert res2["status"] == "COMMITTED"
+    archive2 = Path(res2["archive_path"])
+    assert (archive1 / "observations.sqlite3").stat().st_ino == (archive2 / "observations.sqlite3").stat().st_ino
+    with sqlite3.connect(archive2 / "observations_delta.sqlite3") as conn:
+        assert conn.execute("SELECT id, payload FROM snapshots").fetchall() == [(3, "delta_row_3")]
+
+    # Add row #4 between revision 2 and revision 3: chained delta must ONLY contain row #4
+    with sqlite3.connect(obs_path) as conn:
+        conn.execute("INSERT INTO snapshots(recorded_at,status,payload) VALUES(?,?,?)", ("t4", "OK", "delta_row_4"))
+
+    changed3 = list(NEW)
+    changed3[4], changed3[8] = "106.0", 35
+    _add_receipt(runtime, "2026-11-06T02:05:05Z", changed3)
+    _add_receipt(runtime, "2026-11-06T02:10:05Z", changed3)
+    res3 = revisions.reconcile_confirmed_price_revisions(runtime, [_error()], NOW + pd.Timedelta(minutes=30))
+    assert res3["status"] == "COMMITTED"
+    archive3 = Path(res3["archive_path"])
+    assert (archive1 / "observations.sqlite3").stat().st_ino == (archive3 / "observations.sqlite3").stat().st_ino
+    with sqlite3.connect(archive3 / "observations_delta.sqlite3") as conn:
+        assert conn.execute("SELECT id, payload FROM snapshots").fetchall() == [(4, "delta_row_4")]
+
+    # Verify production policy has both empirical guards enabled and MonitorAuditLogger formats both
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    assert policy["min_buy_price"] == 0.37
+    assert policy["volatility_regime_guard"]["enabled"] is True
+    assert policy["volatility_regime_guard"]["min_rv12_bps"]["BTC_5m"] == 3.0
+
+    logger = monitor_logger.MonitorAuditLogger(tmp_path / "audit_logs")
+    decisions = {
+        "BTC_5m": {
+            "status": "NO_SIGNAL",
+            "outcome": "Up",
+            "prediction": {
+                "z_v4": 0.42,
+                "threshold_frozen": 0.35,
+                "side": "Up",
+                "volatility_regime_guarded": True,
+                "volatility_regime_reason": "BELOW_MIN_RV12_BPS",
+                "ex_ante_rv12_bps": 1.85,
+            },
+        },
+        "ETH_5m": {
+            "status": "SIGNAL",
+            "outcome": "Down",
+            "prediction": {"z_v4": -0.55, "threshold_frozen": 0.35, "side": "Down"},
+        },
+    }
+    outcome = {
+        "status": "PROCESSED",
+        "streams": {
+            "ETH_5m": {
+                "status": "PRICE_LIMIT_NOT_MET",
+                "best_ask": 0.24,
+                "limit_price": 0.515,
+                "min_buy_price": 0.37,
+            }
+        },
+        "fills": [],
+        "blocked": [],
+    }
+    logger.log_cohort_execution("2026-11-08T12:00:00+00:00", {"order": ["BTC_5m", "ETH_5m"]}, decisions, outcome)
+    ev = logger.recent_events(limit=1)[0]
+    assert "VOLATILITY_REGIME_GUARD" in ev["details"]["streams"]["BTC_5m"]["no_trade_reason"]
+    assert "ADVERSE_SELECTION_GUARD" in ev["details"]["streams"]["ETH_5m"]["no_trade_reason"]
+
+

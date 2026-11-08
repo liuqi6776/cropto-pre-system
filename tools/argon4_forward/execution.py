@@ -522,7 +522,9 @@ class PaperExecutor:
                             best = min(_d(a["price"]) for a in book["asks"] if _d(a["size"]) > 0)
                             stream_results[stream] = {"status":"WAITING_PRICE_RECHECK","persisted":True,
                                 "book_checked":True,"attempt":completed["attempt"],"best_ask":float(best),
-                                "limit_price":.515,"next_retry_at":completed["next_retry_at"],
+                                "limit_price":.515,
+                                **({"min_buy_price": float(limits["min_buy_price"])} if limits["min_buy_price"] > 0 else {}),
+                                "next_retry_at":completed["next_retry_at"],
                                 "book_observed_at":book["observed_at"],"approved_usd":0.,"spent_usd":0.}
                             result.update(status="WAITING_PRICE_RECHECK", next_retry_at=completed["next_retry_at"])
                             break
@@ -530,7 +532,9 @@ class PaperExecutor:
                                                     now=now if multi_look is not None else stamp)
                     best = min(_d(a["price"]) for a in book["asks"] if _d(a["size"])>0)
                     stream_results[stream] = {"status":"PRICE_LIMIT_NOT_MET","raw_capacity_usd":0.,
-                        "best_ask":float(best),"limit_price":.515,"book_observed_at":book["observed_at"],
+                        "best_ask":float(best),"limit_price":.515,
+                        **({"min_buy_price": float(limits["min_buy_price"])} if limits["min_buy_price"] > 0 else {}),
+                        "book_observed_at":book["observed_at"],
                         "book_checked":True,"approved_usd":0.,"spent_usd":0.,"persisted":True}
                     continue
                 if multi_look is not None:

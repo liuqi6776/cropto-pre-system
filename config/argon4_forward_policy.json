@@ -25,6 +25,7 @@
   "max_open_risk_usd": 1000,
   "max_underlying_open_risk_usd": 500,
   "max_buy_price": 0.515,
+  "min_buy_price": 0.37,
   "daily_loss_fraction": 0.055,
   "risk_limit_note": "200/1000/500 USD are proposed paper safety ceilings, not empirically established market capacity",
   "paper_trading_active": true,
@@ -269,7 +270,7 @@
     "effective_from": "2026-11-07T08:20:00+00:00"
   },
   "volatility_regime_guard": {
-    "enabled": false,
+    "enabled": true,
     "max_rv12_bps": {
       "BTC_15m": 28.0,
       "ETH_5m": 35.0,
