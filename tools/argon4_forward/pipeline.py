@@ -297,12 +297,38 @@ class ForwardPipeline:
         if time.monotonic()-self.last_settlement_poll <= 30:
             return
         self.last_settlement_poll = time.monotonic()
-        if not self.account.overview()["positions"]:
+        before_positions = {p["market_id"]: p for p in self.account.overview()["positions"]}
+        if not before_positions:
             return
         self.update_clock()
         result = PaperExecutor(self.account, policy).settle_observed(
             now=lambda: calibrated_now(self.clock), fetcher=self.fetch_resolution)
         self.observations.save("paper_settlements", result)
+        if result.get("settled"):
+            try:
+                from scripts.analyze_argon4_settlement_alignment import (
+                    compute_settlement_alignment_row,
+                    summarize_settlement_alignments,
+                )
+                raw_root = self.runtime / "features/raw_data"
+                rows = []
+                for item in result["settled"]:
+                    mid = item.get("market_id")
+                    pos = before_positions.get(mid, {})
+                    stream = item.get("stream") or pos.get("stream")
+                    w_start = item.get("window_start") or pos.get("window_start")
+                    w_end = item.get("window_end") or pos.get("window_end")
+                    outcome = item.get("winning_outcome") or item.get("outcome")
+                    pred_side = pos.get("outcome")
+                    if stream and w_start and w_end and outcome in ("UP", "DOWN"):
+                        rows.append(compute_settlement_alignment_row(
+                            raw_root, stream=stream, window_start=w_start, window_end=w_end,
+                            official_outcome=outcome, market_id=mid, prediction_side=pred_side))
+                if rows:
+                    self.observations.save("settlement_label_alignment", {
+                        "rows": rows, "summary": summarize_settlement_alignments(rows)})
+            except Exception:
+                pass
 
     def reconcile_inputs(self, collector, inputs):
         if not any("CONFLICTING_CLOSED_OBSERVATION" in e.get("error", "")
@@ -521,6 +547,10 @@ class ForwardPipeline:
     def _score_decisions(self, policy, inputs, cohort, profile, now_lower,
                          available, frames, decisions, snapshot,
                          build_feature_frames, predict_stream):
+        from .model_v14 import apply_volatility_regime_guard, compute_ex_ante_rv12_bps
+        vol_guard = (policy.get("volatility_regime_guard")
+                     if isinstance(policy.get("volatility_regime_guard"), dict) else None)
+        rv12_cache = {}
         for stream in policy["order"]:
             if stream in profile["disabled_streams"]:
                 decisions[stream] = disabled_decision(profile)
@@ -544,6 +574,10 @@ class ForwardPipeline:
             f = frames[symbol]
             if f["base"].index[-1].to_pydatetime() + timedelta(minutes=5) != cohort:
                 raise ValueError("closed feature row does not match decision cohort")
+            if symbol not in rv12_cache:
+                rv12_cache[symbol] = compute_ex_ante_rv12_bps(
+                    inputs.get("data_root"), symbol, as_of=now_lower, snapshot=snapshot,
+                    raw_frame=f.get("raw_target"))
             started = time.perf_counter()
             threshold_override = (policy.get("stream_thresholds", {}).get(stream)
                                   if isinstance(policy.get("stream_thresholds"), dict) else None)
@@ -551,6 +585,9 @@ class ForwardPipeline:
             if threshold_override is not None:
                 score_kwargs["threshold_override"] = threshold_override
             score = predict_stream(stream, f["base"], f["expert"], calibrated_now(self.clock), **score_kwargs)
+            if rv12_cache[symbol] is not None or vol_guard is not None:
+                score = apply_volatility_regime_guard(
+                    stream, score, ex_ante_rv12_bps=rv12_cache[symbol], guard_config=vol_guard)
             self._decision_timing["inference_seconds"][stream] = time.perf_counter()-started
             if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
                 raise ValueError("missed feature decision window")
@@ -1148,6 +1185,18 @@ class ForwardPipeline:
             registered = register_online_marks(inputs["data_root"])
         self._pending_timing["mark_registration_seconds"] = time.perf_counter()-started
         self._pending_timing["mark_registration"] = registered
+        ticker_cfg = policy.get("early_window_book_ticker")
+        if isinstance(ticker_cfg, dict) and ticker_cfg.get("enabled") is True:
+            capture_fn = getattr(self.inputs, "capture_early_window_book_ticker", None)
+            if callable(capture_fn):
+                try:
+                    self.set_input_clock()
+                    snap = capture_fn(now=calibrated_now(self.clock, upper=False), cohort_id=cohort.isoformat())
+                    self.observations.save("early_window_book_ticker", snap)
+                except Exception as exc:
+                    self.observations.save("early_window_book_ticker", {
+                        "status": "ERROR", "cohort_id": cohort.isoformat(),
+                        "error": f"{type(exc).__name__}:{str(exc)[:160]}"})
         started = time.perf_counter()
         with self.monitor_log.phase("pipeline", "prepare_decisions",
                                     cohort=cohort.isoformat(), slow_warn_seconds=5.0):

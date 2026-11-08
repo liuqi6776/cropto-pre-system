@@ -124,12 +124,17 @@ def _policy_risk_limits(policy=None):
     max_tick = dec_field("max_tick_budget_usd", default_tick)
     default_underlying = min(Decimal("500"), max_open) if has_field("max_open_risk_usd") and not has_field("max_underlying_open_risk_usd") else "500"
     max_underlying = dec_field("max_underlying_open_risk_usd", default_underlying)
+    max_active_open = dec_field("max_active_window_risk_usd", max_open)
+    max_active_underlying = dec_field("max_underlying_active_risk_usd", min(max_underlying, max_active_open))
     daily_loss = dec_field("daily_loss_fraction", "0.055")
     if (not Decimal("0.005") <= single_frac <= Decimal("0.030")
             or not Decimal("0.010") <= tick_frac <= Decimal("0.050")
             or not Decimal("0.010") <= daily_loss <= Decimal("0.100")
             or max_tick <= 0 or max_order <= 0 or max_open <= 0 or max_underlying <= 0
-            or max_order > max_tick or max_underlying > max_open):
+            or max_active_open <= 0 or max_active_underlying <= 0
+            or max_order > max_tick or max_underlying > max_open
+            or max_active_open > max_open or max_active_underlying > max_underlying
+            or max_active_underlying > max_active_open):
         raise AccountRejected("invalid policy risk limits")
     return {
         "single_stream_equity_fraction": single_frac,
@@ -138,11 +143,15 @@ def _policy_risk_limits(policy=None):
         "max_order_usd": max_order,
         "max_open_risk_usd": max_open,
         "max_underlying_open_risk_usd": max_underlying,
+        "max_active_window_risk_usd": max_active_open,
+        "max_underlying_active_risk_usd": max_active_underlying,
         "daily_loss_fraction": daily_loss,
         "max_tick_budget_atoms": _atoms(max_tick),
         "max_order_atoms": _atoms(max_order),
         "max_open_risk_atoms": _atoms(max_open),
         "max_underlying_open_risk_atoms": _atoms(max_underlying),
+        "max_active_window_risk_atoms": _atoms(max_active_open),
+        "max_underlying_active_risk_atoms": _atoms(max_active_underlying),
     }
 
 
@@ -343,7 +352,9 @@ class Account:
                 # basis, not a market valuation. Unresolved contracts also consume
                 # their full at-risk paid cost under the separate $1,000 limit.
                 equity = a["initial_atoms"] + a["realized_atoms"]
-                risk = con.execute("SELECT COALESCE(SUM(cost_atoms+fee_atoms),0) FROM orders WHERE status='OPEN'").fetchone()[0]
+                open_rows = con.execute("SELECT cost_atoms,fee_atoms,window_end FROM orders WHERE status='OPEN'").fetchall()
+                risk = sum(r["cost_atoms"] + r["fee_atoms"] for r in open_rows)
+                active_risk = sum(r["cost_atoms"] + r["fee_atoms"] for r in open_rows if _ts(r["window_end"]) > stamp)
                 daily = {}
                 for event in con.execute("SELECT utc,payload FROM events WHERE event_type='OFFICIAL_RESOLUTION_APPLIED_TO_PAPER'"):
                     date = _ts(event["utc"]).date()
@@ -365,7 +376,8 @@ class Account:
                     elif stamp < _ts(until):
                         blocked = "COOLDOWN_ACTIVE"
                 budget = max(0, min(int(Decimal(equity)*limits["tick_equity_fraction"]), limits["max_tick_budget_atoms"],
-                                    a["cash_atoms"], limits["max_open_risk_atoms"]-risk))
+                                    a["cash_atoms"], limits["max_open_risk_atoms"]-risk,
+                                    limits["max_active_window_risk_atoms"]-active_risk))
                 single = max(0, min(limits["max_order_atoms"], int(Decimal(equity)*limits["single_stream_equity_fraction"]*(Decimal(".5") if streak >= 4 else 1))))
                 if not budget:
                     blocked = blocked or "NO_RISK_BUDGET"
@@ -486,7 +498,8 @@ class Account:
                         or _ts(prediction.get("feature_bar_open"))+timedelta(minutes=5) != boundary):
                     raise AccountRejected("no-signal prediction time mismatch")
                 score, threshold = _d(prediction.get("z_v4")), _d(prediction.get("threshold_frozen"))
-                if threshold <= 0 or abs(score) >= threshold or prediction.get("side") != ("UP" if score > 0 else "DOWN"):
+                vol_guarded = prediction.get("volatility_regime_guarded") is True
+                if threshold <= 0 or (abs(score) >= threshold and not vol_guarded) or prediction.get("side") != ("UP" if score > 0 else "DOWN"):
                     raise AccountRejected("no-signal selection does not match the frozen threshold")
             encoded = _json(dict(receipt))
             if multi_look_settings(policy) is not None:
@@ -948,9 +961,16 @@ class Account:
                 con.execute("INSERT INTO signals VALUES(?,?,?)", (clean["signal_id"], _json(clean), _iso(stamp)))
                 self._event(con, "SIGNAL_ADMITTED", clean, stamp)
             cash = con.execute("SELECT cash_atoms FROM account WHERE id=1").fetchone()[0]
-            open_risk = con.execute("SELECT COALESCE(SUM(cost_atoms+fee_atoms),0) FROM orders WHERE status='OPEN'").fetchone()[0]
-            coin_risk = con.execute("SELECT COALESCE(SUM(cost_atoms+fee_atoms),0) FROM orders WHERE status='OPEN' AND underlying=?", (clean["underlying"],)).fetchone()[0]
-            if budget > min(cash, limits["max_open_risk_atoms"] - open_risk, limits["max_underlying_open_risk_atoms"] - coin_risk):
+            open_rows = con.execute("SELECT underlying,cost_atoms,fee_atoms,window_end FROM orders WHERE status='OPEN'").fetchall()
+            open_risk = sum(r["cost_atoms"] + r["fee_atoms"] for r in open_rows)
+            coin_risk = sum(r["cost_atoms"] + r["fee_atoms"] for r in open_rows if r["underlying"] == clean["underlying"])
+            active_risk = sum(r["cost_atoms"] + r["fee_atoms"] for r in open_rows if _ts(r["window_end"]) > stamp)
+            active_coin_risk = sum(r["cost_atoms"] + r["fee_atoms"] for r in open_rows
+                                   if r["underlying"] == clean["underlying"] and _ts(r["window_end"]) > stamp)
+            if budget > min(cash, limits["max_open_risk_atoms"] - open_risk,
+                            limits["max_underlying_open_risk_atoms"] - coin_risk,
+                            limits["max_active_window_risk_atoms"] - active_risk,
+                            limits["max_underlying_active_risk_atoms"] - active_coin_risk):
                 raise AccountRejected("cash or concurrent exposure limit exceeded")
             remaining = budget
             fills, cost, fees, quantity = [], 0, 0, Decimal(0)
@@ -1130,6 +1150,8 @@ class Account:
                                 "max_stream_cohort_usd": _num(limits["max_order_usd"]),
                                 "max_total_open_cost_usd": _num(limits["max_open_risk_usd"]),
                                 "max_underlying_open_cost_usd": _num(limits["max_underlying_open_risk_usd"]),
+                                "max_active_window_cost_usd": _num(limits["max_active_window_risk_usd"]),
+                                "max_underlying_active_cost_usd": _num(limits["max_underlying_active_risk_usd"]),
                                 "max_buy_price": .515},
                 "limitations": ["No real orders or signed transactions", "Model attestation must be verified by the upstream signal adapter", "Paper IOC fills use observed ask depth; they are not actual fills", "Open positions have no mark-to-market valuation"]}
 

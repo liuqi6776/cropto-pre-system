@@ -4,6 +4,7 @@ from __future__ import annotations
 from decimal import Decimal
 import json
 from pathlib import Path
+import sqlite3
 import time
 
 import pandas as pd
@@ -375,3 +376,174 @@ def test_monitor_audit_logger_records_no_trade_and_stall_events(tmp_path):
     assert recent[0]["event"] == "COHORT_NO_TRADE_AUDIT"
     assert "BELOW_THRESHOLD" in recent[0]["details"]["streams"]["BTC_15m"]["no_trade_reason"]
     assert recent[1]["event"] == "COHORT_NO_TRADE_BLOCKED"
+
+
+def test_v14r2_patch1_observations_delta_and_disk_budget_cap(runtime):
+    """Patch 1: second revision writes observations_delta.sqlite3 for new rows and caps disk budget at 16 MB."""
+    _add_receipt(runtime)
+    _add_receipt(runtime, "2026-11-06T01:40:05Z")
+    res1 = revisions.reconcile_confirmed_price_revisions(runtime, [_error()], NOW)
+    assert res1["status"] == "COMMITTED"
+
+    # Insert a new observation row after the first revision
+    with sqlite3.connect(runtime / "observations.sqlite3") as conn:
+        conn.execute("INSERT INTO decisions(content) VALUES(?)", ("new decision between revisions",))
+
+    # Check disk budget caps observations.sqlite3 at <= 16 MB when prior hardlink exists
+    budget = revisions._disk_budget(runtime, runtime / "features/raw_data", {}, [])
+    assert budget["sqlite_backup_bytes"] <= 17 * 1024 * 1024
+    assert budget["required_free_bytes"] < 300 * 1024 * 1024
+
+    changed = list(NEW)
+    changed[4], changed[8] = "104.5", 29
+    _add_receipt(runtime, "2026-11-06T01:50:05Z", changed)
+    _add_receipt(runtime, "2026-11-06T01:55:05Z", changed)
+    res2 = revisions.reconcile_confirmed_price_revisions(runtime, [_error()], NOW + pd.Timedelta(minutes=15))
+    assert res2["status"] == "COMMITTED"
+    archive2 = Path(res2["archive_path"])
+    delta_path = archive2 / "observations_delta.sqlite3"
+    assert delta_path.is_file()
+    with sqlite3.connect(delta_path) as conn:
+        rows = conn.execute("SELECT content FROM decisions").fetchall()
+    assert rows == [("new decision between revisions",)]
+    assert revisions.ensure_view_committed(runtime)["status"] == "COMMITTED"
+
+
+def test_v14r2_patch2_active_window_risk_vs_awaiting_settlement_open_risk(tmp_path):
+    """Patch 2: max_active_window_risk_usd separates unexpired active risk from expired awaiting-settlement open risk."""
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    policy["risk"] = {
+        "max_order_usd": 50,
+        "max_open_risk_usd": 200,
+        "max_active_window_risk_usd": 50,
+        "max_underlying_open_risk_usd": 150,
+        "max_underlying_active_risk_usd": 50,
+    }
+    limits = account._policy_risk_limits(policy)
+    assert limits["max_open_risk_usd"] == Decimal("200")
+    assert limits["max_active_window_risk_usd"] == Decimal("50")
+    assert limits["max_underlying_open_risk_usd"] == Decimal("150")
+    assert limits["max_underlying_active_risk_usd"] == Decimal("50")
+
+    ledger = account.Account(tmp_path / "account.sqlite3", initial_capital=1000, started_at="2026-11-08T00:00:00Z")
+    ov = ledger.overview(now="2026-11-08T00:00:05Z", policy=policy)
+    assert ov["risk_limits"]["max_active_window_cost_usd"] == 50.0
+    assert ov["risk_limits"]["max_total_open_cost_usd"] == 200.0
+    assert ov["risk_limits"]["max_underlying_active_cost_usd"] == 50.0
+    assert ov["risk_limits"]["max_underlying_open_cost_usd"] == 150.0
+
+
+def test_v14r2_patch3_settlement_alignment_analyzer(tmp_path):
+    """Patch 3: analyze_argon4_settlement_alignment compares official TWAP vs Binance 5m point and VWAP."""
+    from scripts.analyze_argon4_settlement_alignment import (
+        compute_settlement_alignment_row,
+        summarize_settlement_alignments,
+    )
+    intraday = tmp_path / "intraday"
+    intraday.mkdir(parents=True)
+    t0 = pd.Timestamp("2026-11-08T00:00:00Z")
+    df = pd.DataFrame([
+        {
+            "date": t0,
+            "open": 100.0,
+            "high": 100.5,
+            "low": 99.9,
+            "close": 100.015,  # +1.5 bps (1_to_3_bps), point=UP
+            "volume": 10.0,
+            "quote_volume": 999.5,  # vwap = 99.95 < 100.0 -> vwap=DOWN
+        }
+    ])
+    df.to_parquet(intraday / "BTCUSDT_5m_futures.parquet", index=False)
+    row = compute_settlement_alignment_row(
+        tmp_path,
+        stream="BTC_5m",
+        window_start="2026-11-08T00:00:00Z",
+        window_end="2026-11-08T00:05:00Z",
+        official_outcome="DOWN",
+        market_id="m1",
+        prediction_side="UP",
+    )
+    assert row["status"] == "ALIGNED_CHECKED"
+    assert row["return_bucket"] == "1_to_3_bps"
+    assert row["binance_point_outcome"] == "UP"
+    assert row["binance_vwap_outcome"] == "DOWN"
+    assert row["point_aligned"] is False
+    assert row["vwap_aligned"] is True
+    assert row["official_win"] is False
+    assert row["binance_point_win"] is True
+    summary = summarize_settlement_alignments([row])
+    assert summary["checked_records"] == 1
+    assert summary["disagreement_count"] == 1
+    assert summary["by_return_bucket"]["1_to_3_bps"]["count"] == 1
+
+
+def test_v14r2_patch4_ex_ante_rv12_bps_and_volatility_regime_guard(tmp_path):
+    """Patch 4: compute_ex_ante_rv12_bps and apply_volatility_regime_guard filter extreme volatility when enabled."""
+    intraday = tmp_path / "intraday"
+    intraday.mkdir(parents=True)
+    times = pd.date_range("2026-11-08T00:00:00Z", periods=12, freq="5min")
+    # 12 bars each with |close - open| / open = 0.0040 -> 40.0 bps
+    df = pd.DataFrame({
+        "date": times,
+        "open_time": times,
+        "open": [100.0] * 12,
+        "close": [100.4] * 12,
+    })
+    df.to_parquet(intraday / "BTCUSDT_5m_futures.parquet", index=False)
+    rv12 = model_v14.compute_ex_ante_rv12_bps(tmp_path, "BTCUSDT", as_of="2026-11-08T01:00:04Z")
+    assert rv12 == pytest.approx(40.0)
+
+    base_pred = {"stream": "BTC_15m", "z_v4": 0.65, "threshold_frozen": 0.45, "selected": True, "side": "UP"}
+    # Disabled guard preserves selection
+    res_off = model_v14.apply_volatility_regime_guard(
+        "BTC_15m", base_pred, ex_ante_rv12_bps=rv12,
+        guard_config={"enabled": False, "max_rv12_bps": {"BTC_15m": 28.0}, "action": "SKIP_OR_HALF_STAKE"},
+    )
+    assert res_off["selected"] is True
+    assert res_off["ex_ante_rv12_bps"] == pytest.approx(40.0)
+
+    # Enabled guard skips when rv12 (40.0) > max_rv12_bps (28.0)
+    res_on = model_v14.apply_volatility_regime_guard(
+        "BTC_15m", base_pred, ex_ante_rv12_bps=rv12,
+        guard_config={"enabled": True, "max_rv12_bps": {"BTC_15m": 28.0}, "action": "SKIP_OR_HALF_STAKE"},
+    )
+    assert res_on["selected"] is False
+    assert res_on["volatility_regime_guarded"] is True
+
+
+def test_v14r2_patch5_early_window_book_ticker(tmp_path, monkeypatch):
+    """Patch 5: OnlineInputs.capture_early_window_book_ticker validates params and records top-of-book snapshot."""
+    online._parameters("book_ticker", {})
+    online._parameters("book_ticker", {"symbol": "BTCUSDT"})
+    with pytest.raises(ValueError):
+        online._parameters("book_ticker", {"symbol": "INVALID"})
+
+    collector = online.OnlineInputs(tmp_path / "runtime")
+    try:
+        def fake_get(kind, params=None, **kwargs):
+            assert kind == "book_ticker"
+            return (
+                [
+                    {"symbol": "BTCUSDT", "bidPrice": "90000.0", "bidQty": "3.0", "askPrice": "90001.0", "askQty": "1.0", "time": 1762560003500},
+                    {"symbol": "ETHUSDT", "bidPrice": "3000.0", "bidQty": "5.0", "askPrice": "3000.2", "askQty": "5.0", "time": 1762560003500},
+                ],
+                {
+                    "requested_at": "2026-11-08T00:00:03.400000+00:00",
+                    "received_at": "2026-11-08T00:00:03.500000+00:00",
+                    "sha256": "e" * 64,
+                    "time_basis": "CALIBRATED_UTC_UPPER_BOUND",
+                    "clock_evidence_sha256": "f" * 64,
+                },
+            )
+        monkeypatch.setattr(collector.client, "get", fake_get)
+        snap = collector.capture_early_window_book_ticker(
+            now="2026-11-08T00:00:03.500000+00:00",
+            cohort_id="2026-11-08T00:00:00+00:00",
+        )
+        assert snap["status"] == "OBSERVED"
+        assert snap["receipt_sha256"] == "e" * 64
+        assert snap["tickers"]["BTCUSDT"]["mid_price"] == pytest.approx(90000.5)
+        assert snap["tickers"]["BTCUSDT"]["top_book_imbalance"] == pytest.approx(0.5)
+    finally:
+        collector.close()
+

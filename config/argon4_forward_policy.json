@@ -267,5 +267,17 @@
       "BTC_5m"
     ],
     "effective_from": "2026-11-07T08:20:00+00:00"
+  },
+  "volatility_regime_guard": {
+    "enabled": false,
+    "max_rv12_bps": {
+      "BTC_15m": 28.0,
+      "ETH_5m": 35.0,
+      "ETH_15m": 35.0
+    },
+    "action": "SKIP_OR_HALF_STAKE"
+  },
+  "early_window_book_ticker": {
+    "enabled": true
   }
 }

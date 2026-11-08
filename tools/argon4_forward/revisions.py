@@ -70,14 +70,15 @@ def _sha(path):
 def _cached_sha(path, cache_bucket):
     resolved = Path(path).resolve()
     st = resolved.stat()
+    meta = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
     key = str(resolved)
     with _COMMITTED_ARCHIVE_HASH_LOCK:
         cached = cache_bucket.get(key)
-    if cached is not None and cached[0] == st.st_size and cached[1] == st.st_mtime_ns:
-        return cached[2]
+    if cached is not None and cached[:5] == meta:
+        return cached[5]
     digest = _sha(resolved)
     with _COMMITTED_ARCHIVE_HASH_LOCK:
-        cache_bucket[key] = (st.st_size, st.st_mtime_ns, digest)
+        cache_bucket[key] = (*meta, digest)
     return digest
 
 
@@ -157,6 +158,10 @@ def _verified_committed_state(runtime, state):
             snapshot = Path(backup["snapshot_path"])
             if snapshot.resolve().parent != folder or _cached_sha(snapshot, cache_bucket) != backup["sha256"]:
                 raise ValueError(SAFE_ERROR)
+            if backup.get("delta_snapshot_path"):
+                delta_snap = Path(backup["delta_snapshot_path"])
+                if delta_snap.resolve().parent != folder or _cached_sha(delta_snap, cache_bucket) != backup.get("delta_sha256"):
+                    raise ValueError(SAFE_ERROR)
         if evidence.get("mark_registry_update"):
             from .mark_revision_registry import verify_registry_archive
             verify_registry_archive(folder, evidence["mark_registry_update"])
@@ -506,37 +511,85 @@ def _is_valid_observations_prefix(source, prior_snapshot):
     return True
 
 
+def _prior_committed_observations(revisions_dir, source):
+    try:
+        revisions_dir = Path(revisions_dir).resolve()
+        marker_path = revisions_dir / "view_state.json"
+        if not marker_path.is_file():
+            return None, None
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        if marker.get("status") != "COMMITTED" or not marker.get("revision_id"):
+            return None, None
+        prior_folder = (revisions_dir / str(marker["revision_id"])).resolve()
+        prior_manifest = prior_folder / "manifest.json"
+        prior_snapshot = prior_folder / "observations.sqlite3"
+        if (prior_folder.parent != revisions_dir
+                or not prior_manifest.is_file() or not prior_snapshot.is_file()
+                or prior_snapshot.is_symlink()):
+            return None, None
+        manifest_data = json.loads(prior_manifest.read_text(encoding="utf-8"))
+        expected_sha = next(
+            (b.get("sha256") for b in manifest_data.get("sqlite_backups", [])
+             if Path(b.get("snapshot_path", "")).name == "observations.sqlite3"),
+            None,
+        )
+        cache_key = (str(prior_folder), str(marker.get("revision_id")), str(marker.get("manifest_sha256")))
+        with _COMMITTED_ARCHIVE_HASH_LOCK:
+            cache_bucket = _COMMITTED_ARCHIVE_HASH_CACHE.setdefault(cache_key, {})
+        if (expected_sha and _cached_sha(prior_snapshot, cache_bucket) == expected_sha
+                and _is_valid_observations_prefix(source, prior_snapshot)):
+            return prior_snapshot, expected_sha
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+        pass
+    return None, None
+
+
+def _write_observations_delta(source, prior_snapshot, delta_path):
+    delta_rows_by_table = {}
+    schemas = {}
+    with sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True) as archived, \
+            sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as current:
+        live_tables = dict(current.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('receipts','snapshots','decisions')"
+        ))
+        arch_tables = {row[0] for row in archived.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('receipts','snapshots','decisions')"
+        )}
+        for name, create_sql in live_tables.items():
+            prior_max = (archived.execute('SELECT COALESCE(MAX(id), 0) FROM "' + name + '"').fetchone()[0]
+                         if name in arch_tables else 0)
+            rows = current.execute('SELECT * FROM "' + name + '" WHERE id > ? ORDER BY id', (prior_max,)).fetchall()
+            if rows:
+                schemas[name] = create_sql
+                delta_rows_by_table[name] = rows
+    if not delta_rows_by_table:
+        return {}
+    with delta_path.open("xb"):
+        pass
+    with sqlite3.connect(delta_path) as delta_db:
+        for name, rows in delta_rows_by_table.items():
+            delta_db.execute(schemas[name])
+            placeholders = ",".join("?" for _ in rows[0])
+            delta_db.executemany('INSERT INTO "' + name + '" VALUES(' + placeholders + ')', rows)
+    return {"delta_snapshot_path": str(delta_path), "delta_sha256": _sha(delta_path)}
+
+
 def _backup_sqlite(source, target):
     if not source.is_file():
         raise ValueError("AUDIT_DATABASE_MISSING")
     if target.name == "observations.sqlite3" and not target.exists():
+        delta_path = target.with_name("observations_delta.sqlite3")
         try:
             revisions_dir = target.resolve().parent.parent
-            marker_path = revisions_dir / "view_state.json"
-            if marker_path.is_file():
-                marker = json.loads(marker_path.read_text(encoding="utf-8"))
-                if marker.get("status") == "COMMITTED" and marker.get("revision_id"):
-                    prior_folder = (revisions_dir / str(marker["revision_id"])).resolve()
-                    prior_manifest = prior_folder / "manifest.json"
-                    prior_snapshot = prior_folder / "observations.sqlite3"
-                    if (prior_folder.parent == revisions_dir.resolve()
-                            and prior_manifest.is_file() and prior_snapshot.is_file()
-                            and not prior_snapshot.is_symlink()):
-                        manifest_data = json.loads(prior_manifest.read_text(encoding="utf-8"))
-                        expected_sha = next(
-                            (b.get("sha256") for b in manifest_data.get("sqlite_backups", [])
-                             if Path(b.get("snapshot_path", "")).name == "observations.sqlite3"),
-                            None,
-                        )
-                        cache_key = (str(prior_folder), str(marker.get("revision_id")), str(marker.get("manifest_sha256")))
-                        with _COMMITTED_ARCHIVE_HASH_LOCK:
-                            cache_bucket = _COMMITTED_ARCHIVE_HASH_CACHE.setdefault(cache_key, {})
-                        if (expected_sha and _cached_sha(prior_snapshot, cache_bucket) == expected_sha
-                                and _is_valid_observations_prefix(source, prior_snapshot)):
-                            os.link(prior_snapshot, target)
-                            return {"source_path": str(source), "snapshot_path": str(target), "sha256": expected_sha}
+            prior_snapshot, expected_sha = _prior_committed_observations(revisions_dir, source)
+            if prior_snapshot is not None and expected_sha is not None:
+                os.link(prior_snapshot, target)
+                delta_info = _write_observations_delta(source, prior_snapshot, delta_path)
+                return {"source_path": str(source), "snapshot_path": str(target),
+                        "sha256": expected_sha, **delta_info}
         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
             target.unlink(missing_ok=True)
+            delta_path.unlink(missing_ok=True)
     # SQLite backup includes committed WAL contents; copying only the main file
     # could omit precisely the receipts/decisions this recovery must preserve.
     with target.open("xb"):
@@ -556,7 +609,12 @@ def _disk_budget(runtime, raw_root, before_files, plans):
         physical = sum(p.stat().st_size for p in (source, Path(str(source)+"-wal"), Path(str(source)+"-shm")) if p.exists())
         with sqlite3.connect(source.as_uri()+"?mode=ro", uri=True) as conn:
             visible_pages = conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute("PRAGMA page_size").fetchone()[0]
-        database_bytes += max(physical, visible_pages)
+        full_db_bytes = max(physical, visible_pages)
+        if source.name == "observations.sqlite3":
+            prior_snap, _ = _prior_committed_observations(runtime / "features/revisions", source)
+            if prior_snap is not None:
+                full_db_bytes = min(full_db_bytes, 16 * 1024 * 1024)
+        database_bytes += full_db_bytes
     # Both immutable proposed files and replacement temporaries need space.
     # In-memory size is a conservative alternative to compressed file length.
     proposed_bytes = 2*sum(max(plan["path"].stat().st_size,

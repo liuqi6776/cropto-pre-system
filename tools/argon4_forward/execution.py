@@ -286,9 +286,15 @@ class PaperExecutor:
                 summary = self.account.overview(now=stamp, policy=self.policy)
                 limits = _policy_risk_limits(self.policy)
                 coin_cost = sum(p["cost_usd"]+p["fee_usd"] for p in summary["positions"] if p["underlying"]==signal["underlying"])
+                active_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
+                                  if not p.get("window_end") or _ts(p["window_end"]) > stamp)
+                active_coin_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
+                                       if p["underlying"]==signal["underlying"] and (not p.get("window_end") or _ts(p["window_end"]) > stamp))
                 amount = min(capacity,_d(cohort["single_usd"]),_d(cohort["remaining_usd"]),_d(summary["cash"]),
                              limits["max_order_usd"],limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
-                             limits["max_underlying_open_risk_usd"]-_d(coin_cost))
+                             limits["max_underlying_open_risk_usd"]-_d(coin_cost),
+                             limits["max_active_window_risk_usd"]-active_cost,
+                             limits["max_underlying_active_risk_usd"]-active_coin_cost)
                 if amount <= 0:
                     raise AccountRejected("persistent budget or existing position limit exhausted")
                 amount = amount.quantize(Decimal(".000001"),rounding=ROUND_DOWN)
@@ -342,9 +348,15 @@ class PaperExecutor:
         limits = _policy_risk_limits(policy or (cohort.get("policy") if isinstance(cohort, dict) else None))
         coin_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
                         if p["underlying"] == asset)
+        active_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
+                          if not p.get("window_end") or _ts(p["window_end"]) > stamp)
+        active_coin_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
+                               if p["underlying"] == asset and (not p.get("window_end") or _ts(p["window_end"]) > stamp))
         budget = min(_d(cohort["single_usd"]), _d(cohort["remaining_usd"]), _d(summary["cash"]),
                      limits["max_order_usd"], limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
-                     limits["max_underlying_open_risk_usd"]-coin_cost)
+                     limits["max_underlying_open_risk_usd"]-coin_cost,
+                     limits["max_active_window_risk_usd"]-active_cost,
+                     limits["max_underlying_active_risk_usd"]-active_coin_cost)
         if budget < Decimal(".000001"):
             raise AccountRejected("persistent budget or existing position limit exhausted")
 
@@ -526,9 +538,15 @@ class PaperExecutor:
                 summary = self.account.overview(now=stamp, policy=self.policy)
                 coin_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
                                 if p["underlying"]==signal["underlying"])
+                active_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
+                                  if not p.get("window_end") or _ts(p["window_end"]) > stamp)
+                active_coin_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
+                                       if p["underlying"]==signal["underlying"] and (not p.get("window_end") or _ts(p["window_end"]) > stamp))
                 amount = min(capacity,_d(cohort["single_usd"]),_d(cohort["remaining_usd"]),_d(summary["cash"]),
                              limits["max_order_usd"],limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
-                             limits["max_underlying_open_risk_usd"]-coin_cost)
+                             limits["max_underlying_open_risk_usd"]-coin_cost,
+                             limits["max_active_window_risk_usd"]-active_cost,
+                             limits["max_underlying_active_risk_usd"]-active_coin_cost)
                 amount = amount.quantize(Decimal(".000001"),rounding=ROUND_DOWN)
                 if amount <= 0:
                     raise AccountRejected("persistent budget or existing position limit exhausted")

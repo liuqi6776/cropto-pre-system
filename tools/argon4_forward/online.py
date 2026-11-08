@@ -39,6 +39,7 @@ ENDPOINTS = {
     "funding": ("https://fapi.binance.com", "/fapi/v1/fundingRate"),
     "spot": ("https://data-api.binance.vision", "/api/v3/klines"),
     "dvol": ("https://www.deribit.com", "/api/v2/public/get_volatility_index_data"),
+    "book_ticker": ("https://fapi.binance.com", "/fapi/v1/ticker/bookTicker"),
 }
 STEPS = {"5m": pd.Timedelta(minutes=5), "1h": pd.Timedelta(hours=1),
          "4h": pd.Timedelta(hours=4), "1D": pd.Timedelta(days=1)}
@@ -88,6 +89,12 @@ def _parameters(kind, params):
     """Allow only the exact public parameter vocabulary; never forward auth."""
     if kind not in ENDPOINTS:
         raise ValueError("Endpoint is not a public input endpoint")
+    if kind == "book_ticker":
+        if set(params) not in (set(), {"symbol"}):
+            raise ValueError("Unexpected public input parameters")
+        if "symbol" in params and params["symbol"] not in ALL_SYMBOLS:
+            raise ValueError("Unsupported symbol")
+        return
     allowed = ({"currency", "start_timestamp", "end_timestamp", "resolution"}
                if kind == "dvol" else set() if kind.endswith("clock")
                else {"symbol", "startTime", "endTime", "limit"} |
@@ -989,6 +996,59 @@ class OnlineInputs:
     def prefetch_auxiliary(self, now=None, *, deadline_monotonic=None, cohort_id=None):
         """Fetch only already-closed auxiliary bars and observed funding events."""
         return self._batch(now, deadline_monotonic, cohort_id, auxiliary=True)
+
+    def capture_early_window_book_ticker(self, now=None, *, cohort_id=None, deadline_monotonic=None):
+        """Capture pre-decision Binance futures bookTicker top-of-book with receipt provenance."""
+        cutoff = _utc(now) if now is not None else _utc(self.clock())
+        if isinstance(self.client, PublicInputsHTTP):
+            payload, receipt = self.client.get(
+                "book_ticker", {},
+                deadline_monotonic=deadline_monotonic,
+                cohort_id=cohort_id,
+                receipt_clock=self.clock,
+                receipt_time_basis=self.time_basis,
+                receipt_clock_evidence=self.clock_evidence_sha256,
+            )
+        else:
+            payload, receipt = self.client.get("book_ticker", {})
+        items = payload if isinstance(payload, list) else ([payload] if isinstance(payload, dict) else [])
+        target_set = set(self.symbols)
+        tickers = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            sym = item.get("symbol")
+            if sym in target_set:
+                try:
+                    bid_p = float(item["bidPrice"])
+                    bid_q = float(item["bidQty"])
+                    ask_p = float(item["askPrice"])
+                    ask_q = float(item["askQty"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                mid = 0.5 * (bid_p + ask_p) if (bid_p > 0 and ask_p > 0) else 0.0
+                imbalance = (bid_q - ask_q) / (bid_q + ask_q) if (bid_q + ask_q) > 0 else 0.0
+                tickers[sym] = {
+                    "symbol": sym,
+                    "bid_price": bid_p,
+                    "bid_qty": bid_q,
+                    "ask_price": ask_p,
+                    "ask_qty": ask_q,
+                    "mid_price": mid,
+                    "top_book_imbalance": imbalance,
+                    "event_time_ms": item.get("time"),
+                }
+        return {
+            "status": "OBSERVED" if tickers else "EMPTY",
+            "cohort_id": cohort_id,
+            "requested_at": receipt.get("requested_at"),
+            "received_at": receipt.get("received_at"),
+            "receipt_sha256": receipt.get("sha256"),
+            "time_basis": receipt.get("time_basis", self.time_basis),
+            "clock_evidence_sha256": receipt.get("clock_evidence_sha256", self.clock_evidence_sha256),
+            "as_of": _iso(cutoff),
+            "tickers": tickers,
+        }
 
     def _source_specs(self):
         for symbol in self.symbols:
