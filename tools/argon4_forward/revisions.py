@@ -530,6 +530,21 @@ def _discover_prior_deltas(prior_snapshot, prior_deltas=None):
     return []
 
 
+_VERIFIED_PREFIX_PAIR_CACHE = {}
+
+
+def _sqlite_snapshot_key(path):
+    st = path.stat()
+    with path.open("rb") as fh:
+        hdr = fh.read(100)
+    wal = Path(str(path) + "-wal")
+    wal_key = None
+    if wal.is_file():
+        wst = wal.stat()
+        wal_key = (wst.st_size, wst.st_mtime_ns, _sha(wal))
+    return (str(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, hdr, wal_key)
+
+
 def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, prior_covered_max=None):
     source = Path(source).resolve()
     prior_snapshot = Path(prior_snapshot).resolve()
@@ -538,6 +553,16 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
     deltas = _discover_prior_deltas(prior_snapshot, prior_deltas)
     if deltas is None or any(not d.is_file() or d.is_symlink() for d in deltas):
         return False
+    pair_key = (
+        _sqlite_snapshot_key(prior_snapshot),
+        tuple(_sqlite_snapshot_key(d) for d in deltas),
+        tuple(sorted((str(k), int(v or 0)) for k, v in (prior_covered_max or {}).items())),
+        _sqlite_snapshot_key(source),
+    )
+    with _COMMITTED_ARCHIVE_HASH_LOCK:
+        if _VERIFIED_PREFIX_PAIR_CACHE.get(pair_key) is True:
+            return True
+    table_cols = {}
     with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived, \
             closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
         if archived.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
@@ -547,9 +572,11 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
         if not schemas or schemas != live_schemas or not set(schemas) <= {"receipts", "snapshots", "decisions"}:
             return False
         for name in schemas:
-            primary = [row[1] for row in archived.execute('PRAGMA table_info("' + name + '")') if row[5]]
+            info = list(archived.execute('PRAGMA table_info("' + name + '")'))
+            primary = [row[1] for row in info if row[5]]
             if primary != ["id"]:
                 return False
+            table_cols[name] = [row[1] for row in info if row[1] != "id"]
     for dpath in deltas:
         with closing(sqlite3.connect(dpath.as_uri() + "?mode=ro", uri=True)) as dconn:
             if dconn.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
@@ -558,7 +585,8 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
             if not d_schemas or any(schemas.get(k) != v for k, v in d_schemas.items()):
                 return False
     # Always verify against a consistent SQLite snapshot (including WAL frames)
-    # across both the base snapshot and every prior delta segment.
+    # across both the base snapshot and every prior delta segment using primary-key
+    # streaming joins (avoiding temporary B-tree sorting of 1+ GB snapshots).
     covered_max = {name: 0 for name in schemas}
     with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as conn:
         conn.execute("ATTACH DATABASE ? AS arch_db", (prior_snapshot.as_uri() + "?mode=ro",)).fetchall()
@@ -571,10 +599,10 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
                 live_cnt = conn.execute('SELECT COUNT(*) FROM main."' + name + '" WHERE id<=?', (max_id,)).fetchall()[0][0]
                 if arch_cnt != live_cnt:
                     return False
+                col_Checks = " OR ".join(f'a."{c}" IS NOT m."{c}"' for c in table_cols[name])
+                where_diff = f"m.id IS NULL OR ({col_Checks})" if col_Checks else "m.id IS NULL"
                 mismatch = conn.execute(
-                    'SELECT 1 FROM (SELECT * FROM arch_db."' + name + '" '
-                    'EXCEPT SELECT * FROM main."' + name + '" WHERE id<=?) LIMIT 1',
-                    (max_id,),
+                    f'SELECT 1 FROM arch_db."{name}" a LEFT JOIN main."{name}" m ON a.id=m.id WHERE {where_diff} LIMIT 1'
                 ).fetchall()
                 if mismatch:
                     return False
@@ -604,10 +632,10 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
                     ).fetchall()[0][0]
                     if d_cnt != live_seg_cnt:
                         return False
+                    col_Checks = " OR ".join(f'a."{c}" IS NOT m."{c}"' for c in table_cols[name])
+                    where_diff = f"m.id IS NULL OR ({col_Checks})" if col_Checks else "m.id IS NULL"
                     mismatch = conn.execute(
-                        'SELECT 1 FROM (SELECT * FROM delta_db."' + name + '" '
-                        'EXCEPT SELECT * FROM main."' + name + '" WHERE id>? AND id<=?) LIMIT 1',
-                        (prev_max, max_id),
+                        f'SELECT 1 FROM delta_db."{name}" a LEFT JOIN main."{name}" m ON a.id=m.id WHERE {where_diff} LIMIT 1'
                     ).fetchall()
                     if mismatch:
                         return False
@@ -624,6 +652,8 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
                     if gap_cnt != 0:
                         return False
                     covered_max[name] = int(target_max)
+    with _COMMITTED_ARCHIVE_HASH_LOCK:
+        _VERIFIED_PREFIX_PAIR_CACHE[pair_key] = True
     return True
 
 

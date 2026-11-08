@@ -918,7 +918,7 @@ class OnlineInputs:
             errors, results = [], {}
             clock = self._cached_clock
             cached_clock_ok = (clock is not None and clock.get("status") == "VERIFIED" and
-                               0 <= (cutoff - _utc(clock["received_at"])).total_seconds() <= 30 and
+                               -5 <= (cutoff - _utc(clock["received_at"])).total_seconds() <= 30 and
                                getattr(self, "_cached_clock_identity", None) == context[4:])
             jobs = [] if cached_clock_ok else [("clock", self._check_clock, ())]
             if not auxiliary:

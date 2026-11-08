@@ -515,10 +515,13 @@ class ForwardPipeline:
         self._last_idle_publish = time.monotonic()
         if self.state.get("inputs", {}).get("status") == "BLOCKED":
             revision = self.state.get("revision") or {}
+            maint_res = (self.state.get("maintenance") or {}).get("result") or {}
             errors = self.state.get("inputs", {}).get("errors", [])
             deadline_block = any("DEADLINE" in str(e) or "BUSY" in str(e) for e in errors)
-            reason = ("价格修订已保留旧版本并重复确认；等待下一窗口重新检查输入"
-                      if revision.get("status") == "COMMITTED" else
+            reason = ("输入维护检查已就绪；本窗口不补单，等待下一实时决策窗口重新核验"
+                      if maint_res.get("status") == "READY_FOR_FUTURE_WINDOW" else
+                      "价格修订已保留旧版本并重复确认；等待下一窗口重新检查输入"
+                      if revision.get("status") == "COMMITTED" or maint_res.get("status") == "COMMITTED" else
                       "采集超过本轮时间预算，已跳过；等待下一实时窗口，不补历史订单" if deadline_block else
                       "模型输入存在缺口或观测冲突；当前暂停新单，等待后续数据检查")
             self.publish(status="PAPER_DATA_BLOCKED", active=True, models=models, reason=reason)
