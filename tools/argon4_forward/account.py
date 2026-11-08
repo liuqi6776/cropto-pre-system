@@ -367,44 +367,62 @@ class Account:
                 day_start_equity = equity - today_pnl
                 until_raw = policy.get("cooldown_until")
                 until_ts = _ts(until_raw) if until_raw else None
+                known_untils = [until_ts] if until_ts is not None else []
+                for (p_json,) in con.execute("SELECT policy_json FROM decision_cohorts"):
+                    try:
+                        p_u = json.loads(p_json).get("cooldown_until")
+                        if p_u:
+                            known_untils.append(_ts(p_u))
+                    except Exception:
+                        pass
+                losing_dates = sorted(d for d, amt in daily.items() if d < stamp.date() and amt < 0)
+                run_len = 0
+                prev_d = None
+                unsettled_trigger_ts = None
+                last_cleared_loss_date = None
+                for d in losing_dates:
+                    if prev_d is not None and (d - prev_d).days == 1:
+                        run_len += 1
+                    else:
+                        run_len = 1
+                    prev_d = d
+                    if run_len >= 5:
+                        # Real trigger time is the end of the 5th losing day (00:00:00Z of the next day),
+                        # never overwritten by subsequent blocked cohort dates.
+                        trigger_ts = datetime(d.year, d.month, d.day, tzinfo=timezone.utc) + timedelta(days=1)
+                        matching_untils = [u for u in known_untils if u > trigger_ts]
+                        if matching_untils and any(u <= stamp for u in matching_untils):
+                            last_cleared_loss_date = d
+                            run_len = 0
+                            prev_d = None
+                            unsettled_trigger_ts = None
+                        else:
+                            unsettled_trigger_ts = trigger_ts
+                if not losing_dates and unsettled_trigger_ts is None:
+                    prior_req_row = con.execute(
+                        "SELECT cohort_id FROM decision_cohorts "
+                        "WHERE blocked_reason='COOLDOWN_STATE_REQUIRED' "
+                        "ORDER BY cohort_id ASC LIMIT 1"
+                    ).fetchone()
+                    if prior_req_row is not None:
+                        req_ts = _ts(prior_req_row[0])
+                        matching_untils = [u for u in known_untils if u > req_ts]
+                        if not (matching_untils and any(u <= stamp for u in matching_untils)):
+                            unsettled_trigger_ts = req_ts
                 streak, day = 0, stamp.date() - timedelta(days=1)
-                while daily.get(day, 0) < 0:
+                while (last_cleared_loss_date is None or day > last_cleared_loss_date) and daily.get(day, 0) < 0:
                     streak += 1
                     day -= timedelta(days=1)
-                # Check if any historical 5-consecutive-losing-day streak occurred
-                # that has not yet been satisfied by a completed cooldown_until after it.
-                losing_dates = {d for d, amt in daily.items() if d < stamp.date() and amt < 0}
-                unsettled_five_loss_end = None
-                for d in sorted(losing_dates, reverse=True):
-                    if all((d - timedelta(days=offset)) in losing_dates for offset in range(5)):
-                        unsettled_five_loss_end = d
-                        break
-                prior_cooldown_row = con.execute(
-                    "SELECT substr(cohort_id,1,10) FROM decision_cohorts "
-                    "WHERE blocked_reason='COOLDOWN_STATE_REQUIRED' "
-                    "ORDER BY cohort_id DESC LIMIT 1"
-                ).fetchone()
-                if prior_cooldown_row is not None:
-                    prior_cd_date = datetime.fromisoformat(prior_cooldown_row[0]).date()
-                    if unsettled_five_loss_end is None or prior_cd_date > unsettled_five_loss_end:
-                        unsettled_five_loss_end = prior_cd_date
-                cooldown_latched = False
-                if unsettled_five_loss_end is not None:
-                    # Cooldown remains latched unless an explicit cooldown_until AFTER the 5th losing day has already expired
-                    end_of_loss_day = datetime(
-                        unsettled_five_loss_end.year, unsettled_five_loss_end.month, unsettled_five_loss_end.day,
-                        23, 59, 59, tzinfo=timezone.utc
-                    )
-                    if until_ts is None or until_ts <= end_of_loss_day or stamp < until_ts:
-                        cooldown_latched = True
-                        streak = max(streak, 5)
+                cooldown_latched = unsettled_trigger_ts is not None
+                if cooldown_latched:
+                    streak = max(streak, 5)
                 blocked = None
                 if day_start_equity <= 0 or Decimal(today_pnl) <= -Decimal(day_start_equity) * limits["daily_loss_fraction"]:
                     blocked = "DAILY_LOSS_LIMIT"
                 if until_ts is not None and stamp < until_ts:
                     blocked = "COOLDOWN_ACTIVE"
                 elif streak >= 5 or cooldown_latched:
-                    if until_ts is None or (unsettled_five_loss_end is not None and until_ts.date() <= unsettled_five_loss_end):
+                    if until_ts is None or (unsettled_trigger_ts is not None and until_ts <= unsettled_trigger_ts):
                         blocked = "COOLDOWN_STATE_REQUIRED"
                     elif stamp < until_ts:
                         blocked = "COOLDOWN_ACTIVE"

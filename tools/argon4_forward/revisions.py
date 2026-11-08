@@ -163,6 +163,12 @@ def _verified_committed_state(runtime, state):
                 delta_snap = Path(backup["delta_snapshot_path"])
                 if delta_snap.resolve().parent != folder or _cached_sha(delta_snap, cache_bucket) != backup.get("delta_sha256"):
                     raise ValueError(SAFE_ERROR)
+            for item in backup.get("delta_chain") or []:
+                item_snap = Path(item.get("delta_snapshot_path", ""))
+                if (item_snap.resolve().parent.parent != revisions.resolve()
+                        or item_snap.is_symlink()
+                        or _cached_sha(item_snap, cache_bucket) != item.get("delta_sha256")):
+                    raise ValueError(SAFE_ERROR)
         if evidence.get("mark_registry_update"):
             from .mark_revision_registry import verify_registry_archive
             verify_registry_archive(folder, evidence["mark_registry_update"])
@@ -496,24 +502,42 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
     return plans, pending
 
 
-_VERIFIED_PREFIX_PAIR_CACHE = {}
+def _discover_prior_deltas(prior_snapshot, prior_deltas=None):
+    if prior_deltas is not None:
+        return [Path(p).resolve() for p in prior_deltas if p]
+    folder = Path(prior_snapshot).resolve().parent
+    manifest_path = folder / "manifest.json"
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            obs_entry = next(
+                (b for b in manifest_data.get("sqlite_backups", [])
+                 if Path(b.get("snapshot_path", "")).name == "observations.sqlite3"),
+                None,
+            )
+            if obs_entry:
+                chain = obs_entry.get("delta_chain")
+                if isinstance(chain, list) and chain:
+                    return [Path(item["delta_snapshot_path"]).resolve()
+                            for item in chain if isinstance(item, dict) and item.get("delta_snapshot_path")]
+                if obs_entry.get("delta_snapshot_path"):
+                    return [Path(obs_entry["delta_snapshot_path"]).resolve()]
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+    sibling = folder / "observations_delta.sqlite3"
+    if sibling.is_file():
+        return [sibling.resolve()]
+    return []
 
 
-def _is_valid_observations_prefix(source, prior_snapshot):
+def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, prior_covered_max=None):
     source = Path(source).resolve()
     prior_snapshot = Path(prior_snapshot).resolve()
     if not source.is_file() or not prior_snapshot.is_file() or source.is_symlink() or prior_snapshot.is_symlink():
         return False
-    src_st, pri_st = source.stat(), prior_snapshot.stat()
-    with source.open("rb") as sf, prior_snapshot.open("rb") as pf:
-        src_hdr, pri_hdr = sf.read(100), pf.read(100)
-    pair_key = (
-        str(prior_snapshot), pri_st.st_dev, pri_st.st_ino, pri_st.st_size, pri_st.st_mtime_ns, pri_hdr,
-        str(source), src_st.st_dev, src_st.st_ino, src_st.st_size, src_st.st_mtime_ns, src_hdr,
-    )
-    with _COMMITTED_ARCHIVE_HASH_LOCK:
-        if _VERIFIED_PREFIX_PAIR_CACHE.get(pair_key) is True:
-            return True
+    deltas = _discover_prior_deltas(prior_snapshot, prior_deltas)
+    if deltas is None or any(not d.is_file() or d.is_symlink() for d in deltas):
+        return False
     with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived, \
             closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
         if archived.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
@@ -526,7 +550,16 @@ def _is_valid_observations_prefix(source, prior_snapshot):
             primary = [row[1] for row in archived.execute('PRAGMA table_info("' + name + '")') if row[5]]
             if primary != ["id"]:
                 return False
-    # Use SQLite C-engine ATTACH + EXCEPT to verify 100% of all rows (including middle rows > 50,000)
+    for dpath in deltas:
+        with closing(sqlite3.connect(dpath.as_uri() + "?mode=ro", uri=True)) as dconn:
+            if dconn.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                return False
+            d_schemas = dict(dconn.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+            if not d_schemas or any(schemas.get(k) != v for k, v in d_schemas.items()):
+                return False
+    # Always verify against a consistent SQLite snapshot (including WAL frames)
+    # across both the base snapshot and every prior delta segment.
+    covered_max = {name: 0 for name in schemas}
     with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as conn:
         conn.execute("ATTACH DATABASE ? AS arch_db", (prior_snapshot.as_uri() + "?mode=ro",)).fetchall()
         try:
@@ -545,30 +578,73 @@ def _is_valid_observations_prefix(source, prior_snapshot):
                 ).fetchall()
                 if mismatch:
                     return False
+                covered_max[name] = int(max_id)
         finally:
             conn.execute("DETACH DATABASE arch_db").fetchall()
-    with _COMMITTED_ARCHIVE_HASH_LOCK:
-        _VERIFIED_PREFIX_PAIR_CACHE[pair_key] = True
+        for dpath in deltas:
+            conn.execute("ATTACH DATABASE ? AS delta_db", (dpath.as_uri() + "?mode=ro",)).fetchall()
+            try:
+                d_tables = {
+                    r[0] for r in conn.execute(
+                        "SELECT name FROM delta_db.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                    )
+                }
+                for name in d_tables:
+                    min_id, max_id, d_cnt = conn.execute(
+                        'SELECT MIN(id), MAX(id), COUNT(*) FROM delta_db."' + name + '"'
+                    ).fetchall()[0]
+                    if max_id is None or d_cnt == 0:
+                        continue
+                    prev_max = covered_max[name]
+                    if int(min_id) <= prev_max:
+                        return False
+                    live_seg_cnt = conn.execute(
+                        'SELECT COUNT(*) FROM main."' + name + '" WHERE id>? AND id<=?',
+                        (prev_max, max_id),
+                    ).fetchall()[0][0]
+                    if d_cnt != live_seg_cnt:
+                        return False
+                    mismatch = conn.execute(
+                        'SELECT 1 FROM (SELECT * FROM delta_db."' + name + '" '
+                        'EXCEPT SELECT * FROM main."' + name + '" WHERE id>? AND id<=?) LIMIT 1',
+                        (prev_max, max_id),
+                    ).fetchall()
+                    if mismatch:
+                        return False
+                    covered_max[name] = int(max_id)
+            finally:
+                conn.execute("DETACH DATABASE delta_db").fetchall()
+        if isinstance(prior_covered_max, dict):
+            for name, target_max in prior_covered_max.items():
+                if name in schemas and int(target_max or 0) > covered_max[name]:
+                    gap_cnt = conn.execute(
+                        'SELECT COUNT(*) FROM main."' + name + '" WHERE id>? AND id<=?',
+                        (covered_max[name], int(target_max)),
+                    ).fetchall()[0][0]
+                    if gap_cnt != 0:
+                        return False
+                    covered_max[name] = int(target_max)
     return True
 
 
 def _prior_committed_observations(revisions_dir, source, *, include_delta_max_id=False):
+    empty = (None, None, None, None) if include_delta_max_id else (None, None)
     try:
         revisions_dir = Path(revisions_dir).resolve()
         source = Path(source).resolve()
         marker_path = revisions_dir / "view_state.json"
         if not marker_path.is_file():
-            return (None, None, None) if include_delta_max_id else (None, None)
+            return empty
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
         if marker.get("status") != "COMMITTED" or not marker.get("revision_id"):
-            return (None, None, None) if include_delta_max_id else (None, None)
+            return empty
         prior_folder = (revisions_dir / str(marker["revision_id"])).resolve()
         prior_manifest = prior_folder / "manifest.json"
         prior_snapshot = prior_folder / "observations.sqlite3"
         if (prior_folder.parent != revisions_dir
                 or not prior_manifest.is_file() or not prior_snapshot.is_file()
                 or prior_snapshot.is_symlink()):
-            return (None, None, None) if include_delta_max_id else (None, None)
+            return empty
         manifest_data = json.loads(prior_manifest.read_text(encoding="utf-8"))
         obs_entry = next(
             (b for b in manifest_data.get("sqlite_backups", [])
@@ -577,25 +653,48 @@ def _prior_committed_observations(revisions_dir, source, *, include_delta_max_id
         )
         expected_sha = obs_entry.get("sha256") if obs_entry else None
         prior_covered_max = (obs_entry.get("delta_max_id") or {}) if obs_entry else {}
+        raw_chain = obs_entry.get("delta_chain") if obs_entry else None
+        if isinstance(raw_chain, list) and raw_chain:
+            prior_chain = list(raw_chain)
+        elif obs_entry and obs_entry.get("delta_snapshot_path") and obs_entry.get("delta_sha256"):
+            prior_chain = [{
+                "delta_snapshot_path": obs_entry["delta_snapshot_path"],
+                "delta_sha256": obs_entry["delta_sha256"],
+                "delta_max_id": prior_covered_max,
+            }]
+        else:
+            prior_chain = []
         cache_key = (str(prior_folder), str(marker.get("revision_id")), str(marker.get("manifest_sha256")))
         with _COMMITTED_ARCHIVE_HASH_LOCK:
             cache_bucket = _COMMITTED_ARCHIVE_HASH_CACHE.setdefault(cache_key, {})
+        delta_paths = []
+        for item in prior_chain:
+            if not isinstance(item, dict) or not item.get("delta_snapshot_path") or not item.get("delta_sha256"):
+                return empty
+            dpath = Path(item["delta_snapshot_path"]).resolve()
+            if (dpath.parent.parent != revisions_dir or not dpath.is_file() or dpath.is_symlink()
+                    or _cached_sha(dpath, cache_bucket) != item["delta_sha256"]):
+                return empty
+            delta_paths.append(dpath)
         if (expected_sha and _cached_sha(prior_snapshot, cache_bucket) == expected_sha
-                and _is_valid_observations_prefix(source, prior_snapshot)):
+                and _is_valid_observations_prefix(
+                    source, prior_snapshot, prior_deltas=delta_paths, prior_covered_max=prior_covered_max
+                )):
             if include_delta_max_id:
-                return prior_snapshot, expected_sha, prior_covered_max
+                return prior_snapshot, expected_sha, prior_covered_max, prior_chain
             return prior_snapshot, expected_sha
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
         pass
-    return (None, None, None) if include_delta_max_id else (None, None)
+    return empty
 
 
-def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_max=None):
+def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_max=None, prior_chain=None):
     source = Path(source).resolve()
     prior_snapshot = Path(prior_snapshot).resolve()
     delta_rows_by_table = {}
     delta_max_ids = {}
     schemas = {}
+    chain = list(prior_chain or [])
     with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived, \
             closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
         live_tables = dict(current.execute(
@@ -615,7 +714,10 @@ def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_
                 schemas[name] = create_sql
                 delta_rows_by_table[name] = rows
     if not delta_rows_by_table:
-        return {"delta_max_id": delta_max_ids} if delta_max_ids else {}
+        out = {"delta_max_id": delta_max_ids} if delta_max_ids else {}
+        if chain:
+            out["delta_chain"] = chain
+        return out
     with delta_path.open("xb"):
         pass
     with closing(sqlite3.connect(delta_path)) as delta_db:
@@ -624,7 +726,9 @@ def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_
                 delta_db.execute(schemas[name])
                 placeholders = ",".join("?" for _ in rows[0])
                 delta_db.executemany('INSERT INTO "' + name + '" VALUES(' + placeholders + ')', rows)
-    return {"delta_snapshot_path": str(delta_path), "delta_sha256": _sha(delta_path), "delta_max_id": delta_max_ids}
+    delta_sha = _sha(delta_path)
+    entry = {"delta_snapshot_path": str(delta_path), "delta_sha256": delta_sha, "delta_max_id": delta_max_ids}
+    return {**entry, "delta_chain": chain + [entry]}
 
 
 def _backup_sqlite(source, target):
@@ -634,13 +738,17 @@ def _backup_sqlite(source, target):
         delta_path = target.with_name("observations_delta.sqlite3")
         try:
             revisions_dir = target.resolve().parent.parent
-            prior_snapshot, expected_sha, prior_covered_max = _prior_committed_observations(
+            prior_snapshot, expected_sha, prior_covered_max, prior_chain = _prior_committed_observations(
                 revisions_dir, source, include_delta_max_id=True
             )
             if prior_snapshot is not None and expected_sha is not None:
-                os.link(prior_snapshot, target)
+                try:
+                    os.link(prior_snapshot, target)
+                except PermissionError:
+                    shutil.copyfile(prior_snapshot, target)
                 delta_info = _write_observations_delta(
-                    source, prior_snapshot, delta_path, prior_covered_max=prior_covered_max
+                    source, prior_snapshot, delta_path,
+                    prior_covered_max=prior_covered_max, prior_chain=prior_chain,
                 )
                 return {"source_path": str(source), "snapshot_path": str(target),
                         "sha256": expected_sha, **delta_info}
