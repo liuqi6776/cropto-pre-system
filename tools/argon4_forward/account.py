@@ -623,7 +623,11 @@ class Account:
             retry_at = None
             expiry = min(_ts(cohort["expires_at"]), _ts(clean["valid_until"]))
             proposed = stamp + timedelta(seconds=2.5)
-            if (outcome == "PRICE_LIMIT_NOT_MET" and attempt < settings["max_price_rechecks"]
+            min_limit = _d(receipt.get("min_buy_price", "0"))
+            positive_asks = [_d(a["price"]) for a in receipt.get("orderbook", {}).get("asks", []) if _d(a.get("size", 0)) > 0]
+            below_min_buy = bool(positive_asks and min(positive_asks) < min_limit)
+            if (outcome == "PRICE_LIMIT_NOT_MET" and not below_min_buy
+                    and attempt < settings["max_price_rechecks"]
                     and (expiry-stamp).total_seconds() >= 3
                     and proposed <= _ts(key)+timedelta(seconds=18.5)):
                 retry_at = _iso(proposed)
@@ -692,7 +696,7 @@ class Account:
                 raise AccountRejected("invalid price skip ask level")
             if size > 0:
                 positive.append(price)
-        if not positive or any(min_limit <= p <= skip_limit for p in positive):
+        if not positive or (min_limit <= min(positive) <= skip_limit):
             raise AccountRejected("price skip requires all positive asks above the limit")
         return clean
 
@@ -980,8 +984,10 @@ class Account:
                 raise AccountRejected("cash or concurrent exposure limit exceeded")
             remaining = budget
             min_buy = limits.get("min_buy_price", Decimal("0"))
+            positive_book_prices = [p for p, v in aggregated.items() if v > 0]
+            best_ask_price = min(positive_book_prices) if positive_book_prices else Decimal("0")
             fills, cost, fees, quantity = [], 0, 0, Decimal(0)
-            for price, quoted_available in sorted(aggregated.items()):
+            for price, quoted_available in ([] if best_ask_price < min_buy else sorted(aggregated.items())):
                 consumed = con.execute("SELECT quantity FROM consumed_book_depth WHERE book_hash=? AND price=?",
                                        (book_hash, str(price))).fetchone()
                 previous_quantity = _d(consumed[0]) if consumed else Decimal(0)

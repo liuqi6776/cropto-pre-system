@@ -746,3 +746,130 @@ def test_v14r4_snapshots_only_large_observations_hardlink_chained_delta_and_acti
     assert "ADVERSE_SELECTION_GUARD" in ev["details"]["streams"]["ETH_5m"]["no_trade_reason"]
 
 
+def test_v14r5_multilevel_orderbook_adverse_selection_guard_and_immediate_skip_without_recheck(tmp_path):
+    """v14r5: multi-level orderbook with best_ask=0.25 (<0.37) and resting asks at 0.42/0.50 zeroes capacity,
+    never sweeps resting 0.42 asks, and skips immediately without WAITING_PRICE_RECHECK under multi_look_ioc."""
+    from tools.argon4_forward.execution import PaperExecutor
+
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    assert policy["min_buy_price"] == 0.37
+    assert policy["execution"]["multi_look_ioc"] is True
+
+    market_btc = {
+        "status": "VERIFIED_MARKET",
+        "active": True,
+        "closed": False,
+        "accepting_orders": True,
+        "market_id": "m-btc",
+        "condition_id": "c-btc",
+        "protocol": "polymarket_clob",
+        "asset": "BTC",
+        "duration_seconds": 900,
+        "window_start": "2026-11-08T12:00:00+00:00",
+        "window_end": "2026-11-08T12:15:00+00:00",
+        "outcome_ids": {"UP": "tok-btc-up", "DOWN": "tok-btc-down"},
+        "metadata_received_at": "2026-11-08T12:00:04+00:00",
+        "metadata_sha256": "a" * 64,
+        "fee": {"status": "KNOWN_DISABLED", "fees_enabled": False},
+        "resolution": {"source": "chainlink"},
+    }
+    market_eth = {
+        "status": "VERIFIED_MARKET",
+        "active": True,
+        "closed": False,
+        "accepting_orders": True,
+        "market_id": "m-eth",
+        "condition_id": "c-eth",
+        "protocol": "polymarket_clob",
+        "asset": "ETH",
+        "duration_seconds": 300,
+        "window_start": "2026-11-08T12:00:00+00:00",
+        "window_end": "2026-11-08T12:05:00+00:00",
+        "outcome_ids": {"UP": "tok-eth-up", "DOWN": "tok-eth-down"},
+        "metadata_received_at": "2026-11-08T12:00:04+00:00",
+        "metadata_sha256": "e" * 64,
+        "fee": {"status": "KNOWN_DISABLED", "fees_enabled": False},
+        "resolution": {"source": "chainlink"},
+    }
+    # Realistic multi-level Polymarket CLOB orderbook where best_ask=0.25 (<0.37) AND resting asks exist at 0.42 & 0.50
+    crashed_multilevel_book = {
+        "status": "OBSERVED",
+        "asset_id": "tok-btc-up",
+        "condition_id": "c-btc",
+        "source_at": "2026-11-08T12:00:05+00:00",
+        "received_at": "2026-11-08T12:00:05.100000+00:00",
+        "asks": [
+            {"price": "0.25", "size": "200"},
+            {"price": "0.32", "size": "300"},
+            {"price": "0.42", "size": "400"},
+            {"price": "0.50", "size": "500"},
+        ],
+    }
+    healthy_multilevel_book = {
+        "status": "OBSERVED",
+        "asset_id": "tok-eth-up",
+        "condition_id": "c-eth",
+        "source_at": "2026-11-08T12:00:05+00:00",
+        "received_at": "2026-11-08T12:00:05.100000+00:00",
+        "asks": [
+            {"price": "0.45", "size": "400"},
+            {"price": "0.48", "size": "500"},
+            {"price": "0.60", "size": "800"},
+        ],
+    }
+    clock = {
+        "server_minus_local_seconds": 0.0,
+        "uncertainty_seconds": 0.05,
+        "receipt_sha256": "b" * 64,
+    }
+    stamp = account._ts("2026-11-08T12:00:05.200000+00:00")
+
+    # 1. _adapt must return capacity=0 on the multi-level crashed orderbook despite resting asks at 0.42 and 0.50
+    adapted, fee, cap = PaperExecutor._adapt(
+        market_btc, "UP", crashed_multilevel_book, stamp, clock, allow_price_skip=True, min_buy_price=Decimal("0.37")
+    )
+    assert cap == Decimal(0)
+
+    # 2. Full waterfall execution under multi_look_ioc:
+    # Rank 1 (BTC_15m) has crashed multi-level book (best_ask=0.25 < 0.37): must skip immediately as PRICE_LIMIT_NOT_MET
+    # WITHOUT entering WAITING_PRICE_RECHECK, and immediately unlock Rank 2 (ETH_5m) in the same call!
+    from test_argon4_forward_execution import BOUNDARY, clock as make_clock, fixture_inputs, v5_policy
+
+    test_policy = {
+        **v5_policy(),
+        "min_buy_price": 0.37,
+        "execution": {
+            "multi_look_ioc": True,
+            "max_price_rechecks": 3,
+            "price_recheck_interval_seconds": 2.5,
+            "minimum_recheck_remaining_seconds": 3.0,
+            "last_recheck_start_after_boundary_seconds": 18.5,
+        },
+    }
+    ledger = account.Account(tmp_path / "account.sqlite3", initial_capital=10000, started_at=BOUNDARY - pd.Timedelta(seconds=1))
+    executor = PaperExecutor(ledger, test_policy)
+    decisions, markets = fixture_inputs(boundary=BOUNDARY)
+    markets["BTC_15m"]["books"]["UP"]["asks"] = [
+        {"price": "0.25", "size": "200"},
+        {"price": "0.32", "size": "300"},
+        {"price": "0.42", "size": "400"},
+        {"price": "0.50", "size": "500"},
+    ]
+    markets["ETH_5m"]["books"]["UP"]["asks"] = [
+        {"price": "0.45", "size": "400"},
+        {"price": "0.48", "size": "500"},
+    ]
+    now_ts = BOUNDARY + pd.Timedelta(seconds=1)
+    res = executor.process_cohort(BOUNDARY.isoformat(), decisions, markets, now=now_ts, clock=make_clock(now_ts))
+    assert res.get("status") != "WAITING_PRICE_RECHECK"
+    assert res["stream_results"]["BTC_15m"]["status"] == "PRICE_LIMIT_NOT_MET"
+    assert res["stream_results"]["BTC_15m"]["best_ask"] == pytest.approx(0.25)
+    assert res["stream_results"]["BTC_15m"]["min_buy_price"] == pytest.approx(0.37)
+    assert res["stream_results"]["ETH_5m"]["status"] == "FILLED_BUDGET"
+    assert any(f["signal_id"].startswith("model:ETH_5m:") for f in res["fills"])
+    assert not any(f["signal_id"].startswith("model:BTC_15m:") for f in res["fills"])
+
+
+
+
+

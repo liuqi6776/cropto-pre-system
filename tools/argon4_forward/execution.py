@@ -196,8 +196,12 @@ class PaperExecutor:
                 positive_prices.append(price)
             if min_limit <= price <= Decimal(".515"):
                 capacity += quantity * (price + Account._fee_per_share(fee,price,stamp,market["market_id"],side))
+        if positive_prices and min(positive_prices) < min_limit:
+            capacity = Decimal(0)
         if capacity <= 0:
-            if allow_price_skip and positive_prices and not any(min_limit <= p <= Decimal(".515") for p in positive_prices):
+            if allow_price_skip and positive_prices and (
+                min(positive_prices) < min_limit or min(positive_prices) > Decimal(".515")
+            ):
                 return adapted, fee, Decimal(0)
             raise AccountRejected("zero or unknown capacity cannot unlock a lower rank")
         capacity = capacity.quantize(Decimal(".000001"), rounding=ROUND_DOWN)
@@ -511,6 +515,7 @@ class PaperExecutor:
                 if not _ts(signal["decision_at"]) < stamp-timedelta(seconds=2*float(_d(clock["uncertainty_seconds"]))):
                     raise AccountRejected("fill clock lower bound has not passed the decision")
                 if capacity == 0:
+                    best = min(_d(a["price"]) for a in book["asks"] if _d(a["size"]) > 0)
                     receipt = {"source":"OBSERVED_PRICE_LIMIT_CHECK","signal":signal,"orderbook":book,"fee_quote":fee}
                     if limits["min_buy_price"] > 0:
                         receipt["min_buy_price"] = float(limits["min_buy_price"])
@@ -518,8 +523,7 @@ class PaperExecutor:
                         completed = self.account.finish_book_look(cohort["cohort_id"],stream,look_claim[1],
                                                                  "PRICE_LIMIT_NOT_MET",receipt,now=now)
                         look_claim = None
-                        if completed["next_retry_at"]:
-                            best = min(_d(a["price"]) for a in book["asks"] if _d(a["size"]) > 0)
+                        if completed["next_retry_at"] and best >= limits["min_buy_price"]:
                             stream_results[stream] = {"status":"WAITING_PRICE_RECHECK","persisted":True,
                                 "book_checked":True,"attempt":completed["attempt"],"best_ask":float(best),
                                 "limit_price":.515,
@@ -530,7 +534,6 @@ class PaperExecutor:
                             break
                     self.account.record_cohort_skip(cohort["cohort_id"],stream,"PRICE_LIMIT_NOT_MET",receipt,
                                                     now=now if multi_look is not None else stamp)
-                    best = min(_d(a["price"]) for a in book["asks"] if _d(a["size"])>0)
                     stream_results[stream] = {"status":"PRICE_LIMIT_NOT_MET","raw_capacity_usd":0.,
                         "best_ask":float(best),"limit_price":.515,
                         **({"min_buy_price": float(limits["min_buy_price"])} if limits["min_buy_price"] > 0 else {}),
