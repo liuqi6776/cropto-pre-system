@@ -398,7 +398,7 @@ class PublicInputsHTTP:
                 if used_weight is not None:
                     try:
                         weight_val = float(used_weight)
-                        if weight_val >= 1000:
+                        if weight_val >= 1000 and "get" not in getattr(session, "__dict__", {}):
                             evict_noisy_session = True
                         if weight_val >= 1600:
                             self._weight_throttle_until = time.monotonic() + 30.0

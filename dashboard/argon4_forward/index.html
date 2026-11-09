@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ARGON · 七流模拟盘</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
 <body><main>
-<header><div><span class="eyebrow">ARGON / FORWARD PAPER</span><h1>七流阶梯模拟盘</h1><p>Polymarket · 共享本金 $10,000 · 从账户创建时刻开始</p></div><div class="private">仅本机可见<br><span>真实下单未启用</span></div></header>
+<header><div><span class="eyebrow">ARGON / FORWARD PAPER</span><h1>七流阶梯模拟盘</h1><p id="header-subtitle">Polymarket · 共享本金 $1,000（打法 B：单笔 $40 / 窗口 $80） · 从账户创建时刻开始</p></div><div class="private">仅本机可见<br><span>真实下单未启用</span></div></header>
 <div class="banner" id="connection">正在连接本地账户…</div>
 <section class="cards"><article><span>模拟权益 / USD</span><strong id="equity">—</strong><small id="valuation">等待账户</small></article><article><span>已实现收益</span><strong id="pnl">—</strong><small id="return">—</small></article><article><span>可用现金</span><strong id="cash">—</strong><small id="locked">—</small></article><article><span>已结算胜 / 负</span><strong id="wins">—</strong><small id="winrate">无交易不计算胜率</small></article></section>
 <div class="split"><section class="panel"><div class="section-title"><h2>从现在起的账户曲线</h2><span id="since">—</span></div><svg id="chart" viewBox="0 0 760 200" role="img" aria-label="实际记录的模拟账户权益"></svg><p class="hint" id="chartnote">只显示已保存账户记录，不导入历史回测收益。</p></section><section class="panel"><h2>当前运行状态</h2><div id="blockers"></div><p class="hint" id="lastdecision">等待下一次实时预测</p><dl class="status-list"><dt>行情与市场观察</dt><dd id="observing">—</dd><dt>自动模拟下单</dt><dd id="paperstate">未启动 · 本地模型准备中</dd><dt>真实钱包 / 实盘</dt><dd>未连接 / 关闭</dd><dt>最后观察</dt><dd id="lastcycle">—</dd></dl></section></div>

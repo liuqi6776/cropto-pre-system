@@ -1305,7 +1305,9 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
             if _sha(target) != digest:
                 raise ValueError("SNAPSHOT_HASH_MISMATCH")
         backups = [_backup_sqlite(features / "http_receipts.sqlite3", archive / "receipts.sqlite3"),
-                   _backup_sqlite(runtime / "observations.sqlite3", archive / "observations.sqlite3", prior_obs=prior_obs)]
+                   (_backup_sqlite(runtime / "observations.sqlite3", archive / "observations.sqlite3", prior_obs=prior_obs)
+                    if prior_obs and prior_obs[0] is not None
+                    else _backup_sqlite(runtime / "observations.sqlite3", archive / "observations.sqlite3"))]
         after_files = dict(before_files)
         for plan in plans:
             proposed = archive / "proposed_raw_data" / plan["relative_path"]

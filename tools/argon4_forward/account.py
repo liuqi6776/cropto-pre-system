@@ -124,8 +124,19 @@ def _policy_risk_limits(policy=None):
     max_tick = dec_field("max_tick_budget_usd", default_tick)
     default_underlying = min(Decimal("500"), max_open) if has_field("max_open_risk_usd") and not has_field("max_underlying_open_risk_usd") else "500"
     max_underlying = dec_field("max_underlying_open_risk_usd", default_underlying)
-    max_active_open = dec_field("max_active_window_risk_usd", max_open)
-    max_active_underlying = dec_field("max_underlying_active_risk_usd", min(max_underlying, max_active_open))
+    max_active_open = (
+        dec_field("max_active_window_risk_usd", max_open)
+        if ("max_active_window_risk_usd" in risk_block or "max_open_risk_usd" not in risk_block)
+        else max_open
+    )
+    max_active_underlying = (
+        dec_field("max_underlying_active_risk_usd", min(max_underlying, max_active_open))
+        if (
+            "max_underlying_active_risk_usd" in risk_block
+            or ("max_underlying_open_risk_usd" not in risk_block and "max_open_risk_usd" not in risk_block)
+        )
+        else min(max_underlying, max_active_open)
+    )
     daily_loss = dec_field("daily_loss_fraction", "0.055")
     min_buy_price = dec_field("min_buy_price", "0")
     raw_stream_min = risk_block.get("stream_min_buy_price") if "stream_min_buy_price" in risk_block else src.get("stream_min_buy_price")
@@ -140,8 +151,9 @@ def _policy_risk_limits(policy=None):
             if not Decimal("0") <= d_val <= Decimal("0.500"):
                 raise AccountRejected("invalid policy risk limits")
             stream_min_buy_price[str(s_key)] = d_val
-    if (not Decimal("0.005") <= single_frac <= Decimal("0.030")
-            or not Decimal("0.010") <= tick_frac <= Decimal("0.050")
+    if (not Decimal("0.005") <= single_frac <= Decimal("0.050")
+            or not Decimal("0.010") <= tick_frac <= Decimal("0.100")
+            or single_frac > tick_frac
             or not Decimal("0.010") <= daily_loss <= Decimal("0.100")
             or not Decimal("0") <= min_buy_price <= Decimal("0.500")
             or max_tick <= 0 or max_order <= 0 or max_open <= 0 or max_underlying <= 0

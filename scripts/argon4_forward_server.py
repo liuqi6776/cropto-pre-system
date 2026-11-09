@@ -239,7 +239,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8897)
     parser.add_argument("--runtime-dir", type=Path, default=ROOT / "paper_runtime/argon4_forward_20261105")
-    parser.add_argument("--capital", type=float, default=10000)
+    parser.add_argument("--capital", type=float, default=None)
     parser.add_argument("--interval", type=int, default=60)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--enable-paper", action="store_true", help="Enable isolated local-model paper worker; never real trading")
@@ -249,11 +249,16 @@ def main():
         parser.error("Runtime must stay inside this workspace's paper_runtime")
     if not 1024 <= args.port <= 65535 or args.interval < 30:
         parser.error("Invalid port or polling interval")
+    capital = (
+        args.capital
+        if args.capital is not None
+        else float(load_json(ROOT / "config/argon4_forward_policy.json", {}).get("initial_capital_usd", 10000))
+    )
     # Reserve the listener before constructing any account/worker. A duplicate
     # startup must fail before it can touch the paper account or input files.
     server = None if args.once else ThreadingHTTPServer(("127.0.0.1", args.port), BaseHTTPRequestHandler)
     try:
-        app = Application(runtime, args.capital, enable_paper=args.enable_paper)
+        app = Application(runtime, capital, enable_paper=args.enable_paper)
     except BaseException:
         if server is not None:
             server.server_close()

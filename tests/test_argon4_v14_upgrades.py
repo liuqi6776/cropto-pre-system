@@ -234,13 +234,25 @@ def test_module5_production_policy_v14_and_all_8_bundles_loadable():
 
 def test_correction2_dynamic_policy_risk_limits_for_1k_trial_and_10k_default(tmp_path):
     """Correction 2: _policy_risk_limits drives Account, PaperExecutor, plan_waterfall, and live_preflight."""
+    fallback_limits = account._policy_risk_limits({})
+    assert fallback_limits["max_order_usd"] == Decimal("200")
+    assert fallback_limits["max_open_risk_usd"] == Decimal("1000")
+    assert fallback_limits["max_underlying_open_risk_usd"] == Decimal("500")
+    assert fallback_limits["max_tick_budget_usd"] == Decimal("1200")
+
     policy_path = Path("config/argon4_forward_policy.json")
     default_policy = json.loads(policy_path.read_text(encoding="utf-8"))
     default_limits = account._policy_risk_limits(default_policy)
-    assert default_limits["max_order_usd"] == Decimal("200")
-    assert default_limits["max_open_risk_usd"] == Decimal("1000")
-    assert default_limits["max_underlying_open_risk_usd"] == Decimal("500")
-    assert default_limits["max_tick_budget_usd"] == Decimal("1200")
+    assert default_policy["initial_capital_usd"] == 1000
+    assert default_limits["single_stream_equity_fraction"] == Decimal("0.04")
+    assert default_limits["tick_equity_fraction"] == Decimal("0.08")
+    assert default_limits["max_order_usd"] == Decimal("40")
+    assert default_limits["max_tick_budget_usd"] == Decimal("80")
+    assert default_limits["max_active_window_risk_usd"] == Decimal("120")
+    assert default_limits["max_open_risk_usd"] == Decimal("200")
+    assert default_limits["max_underlying_active_risk_usd"] == Decimal("80")
+    assert default_limits["max_underlying_open_risk_usd"] == Decimal("120")
+    assert default_limits["daily_loss_fraction"] == Decimal("0.08")
 
     trial_policy = json.loads(policy_path.read_text(encoding="utf-8"))
     trial_policy["risk"] = {
