@@ -143,6 +143,8 @@ class ForwardPipeline:
         self._revision_fastpath = {"enabled": False}
         self._same_cohort_revision = None
         self._blocked_input_maintenance = None
+        from .storage_janitor import StorageJanitor
+        self.janitor = StorageJanitor(self.runtime, monitor_log=self.monitor_log)
         from .polymarket_transport import PublicPolymarketTransport
         # Clock calibration keeps this CLOB connection warm without additional
         # requests. Background discovery has its own bounded connection pool.
@@ -1146,6 +1148,13 @@ class ForwardPipeline:
             if self.maintain_blocked_inputs(policy, models, cohort):
                 return
             self.prefetch_inputs(engineering, now_lower)
+            if getattr(self, "janitor", None) is not None and 95 <= elapsed <= 230:
+                try:
+                    self.janitor.maybe_run_window_maintenance(
+                        now=now_lower, elapsed_in_window=elapsed, inputs=self.inputs
+                    )
+                except Exception:
+                    pass
             self.wait_for_window(models)
             return
         self.last_cohort = cohort

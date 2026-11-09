@@ -511,23 +511,24 @@ class PaperExecutor:
                 self._clock(clock,stamp)
                 if not stamp < _ts(cohort["expires_at"]):
                     raise AccountRejected("decision cohort expired")
-                book,fee,capacity = self._adapt(market,side,observed,stamp,clock,allow_price_skip=True,min_buy_price=limits["min_buy_price"])
+                stream_min_buy = (limits.get("stream_min_buy_price") or {}).get(stream, limits["min_buy_price"])
+                book,fee,capacity = self._adapt(market,side,observed,stamp,clock,allow_price_skip=True,min_buy_price=stream_min_buy)
                 if not _ts(signal["decision_at"]) < stamp-timedelta(seconds=2*float(_d(clock["uncertainty_seconds"]))):
                     raise AccountRejected("fill clock lower bound has not passed the decision")
                 if capacity == 0:
                     best = min(_d(a["price"]) for a in book["asks"] if _d(a["size"]) > 0)
                     receipt = {"source":"OBSERVED_PRICE_LIMIT_CHECK","signal":signal,"orderbook":book,"fee_quote":fee}
-                    if limits["min_buy_price"] > 0:
-                        receipt["min_buy_price"] = float(limits["min_buy_price"])
+                    if stream_min_buy > 0:
+                        receipt["min_buy_price"] = float(stream_min_buy)
                     if multi_look is not None:
                         completed = self.account.finish_book_look(cohort["cohort_id"],stream,look_claim[1],
                                                                  "PRICE_LIMIT_NOT_MET",receipt,now=now)
                         look_claim = None
-                        if completed["next_retry_at"] and best >= limits["min_buy_price"]:
+                        if completed["next_retry_at"] and best >= stream_min_buy:
                             stream_results[stream] = {"status":"WAITING_PRICE_RECHECK","persisted":True,
                                 "book_checked":True,"attempt":completed["attempt"],"best_ask":float(best),
                                 "limit_price":.515,
-                                **({"min_buy_price": float(limits["min_buy_price"])} if limits["min_buy_price"] > 0 else {}),
+                                **({"min_buy_price": float(stream_min_buy)} if stream_min_buy > 0 else {}),
                                 "next_retry_at":completed["next_retry_at"],
                                 "book_observed_at":book["observed_at"],"approved_usd":0.,"spent_usd":0.}
                             result.update(status="WAITING_PRICE_RECHECK", next_retry_at=completed["next_retry_at"])
@@ -536,7 +537,7 @@ class PaperExecutor:
                                                     now=now if multi_look is not None else stamp)
                     stream_results[stream] = {"status":"PRICE_LIMIT_NOT_MET","raw_capacity_usd":0.,
                         "best_ask":float(best),"limit_price":.515,
-                        **({"min_buy_price": float(limits["min_buy_price"])} if limits["min_buy_price"] > 0 else {}),
+                        **({"min_buy_price": float(stream_min_buy)} if stream_min_buy > 0 else {}),
                         "book_observed_at":book["observed_at"],
                         "book_checked":True,"approved_usd":0.,"spent_usd":0.,"persisted":True}
                     continue

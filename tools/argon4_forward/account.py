@@ -128,6 +128,18 @@ def _policy_risk_limits(policy=None):
     max_active_underlying = dec_field("max_underlying_active_risk_usd", min(max_underlying, max_active_open))
     daily_loss = dec_field("daily_loss_fraction", "0.055")
     min_buy_price = dec_field("min_buy_price", "0")
+    raw_stream_min = risk_block.get("stream_min_buy_price") if "stream_min_buy_price" in risk_block else src.get("stream_min_buy_price")
+    stream_min_buy_price = {}
+    if raw_stream_min is not None:
+        if not isinstance(raw_stream_min, Mapping):
+            raise AccountRejected("invalid policy risk limits")
+        for s_key, s_val in raw_stream_min.items():
+            if s_key not in ALL_STREAMS or isinstance(s_val, bool):
+                raise AccountRejected("invalid policy risk limits")
+            d_val = _d(s_val)
+            if not Decimal("0") <= d_val <= Decimal("0.500"):
+                raise AccountRejected("invalid policy risk limits")
+            stream_min_buy_price[str(s_key)] = d_val
     if (not Decimal("0.005") <= single_frac <= Decimal("0.030")
             or not Decimal("0.010") <= tick_frac <= Decimal("0.050")
             or not Decimal("0.010") <= daily_loss <= Decimal("0.100")
@@ -149,6 +161,7 @@ def _policy_risk_limits(policy=None):
         "max_underlying_active_risk_usd": max_active_underlying,
         "daily_loss_fraction": daily_loss,
         "min_buy_price": min_buy_price,
+        "stream_min_buy_price": stream_min_buy_price,
         "max_tick_budget_atoms": _atoms(max_tick),
         "max_order_atoms": _atoms(max_order),
         "max_open_risk_atoms": _atoms(max_open),
@@ -365,6 +378,17 @@ class Account:
                     daily[date] = daily.get(date, 0) + amount
                 today_pnl = daily.get(stamp.date(), 0)
                 day_start_equity = equity - today_pnl
+                running_today = 0
+                peak_today_pnl = 0
+                for event in con.execute("SELECT utc,payload FROM events WHERE event_type='OFFICIAL_RESOLUTION_APPLIED_TO_PAPER' ORDER BY seq ASC"):
+                    if _ts(event["utc"]).date() == stamp.date():
+                        running_today += _atoms(_d(json.loads(event["payload"])["realized_pnl_usd"]))
+                        if running_today > peak_today_pnl:
+                            peak_today_pnl = running_today
+                trailing_enabled = bool(policy.get("trailing_daily_loss_limit", False))
+                ref_equity = (day_start_equity + peak_today_pnl) if trailing_enabled else day_start_equity
+                drawdown_from_ref = (today_pnl - peak_today_pnl) if trailing_enabled else today_pnl
+                max_daily_loss_atoms = int((Decimal(max(0, ref_equity)) * limits["daily_loss_fraction"]).to_integral_value(rounding=ROUND_DOWN))
                 until_raw = policy.get("cooldown_until")
                 until_ts = _ts(until_raw) if until_raw else None
                 known_untils = [until_ts] if until_ts is not None else []
@@ -417,7 +441,7 @@ class Account:
                 if cooldown_latched:
                     streak = max(streak, 5)
                 blocked = None
-                if day_start_equity <= 0 or Decimal(today_pnl) <= -Decimal(day_start_equity) * limits["daily_loss_fraction"]:
+                if ref_equity <= 0 or -drawdown_from_ref >= max_daily_loss_atoms:
                     blocked = "DAILY_LOSS_LIMIT"
                 if until_ts is not None and stamp < until_ts:
                     blocked = "COOLDOWN_ACTIVE"
@@ -430,8 +454,14 @@ class Account:
                                     a["cash_atoms"], limits["max_open_risk_atoms"]-risk,
                                     limits["max_active_window_risk_atoms"]-active_risk))
                 single = max(0, min(limits["max_order_atoms"], int(Decimal(equity)*limits["single_stream_equity_fraction"]*(Decimal(".5") if streak >= 4 else 1))))
+                remaining_loss_room = max(0, max_daily_loss_atoms + drawdown_from_ref - active_risk)
+                if (drawdown_from_ref < 0 and policy.get("cap_budget_by_daily_loss_room", True)) or bool(
+                    policy.get("cap_order_by_remaining_daily_loss", False)
+                ):
+                    budget = min(budget, remaining_loss_room)
+                    single = min(single, remaining_loss_room)
                 if not budget:
-                    blocked = blocked or "NO_RISK_BUDGET"
+                    blocked = blocked or ("DAILY_LOSS_LIMIT" if (drawdown_from_ref < 0 and remaining_loss_room == 0) else "NO_RISK_BUDGET")
                 plan_id = "cohort:" + hashlib.sha256((key+policy_hash).encode()).hexdigest()
                 con.execute("INSERT INTO decision_cohorts VALUES(?,?,?,?,?,?,?,?,?,0,?,?)", (
                     key, policy_hash, policy["version"], plan_id, _iso(stamp), _iso(boundary+timedelta(seconds=20)),
@@ -1031,7 +1061,8 @@ class Account:
                             limits["max_underlying_active_risk_atoms"] - active_coin_risk):
                 raise AccountRejected("cash or concurrent exposure limit exceeded")
             remaining = budget
-            min_buy = limits.get("min_buy_price", Decimal("0"))
+            stream_mins = limits.get("stream_min_buy_price") or {}
+            min_buy = stream_mins.get(clean["stream"], limits.get("min_buy_price", Decimal("0")))
             positive_available_prices = [
                 price for price, quoted_available in aggregated.items()
                 if quoted_available - (_d((con.execute("SELECT quantity FROM consumed_book_depth WHERE book_hash=? AND price=?",

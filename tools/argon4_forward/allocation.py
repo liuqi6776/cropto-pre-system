@@ -229,9 +229,19 @@ def plan_waterfall(policy, candidates, equity, cash, open_risk, now, day_pnl=0,
         except (ValueError, TypeError, InvalidOperation):
             block("DAY_START_EQUITY_REQUIRED", "Daily loss guard requires the observed day-start equity")
             return result
-        if -day_result >= day_base * limits["daily_loss_fraction"]:
+        max_daily_loss = day_base * limits["daily_loss_fraction"]
+        if -day_result >= max_daily_loss:
             block("DAILY_LOSS_LIMIT", "Observed daily loss reached 5.5% of day-start equity")
             return result
+        if policy.get("cap_budget_by_daily_loss_room", True):
+            remaining_room = _money(max(Decimal(0), max_daily_loss + day_result - risk))
+            if remaining_room <= 0:
+                block("DAILY_LOSS_LIMIT", "Observed daily loss plus open risk reached daily loss limit")
+                return result
+            tick_budget = min(tick_budget, remaining_room)
+            effective_single = min(effective_single, remaining_room)
+            result["initial_tick_budget_usd"] = result["unspent"] = float(tick_budget)
+            result["effective_single_stream_budget_usd"] = float(effective_single)
     if policy.get("cooldown_until") is not None or losing_days >= 5:
         try:
             cooldown_until = _time(policy.get("cooldown_until"))

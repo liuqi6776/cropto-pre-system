@@ -536,7 +536,7 @@ def test_v14r3_min_buy_price_adverse_selection_guard_and_settlement_buckets(tmp_
     )
 
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["volatility_regime_guard"]["min_rv12_bps"] == {"BTC_5m": 3.0, "ETH_5m": 3.0, "SOL_5m": 3.0}
+    assert policy["volatility_regime_guard"]["min_rv12_bps"].items() >= {"BTC_5m": 3.0, "ETH_5m": 3.0, "SOL_5m": 3.0}.items()
     policy["min_buy_price"] = 0.37
     limits = account._policy_risk_limits(policy)
     assert limits["min_buy_price"] == Decimal("0.37")
@@ -1121,6 +1121,176 @@ def test_v14r7_wal_tamper_chained_delta_tamper_and_sameday_6h_cooldown_unlock(ru
     c7 = ledger.ensure_cohort((day7 + pd.Timedelta(minutes=5)).isoformat(), pol, now=day7 + pd.Timedelta(minutes=5, seconds=1))
     assert c7["blocked_reason"] is None
     assert c7["budget_usd"] > 0
+
+
+def test_v14r9_volatility_guards_daily_loss_room_cap_and_stream_min_buy_price(tmp_path):
+    """v14r9:
+    1. Production policy configures BTC_5m max_rv12_bps=28.0 and 15m stream min_rv12_bps thresholds.
+    2. ensure_cohort caps budget_usd and single_usd by remaining distance to DAILY_LOSS_LIMIT (preventing last-order breach)
+       and supports trailing_daily_loss_limit from intraday peak realized equity.
+    3. stream_min_buy_price overrides global min_buy_price per stream in both PaperExecutor and Account.
+    """
+    from test_argon4_forward_execution import BOUNDARY, clock as make_clock, fixture_inputs, v5_policy
+    from tools.argon4_forward.execution import PaperExecutor
+
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    vguard = policy["volatility_regime_guard"]
+    assert vguard["max_rv12_bps"]["BTC_5m"] == 28.0
+    assert vguard["max_rv12_bps"]["BTC_15m"] == 28.0
+    assert vguard["min_rv12_bps"]["BTC_15m"] == 2.5
+    assert vguard["min_rv12_bps"]["SOL_15m"] == 3.0
+    assert vguard["min_rv12_bps"]["ETH_15m"] == 2.5
+    assert policy["storage_maintenance"]["enabled"] is True
+    assert policy["storage_maintenance"]["scan_interval_days"] == 14
+
+    # Test daily loss room cap: -$532 realized today on $10,000 day_start_equity leaves $18 before -$550 (-5.5%) limit
+    day0 = account._ts("2026-11-08T10:00:00Z")
+    ledger = account.Account(
+        tmp_path / "daily_cap_v14r9.sqlite3", initial_capital=10000, started_at=day0 - pd.Timedelta(hours=2)
+    )
+    with ledger._connection() as con:
+        con.execute("UPDATE account SET cash_atoms = cash_atoms - 532000000, realized_atoms = -532000000 WHERE id=1")
+        ledger._event(
+            con,
+            "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+            {"market_id": "m-loss-1", "realized_pnl_usd": -532.0},
+            day0 - pd.Timedelta(minutes=10),
+        )
+    pol = v5_policy()
+    cohort = ledger.ensure_cohort(day0.isoformat(), pol, now=day0 + pd.Timedelta(seconds=1))
+    assert cohort["blocked_reason"] is None
+    assert cohort["budget_usd"] == pytest.approx(18.0)
+    assert cohort["single_usd"] == pytest.approx(18.0)
+
+    # Test trailing_daily_loss_limit: +$600 morning peak (ref_equity=$10,600, max drawdown=$583), then -$583 from peak
+    ledger_trail = account.Account(
+        tmp_path / "trailing_v14r9.sqlite3", initial_capital=10000, started_at=day0 - pd.Timedelta(hours=4)
+    )
+    with ledger_trail._connection() as con:
+        con.execute("UPDATE account SET cash_atoms = cash_atoms + 17000000, realized_atoms = 17000000 WHERE id=1")
+        ledger_trail._event(
+            con,
+            "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+            {"market_id": "m-win-1", "realized_pnl_usd": 600.0},
+            day0 - pd.Timedelta(hours=2),
+        )
+        ledger_trail._event(
+            con,
+            "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+            {"market_id": "m-loss-2", "realized_pnl_usd": -583.0},
+            day0 - pd.Timedelta(minutes=15),
+        )
+    pol_trail = {**pol, "trailing_daily_loss_limit": True}
+    c_trail = ledger_trail.ensure_cohort(day0.isoformat(), pol_trail, now=day0 + pd.Timedelta(seconds=1))
+    assert c_trail["blocked_reason"] == "DAILY_LOSS_LIMIT"
+
+    # Test stream_min_buy_price: BTC_15m requires 0.42 while ETH_5m requires 0.37
+    pol_stream_min = {
+        **v5_policy(),
+        "min_buy_price": 0.37,
+        "stream_min_buy_price": {"BTC_15m": 0.42, "ETH_5m": 0.37},
+    }
+    ledger_sm = account.Account(
+        tmp_path / "stream_min_v14r9.sqlite3", initial_capital=10000, started_at=BOUNDARY - pd.Timedelta(seconds=1)
+    )
+    executor = PaperExecutor(ledger_sm, pol_stream_min)
+    decisions, markets = fixture_inputs(boundary=BOUNDARY)
+    # BTC_15m has best_ask = 0.39 (>= global 0.37, but < BTC_15m's 0.42 stream_min_buy_price!)
+    markets["BTC_15m"]["books"]["UP"]["asks"] = [{"price": "0.39", "size": "400"}, {"price": "0.48", "size": "500"}]
+    markets["ETH_5m"]["books"]["UP"]["asks"] = [{"price": "0.39", "size": "400"}, {"price": "0.48", "size": "500"}]
+    now_ts = BOUNDARY + pd.Timedelta(seconds=1)
+    res = executor.process_cohort(BOUNDARY.isoformat(), decisions, markets, now=now_ts, clock=make_clock(now_ts))
+    assert res["stream_results"]["BTC_15m"]["status"] == "PRICE_LIMIT_NOT_MET"
+    assert res["stream_results"]["BTC_15m"]["min_buy_price"] == pytest.approx(0.42)
+    assert res["stream_results"]["ETH_5m"]["status"] == "FILLED_BUDGET"
+
+
+def test_v14r9_storage_janitor_biweekly_cold_archive_and_revision_integrity(runtime, tmp_path, no_network):
+    """v14r9:
+    StorageJanitor migrates >14-day unpinned revision directories, aged observations.sqlite3 rows,
+    and aged monitor_audit.jsonl lines to D_drive/argon4_cold_archive with SHA256 verification,
+    while preserving active COMMITTED revision integrity and subsequent revision commits.
+    """
+    from contextlib import closing
+    from tools.argon4_forward.storage_janitor import StorageJanitor
+
+    obs_path = runtime / "observations.sqlite3"
+    with closing(sqlite3.connect(obs_path)) as conn, conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS snapshots(id INTEGER PRIMARY KEY, kind TEXT, saved_at TEXT, payload TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO snapshots(kind, saved_at, payload) VALUES(?, ?, ?)",
+            ("polymarket", "2026-10-15T00:00:00+00:00", "aged_snapshot_payload_" + ("x" * 2048)),
+        )
+        conn.execute(
+            "INSERT INTO snapshots(kind, saved_at, payload) VALUES(?, ?, ?)",
+            ("polymarket", "2026-11-05T00:00:00+00:00", "hot_snapshot_payload"),
+        )
+
+    # Revision 1 & Revision 2 (active COMMITTED revision)
+    _add_receipt(runtime)
+    _add_receipt(runtime, "2026-11-06T01:40:05Z")
+    res1 = revisions.reconcile_confirmed_price_revisions(runtime, [_error()], NOW)
+    assert res1["status"] == "COMMITTED"
+
+    # Also create an unpinned >14-day historical revision directory (from 2026-10-10)
+    revs_dir = runtime / "features" / "revisions"
+    old_rev_id = "20261010T000000000000Z_oldunpinned0001"
+    old_rev_dir = revs_dir / old_rev_id
+    old_rev_dir.mkdir(parents=True, exist_ok=True)
+    (old_rev_dir / "manifest.json").write_text(
+        json.dumps({"status": "COMMITTED", "revision_id": old_rev_id, "view_effective_at": "2026-10-10T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    (old_rev_dir / "dummy_archive.bin").write_bytes(b"cold_archive_payload_123456")
+    expected_dummy_sha = revisions._sha(old_rev_dir / "dummy_archive.bin")
+
+    # Create monitor_audit.jsonl with 1 aged line (2026-10-12) and 1 hot line (2026-11-06)
+    logs_dir = runtime / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "monitor_audit.jsonl").write_text(
+        json.dumps({"ts": "2026-10-12T00:00:00+00:00", "event": "OLD_EVENT"}) + "\n"
+        + json.dumps({"ts": "2026-11-06T01:00:00+00:00", "event": "HOT_EVENT"}) + "\n",
+        encoding="utf-8",
+    )
+
+    cold_root = tmp_path / "D_drive" / "argon4_cold_archive"
+    janitor = StorageJanitor(runtime, cold_root=cold_root)
+    maint = janitor.run_maintenance(now="2026-11-06T02:00:00+00:00")
+    assert maint["status"] == "COMPLETED"
+    assert old_rev_id in maint["revisions"]["migrated_revisions"]
+    assert not old_rev_dir.exists()
+
+    migrated_dir = cold_root / "revisions" / "2026-10" / old_rev_id
+    assert migrated_dir.is_dir()
+    assert revisions._sha(migrated_dir / "dummy_archive.bin") == expected_dummy_sha
+    assert (cold_root / "revisions" / "migration_ledger.jsonl").is_file()
+
+    # Verify aged observations.sqlite3 row was exported to cold SQLite and removed from hot DB
+    assert maint["observations_sqlite"]["exported_rows"] >= 1
+    cold_db = Path(maint["observations_sqlite"]["cold_archive_db"])
+    assert cold_db.is_file()
+    with closing(sqlite3.connect(obs_path)) as conn:
+        remaining_kinds = conn.execute("SELECT saved_at FROM snapshots").fetchall()
+        assert remaining_kinds == [("2026-11-05T00:00:00+00:00",)]
+
+    # Verify aged log line was exported and hot log only retains hot line
+    assert maint["logs"]["archived_lines"] == 1
+    hot_log_lines = (logs_dir / "monitor_audit.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(hot_log_lines) == 1
+    assert json.loads(hot_log_lines[0])["event"] == "HOT_EVENT"
+
+    # Active revision remains 100% COMMITTED
+    assert revisions.ensure_view_committed(runtime)["status"] == "COMMITTED"
+
+    # Subsequent price revision after janitor compaction still commits cleanly!
+    changed2 = list(NEW)
+    changed2[4], changed2[8] = "105.5", 33
+    _add_receipt(runtime, "2026-11-06T02:05:05Z", changed2)
+    _add_receipt(runtime, "2026-11-06T02:10:05Z", changed2)
+    res2 = revisions.reconcile_confirmed_price_revisions(runtime, [_error()], NOW + pd.Timedelta(minutes=30))
+    assert res2["status"] == "COMMITTED"
 
 
 

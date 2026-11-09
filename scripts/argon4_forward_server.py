@@ -58,12 +58,19 @@ class Application:
         self.last_cycle = None
         self.last_error = None
         from tools.argon4_forward.polymarket_transport import PublicPolymarketTransport
+        from tools.argon4_forward.storage_janitor import StorageJanitor
         self.market_transport = PublicPolymarketTransport(pool_size=4)
+        self.janitor = StorageJanitor(
+            self.runtime,
+            policy_provider=lambda: load_json(ROOT / "config/argon4_forward_policy.json", {}),
+            monitor_log=self.monitor_log,
+        )
         self.pipeline = None
         self.telemetry = None
         if enable_paper:
             from tools.argon4_forward.pipeline import ForwardPipeline
             self.pipeline = ForwardPipeline(self.account, self.runtime, self.observations, monitor_log=self.monitor_log)
+            self.pipeline.janitor = self.janitor
             policy_provider = lambda: load_json(ROOT / "config/argon4_forward_policy.json", {})
             if engineering_profile(policy_provider())["book_telemetry"]:
                 from tools.argon4_forward.book_telemetry import BookTelemetry
@@ -117,6 +124,7 @@ class Application:
                 "pipeline": pipeline,
                 "engineering": engineering,
                 "book_telemetry": self.telemetry.status() if self.telemetry else {"status": "DISABLED"},
+                "storage_janitor": self.janitor.status(),
                 "monitor_audit": self.monitor_log.summary(),
                 "backtest": load_json(ROOT / "reports/argon4_local_v4_20261106/summary.json", {}),
                 "streams": [{"stream": s, "status": DISABLED if s in stage["disabled_streams"] else "LOCAL_MODEL_LOADED" if s in models else "WAITING_FOR_MODEL",
