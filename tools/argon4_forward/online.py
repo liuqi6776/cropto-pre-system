@@ -388,6 +388,7 @@ class PublicInputsHTTP:
         requested_at = _iso(request_clock())
         time_basis = receipt_time_basis or self.time_basis
         clock_evidence = receipt_clock_evidence if receipt_clock_evidence is not None else self.clock_evidence_sha256
+        evict_noisy_session = False
         try:
             timeout = (4, 12) if remaining is None else (min(2., remaining), min(3.5, remaining))
             with session.get(url, timeout=timeout, allow_redirects=False, stream=True,
@@ -397,6 +398,8 @@ class PublicInputsHTTP:
                 if used_weight is not None:
                     try:
                         weight_val = float(used_weight)
+                        if weight_val >= 1000:
+                            evict_noisy_session = True
                         if weight_val >= 1600:
                             self._weight_throttle_until = time.monotonic() + 30.0
                             self.min_spacing = max(self._base_min_spacing, 1.0)
@@ -434,6 +437,8 @@ class PublicInputsHTTP:
             cookies = getattr(session, "cookies", None)
             if cookies is not None:
                 cookies.clear()
+            if evict_noisy_session:
+                self._close_session()
         if receipt["http_status"] in (418, 429):
             self._record_backoff(family, raw, retry_after, receipt["http_status"])
         _remaining(deadline_monotonic)

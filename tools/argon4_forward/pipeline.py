@@ -992,6 +992,57 @@ class ForwardPipeline:
         self._last_logged_block_key = key
         self.monitor_log.log_cohort_blocked(cohort, code, reason, **extra)
 
+    def _try_recover_shared_proxy_backoff(self, backoff_path, backoff):
+        """Probe fapi.binance.com on a fresh TCP session when a shared TUN/VPN node caused a 418/429."""
+        if not isinstance(backoff, dict) or backoff.get("reason") not in ("PUBLIC_HTTP_418", "PUBLIC_HTTP_429"):
+            return False
+        now_mono = time.monotonic()
+        if now_mono - getattr(self, "_last_backoff_probe_mono", 0.0) < 30.0:
+            return False
+        self._last_backoff_probe_mono = now_mono
+        try:
+            import requests
+            import sqlite3
+            with requests.Session() as probe_sess:
+                probe_sess.trust_env = False
+                resp = probe_sess.get(
+                    "https://fapi.binance.com/fapi/v1/time",
+                    timeout=(2.0, 3.0),
+                    allow_redirects=False,
+                    headers={"User-Agent": "argon4-public-paper-inputs/1"},
+                )
+                if resp.status_code != 200:
+                    return False
+                weight_hdr = resp.headers.get("X-MBX-USED-WEIGHT-1M") or resp.headers.get("x-mbx-used-weight-1m")
+                weight_val = float(weight_hdr) if weight_hdr is not None else 0.0
+                if weight_val >= 1200.0:
+                    return False
+            backoff_path.unlink(missing_ok=True)
+            receipts_db = self.runtime / "features/http_receipts.sqlite3"
+            if receipts_db.is_file():
+                with sqlite3.connect(receipts_db, timeout=5.0) as conn:
+                    conn.execute("DELETE FROM backoff WHERE family='binance'")
+            if self.inputs is not None:
+                try:
+                    self.inputs._http._memory_backoff.pop("binance", None)
+                    self.inputs._http._pending_backoff.pop("binance", None)
+                except Exception:
+                    pass
+                close_fn = getattr(self.inputs, "close", None)
+                if close_fn:
+                    close_fn()
+                self.inputs = None
+            self.monitor_log.record(
+                "INFO",
+                "SHARED_PROXY_BACKOFF_RECOVERED",
+                f"共享代理/TUN节点瞬时 418 已自动恢复: 新连接探测 200 OK (X-MBX-USED-WEIGHT-1M={weight_val:.0f})",
+                previous_blocked_until=backoff.get("blocked_until_utc"),
+                observed_weight_1m=weight_val,
+            )
+            return True
+        except Exception:
+            return False
+
     def cycle(self):
         from .online import OnlineInputs
         from .revisions import ensure_view_committed
@@ -1026,13 +1077,14 @@ class ForwardPipeline:
             backoff = json.loads(backoff_path.read_text(encoding="utf-8"))
             until = datetime.fromisoformat(backoff["blocked_until_utc"].replace("Z", "+00:00"))
             if datetime.now(timezone.utc) < until:
-                self.abandon_prepared("PUBLIC_RATE_LIMIT_BACKOFF")
-                self._log_block_once(("PUBLIC_RATE_LIMIT_BACKOFF", backoff.get("blocked_until_utc")),
-                                     None, "PUBLIC_RATE_LIMIT_BACKOFF",
-                                     "公开行情限流暂停；等待供应商解除限制", backoff=backoff)
-                self.publish(status="PUBLIC_RATE_LIMIT_BACKOFF", active=False, models=models, backoff=backoff,
-                             reason="公开行情限流暂停；本地模型已保存，等待供应商解除限制")
-                return
+                if not self._try_recover_shared_proxy_backoff(backoff_path, backoff):
+                    self.abandon_prepared("PUBLIC_RATE_LIMIT_BACKOFF")
+                    self._log_block_once(("PUBLIC_RATE_LIMIT_BACKOFF", backoff.get("blocked_until_utc")),
+                                         None, "PUBLIC_RATE_LIMIT_BACKOFF",
+                                         "公开行情限流暂停；等待供应商解除限制", backoff=backoff)
+                    self.publish(status="PUBLIC_RATE_LIMIT_BACKOFF", active=False, models=models, backoff=backoff,
+                                 reason="公开行情限流暂停；本地模型已保存，等待供应商解除限制")
+                    return
         if revision_view.get("status") == "COMMITTED":
             self.update_clock()
             effective = datetime.fromisoformat(revision_view["view_effective_at"].replace("Z", "+00:00"))
