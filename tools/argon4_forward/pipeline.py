@@ -1148,9 +1148,9 @@ class ForwardPipeline:
             if self.maintain_blocked_inputs(policy, models, cohort):
                 return
             self.prefetch_inputs(engineering, now_lower)
-            if getattr(self, "janitor", None) is not None and 95 <= elapsed <= 230:
+            if getattr(self, "janitor", None) is not None and 95 <= elapsed <= 210:
                 try:
-                    self.janitor.maybe_run_window_maintenance(
+                    self.janitor.trigger_async_if_due(
                         now=now_lower, elapsed_in_window=elapsed, inputs=self.inputs
                     )
                 except Exception:

@@ -461,7 +461,11 @@ class Account:
                     budget = min(budget, remaining_loss_room)
                     single = min(single, remaining_loss_room)
                 if not budget:
-                    blocked = blocked or ("DAILY_LOSS_LIMIT" if (drawdown_from_ref < 0 and remaining_loss_room == 0) else "NO_RISK_BUDGET")
+                    blocked = blocked or (
+                        "DAILY_LOSS_LIMIT"
+                        if (drawdown_from_ref < 0 and max_daily_loss_atoms + drawdown_from_ref <= 0)
+                        else "NO_RISK_BUDGET"
+                    )
                 plan_id = "cohort:" + hashlib.sha256((key+policy_hash).encode()).hexdigest()
                 con.execute("INSERT INTO decision_cohorts VALUES(?,?,?,?,?,?,?,?,?,0,?,?)", (
                     key, policy_hash, policy["version"], plan_id, _iso(stamp), _iso(boundary+timedelta(seconds=20)),
@@ -547,12 +551,12 @@ class Account:
         with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             stamp = current_time()
-            if decision_status == "PRICE_LIMIT_NOT_MET":
-                clean = self._validate_price_skip_receipt(stream, boundary, receipt, stamp)
             cohort = con.execute("SELECT * FROM decision_cohorts WHERE cohort_id=?", (key,)).fetchone()
             if (not cohort or not boundary <= stamp < _ts(cohort["expires_at"]) or cohort["blocked_reason"]):
                 raise AccountRejected("decision cohort unavailable")
             policy = json.loads(cohort["policy_json"])
+            if decision_status == "PRICE_LIMIT_NOT_MET":
+                clean = self._validate_price_skip_receipt(stream, boundary, receipt, stamp, cohort_policy=policy)
             if policy.get("waterfall_semantics") != V5_SEMANTICS:
                 raise AccountRejected("eligible-signal skip is not valid under this cohort policy")
             if stream in _stage(policy, boundary)["disabled_streams"]:
@@ -685,9 +689,10 @@ class Account:
             con.execute("BEGIN IMMEDIATE")
             stamp = current_time()
             self._validate_signal(clean, stamp)
-            if outcome == "PRICE_LIMIT_NOT_MET":
-                self._validate_price_skip_receipt(stream, _ts(key), receipt, stamp)
             cohort, settings = self._book_look_context(con, key, stream, stamp)
+            cohort_policy = json.loads(cohort["policy_json"])
+            if outcome == "PRICE_LIMIT_NOT_MET":
+                self._validate_price_skip_receipt(stream, _ts(key), receipt, stamp, cohort_policy=cohort_policy)
             row = con.execute("SELECT * FROM cohort_book_looks WHERE cohort_id=? AND stream=? AND attempt=?",
                               (key, stream, attempt)).fetchone()
             if (row is None or row["state"] != "REQUESTED" or row["signal_sha256"] != digest
@@ -701,7 +706,9 @@ class Account:
             retry_at = None
             expiry = min(_ts(cohort["expires_at"]), _ts(clean["valid_until"]))
             proposed = stamp + timedelta(seconds=2.5)
-            min_limit = _d(receipt.get("min_buy_price", "0"))
+            limits = _policy_risk_limits(cohort_policy)
+            expected_min_buy = (limits.get("stream_min_buy_price") or {}).get(stream, limits["min_buy_price"])
+            min_limit = _d(receipt.get("min_buy_price", str(expected_min_buy)))
             positive_asks = [_d(a["price"]) for a in receipt.get("orderbook", {}).get("asks", []) if _d(a.get("size", 0)) > 0]
             below_min_buy = bool(positive_asks and min(positive_asks) < min_limit)
             if (outcome == "PRICE_LIMIT_NOT_MET" and not below_min_buy
@@ -740,7 +747,7 @@ class Account:
                         "attempt": attempt, "reason": reason}, stamp)
         return True
 
-    def _validate_price_skip_receipt(self, stream, boundary, receipt, stamp):
+    def _validate_price_skip_receipt(self, stream, boundary, receipt, stamp, cohort_policy=None):
         """One admission path for terminal skips and retryable price misses."""
         clean = self._validate_signal(receipt.get("signal"), stamp)
         if clean["stream"] != stream or _ts(clean["window_start"]) != boundary:
@@ -776,6 +783,12 @@ class Account:
                 positive.append(price)
         if not positive or (min_limit <= min(positive) <= skip_limit):
             raise AccountRejected("price skip requires all positive asks above the limit")
+        if cohort_policy is not None:
+            limits = _policy_risk_limits(cohort_policy)
+            expected_min_buy = (limits.get("stream_min_buy_price") or {}).get(stream, limits["min_buy_price"])
+            if "min_buy_price" in receipt or (expected_min_buy > 0 and min(positive) < skip_limit):
+                if min_limit != expected_min_buy:
+                    raise AccountRejected("price skip min_buy_price does not match cohort policy")
         return clean
 
     def _validate_signal(self, signal, now):

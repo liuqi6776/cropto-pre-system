@@ -234,9 +234,10 @@ def plan_waterfall(policy, candidates, equity, cash, open_risk, now, day_pnl=0,
             block("DAILY_LOSS_LIMIT", "Observed daily loss reached 5.5% of day-start equity")
             return result
         if policy.get("cap_budget_by_daily_loss_room", True):
+            realized_room = _money(max(Decimal(0), max_daily_loss + day_result))
             remaining_room = _money(max(Decimal(0), max_daily_loss + day_result - risk))
-            if remaining_room <= 0:
-                block("DAILY_LOSS_LIMIT", "Observed daily loss plus open risk reached daily loss limit")
+            if realized_room <= 0:
+                block("DAILY_LOSS_LIMIT", "Observed daily loss reached 5.5% of day-start equity")
                 return result
             tick_budget = min(tick_budget, remaining_room)
             effective_single = min(effective_single, remaining_room)

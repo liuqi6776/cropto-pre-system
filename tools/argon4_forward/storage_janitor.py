@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+import gc
 import hashlib
 import json
 import os
@@ -19,6 +20,8 @@ import re
 import shutil
 import sqlite3
 import threading
+import time
+import uuid
 from typing import Any, Callable, Mapping
 
 from . import revisions
@@ -119,6 +122,36 @@ class StorageJanitor:
         self.explicit_cold_root = Path(cold_root) if cold_root is not None else None
         self.monitor_log = monitor_log
         self._lock = threading.Lock()
+        self._async_lock = threading.Lock()
+        self._worker_thread: threading.Thread | None = None
+        self._tls = threading.local()
+        self._last_async_result: dict[str, Any] | None = None
+
+    def _yield_for_trading_window(
+        self,
+        *,
+        active: bool | None = None,
+        time_fn: Callable[[], float] = time.time,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> float:
+        """Guarantee A: pause background janitor disk I/O during [T - 15s, T + 25s] trading window."""
+        if active is None:
+            active = bool(getattr(self._tls, "in_async_worker", False))
+        if not active:
+            return 0.0
+        slept = 0.0
+        while True:
+            sec_in_5m = float(time_fn()) % 300.0
+            if sec_in_5m >= 285.0:
+                wait_s = (300.0 - sec_in_5m) + 25.1
+            elif sec_in_5m <= 25.0:
+                wait_s = 25.1 - sec_in_5m
+            else:
+                break
+            step = min(max(0.05, wait_s), 2.0)
+            sleep_fn(step)
+            slept += step
+        return round(slept, 3)
 
     def _load_policy(self) -> Mapping[str, Any]:
         if callable(self.policy_provider):
@@ -143,16 +176,17 @@ class StorageJanitor:
         win_range = (
             block.get("allowed_window_seconds_range")
             or block.get("allowed_window_seconds_Range")
-            or [95, 230]
+            or [95, 210]
         )
         if not isinstance(win_range, (list, tuple)) or len(win_range) != 2:
-            win_range = [95, 230]
+            win_range = [95, 210]
         return {
             "enabled": bool(block.get("enabled", True)),
             "scan_interval_days": max(1, int(block.get("scan_interval_days", 14))),
             "retain_hot_days": max(1, int(block.get("retain_hot_days", 14))),
             "cold_archive_root": str(block.get("cold_archive_root", "D:/argon4_cold_archive")),
-            "max_hot_observations_mb": max(64, int(block.get("max_hot_observations_mb", 1500))),
+            "max_hot_observations_mb": max(64, int(block.get("max_hot_observations_mb", 15000))),
+            "max_hot_total_gb": max(1.0, float(block.get("max_hot_total_gb", 35.0))),
             "allowed_window_seconds_range": [float(win_range[0]), float(win_range[1])],
         }
 
@@ -309,6 +343,7 @@ class StorageJanitor:
             file_digests: dict[str, str] = {}
             rev_bytes = 0
             for src_file in source_files:
+                self._yield_for_trading_window()
                 rel = src_file.relative_to(rev_dir)
                 dst_file = dest_dir / rel
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
@@ -347,6 +382,95 @@ class StorageJanitor:
             "bytes_freed": bytes_freed,
         }
 
+    def _refresh_active_revision_observations_baseline(self) -> bool:
+        """Refresh the active COMMITTED revision's observations.sqlite3 snapshot after hot compaction.
+
+        Ensures subsequent intraday price revisions continue hitting the <2ms
+        os.link hardlink path in revisions._prior_committed_observations while
+        keeping ensure_view_committed 100% valid.
+        """
+        revisions_dir = (self.runtime / "features" / "revisions").resolve()
+        marker_path = revisions_dir / "view_state.json"
+        obs_src = self.runtime / "observations.sqlite3"
+        if not marker_path.is_file() or not obs_src.is_file():
+            return False
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            if marker.get("status") != "COMMITTED" or not marker.get("revision_id"):
+                return False
+            folder = (revisions_dir / str(marker["revision_id"])).resolve()
+            if folder.parent != revisions_dir or folder.is_symlink():
+                return False
+            manifest_path = folder / "manifest.json"
+            snap_path = folder / "observations.sqlite3"
+            if not manifest_path.is_file():
+                return False
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            obs_entry = next(
+                (
+                    b
+                    for b in manifest_data.get("sqlite_backups", [])
+                    if Path(b.get("snapshot_path", "")).name == "observations.sqlite3"
+                ),
+                None,
+            )
+            if obs_entry is None:
+                return False
+
+            tmp_snap = folder / f"observations.sqlite3.{uuid.uuid4().hex}.tmp"
+            try:
+                with closing(sqlite3.connect(obs_src.as_uri() + "?mode=ro", uri=True)) as src_con:
+                    with closing(sqlite3.connect(tmp_snap)) as dst_con:
+                        src_con.backup(dst_con)
+                new_obs_sha = _sha256(tmp_snap)
+                try:
+                    os.replace(tmp_snap, snap_path)
+                except PermissionError:
+                    gc.collect()
+                    os.replace(tmp_snap, snap_path)
+            finally:
+                tmp_snap.unlink(missing_ok=True)
+
+            obs_entry["sha256"] = new_obs_sha
+            for k in ("delta_snapshot_path", "delta_sha256", "delta_max_id", "delta_chain"):
+                obs_entry.pop(k, None)
+
+            raw_manifest = json.dumps(
+                manifest_data, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+            ).encode("utf-8")
+            tmp_manifest = folder / f"manifest.json.{uuid.uuid4().hex}.tmp"
+            try:
+                with tmp_manifest.open("wb") as fh:
+                    fh.write(raw_manifest)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_manifest, manifest_path)
+            finally:
+                tmp_manifest.unlink(missing_ok=True)
+
+            new_manifest_sha = _sha256(manifest_path)
+            marker["manifest_sha256"] = new_manifest_sha
+            raw_marker = json.dumps(
+                marker, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+            ).encode("utf-8")
+            tmp_marker = revisions_dir / f"view_state.json.{uuid.uuid4().hex}.tmp"
+            try:
+                with tmp_marker.open("wb") as fh:
+                    fh.write(raw_marker)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_marker, marker_path)
+            finally:
+                tmp_marker.unlink(missing_ok=True)
+
+            with revisions._COMMITTED_ARCHIVE_HASH_LOCK:
+                revisions._COMMITTED_ARCHIVE_HASH_CACHE.clear()
+            revisions._VERIFIED_PREFIX_PAIR_CACHE.clear()
+            revisions._ARCHIVED_SQLITE_META_CACHE.clear()
+            return True
+        except Exception:
+            return False
+
     def _rotate_one_sqlite(
         self,
         db_path: Path,
@@ -356,6 +480,7 @@ class StorageJanitor:
         *,
         archive_prefix: str,
         table_time_cols: Mapping[str, str],
+        prune_hot_rows: bool = True,
     ) -> dict[str, Any]:
         if not db_path.is_file():
             return {"status": "ABSENT", "exported_rows": 0, "bytes_before": 0, "bytes_after": 0}
@@ -364,7 +489,7 @@ class StorageJanitor:
             p.stat().st_size for p in (db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")) if p.is_file()
         )
         exported_counts: dict[str, int] = {}
-        rows_to_export: dict[str, tuple[str, list[tuple[Any, ...]]]] = {}
+        table_specs: dict[str, tuple[str, str]] = {}
 
         with closing(sqlite3.connect(db_path, timeout=15.0)) as conn:
             existing_tables = {
@@ -382,13 +507,16 @@ class StorageJanitor:
                 )
                 if ts_col is None:
                     continue
-                old_rows = conn.execute(
-                    f'SELECT * FROM "{table}" WHERE julianday("{ts_col}") < julianday(?)',
-                    (cutoff_iso,),
-                ).fetchall()
-                if old_rows:
-                    rows_to_export[table] = (existing_tables[table], old_rows)
-                    exported_counts[table] = len(old_rows)
+                row_count = int(
+                    conn.execute(
+                        f'SELECT COUNT(1) FROM "{table}" WHERE julianday("{ts_col}") < julianday(?)',
+                        (cutoff_iso,),
+                    ).fetchone()[0]
+                    or 0
+                )
+                if row_count > 0:
+                    table_specs[table] = (existing_tables[table], ts_col)
+                    exported_counts[table] = row_count
 
         total_exported = sum(exported_counts.values())
         if total_exported == 0:
@@ -408,10 +536,26 @@ class StorageJanitor:
 
         with closing(sqlite3.connect(cold_db_path)) as cold_conn:
             with cold_conn:
-                for table, (create_sql, rows) in rows_to_export.items():
+                for _table, (create_sql, _ts_col) in table_specs.items():
                     cold_conn.execute(create_sql)
-                    placeholders = ",".join("?" for _ in rows[0])
-                    cold_conn.executemany(f'INSERT INTO "{table}" VALUES ({placeholders})', rows)
+
+        # Guarantee B: stream directly inside SQLite C engine via ATTACH DATABASE (0 MB Python memory)
+        with closing(sqlite3.connect(db_path, timeout=15.0)) as conn:
+            conn.execute("ATTACH DATABASE ? AS cold_db", (str(cold_db_path),))
+            try:
+                for table, (_create_sql, ts_col) in table_specs.items():
+                    self._yield_for_trading_window()
+                    with conn:
+                        conn.execute(
+                            f'INSERT OR IGNORE INTO cold_db."{table}" '
+                            f'SELECT * FROM main."{table}" WHERE julianday("{ts_col}") < julianday(?)',
+                            (cutoff_iso,),
+                        )
+            finally:
+                try:
+                    conn.execute("DETACH DATABASE cold_db")
+                except sqlite3.Error:
+                    pass
 
         cold_sha = _sha256(cold_db_path)
         manifest_path = cold_db_path.with_suffix(".manifest.json")
@@ -425,39 +569,42 @@ class StorageJanitor:
                 "sha256": cold_sha,
                 "exported_counts": exported_counts,
                 "total_exported_rows": total_exported,
+                "hot_rows_pruned": bool(prune_hot_rows),
             },
         )
 
-        with closing(sqlite3.connect(db_path, timeout=15.0)) as conn:
-            with conn:
-                for table in rows_to_export:
-                    cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
-                    preferred_col = table_time_cols[table]
-                    ts_col = preferred_col if preferred_col in cols else (
-                        "saved_at" if "saved_at" in cols else "recorded_at"
-                    )
-                    conn.execute(
-                        f'DELETE FROM "{table}" WHERE julianday("{ts_col}") < julianday(?)',
-                        (cutoff_iso,),
-                    )
-            try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error:
-                pass
-            try:
-                conn.execute("VACUUM")
-            except sqlite3.Error:
-                pass
+        baseline_refreshed = False
+        if prune_hot_rows:
+            self._yield_for_trading_window()
+            with closing(sqlite3.connect(db_path, timeout=15.0)) as conn:
+                with conn:
+                    for table, (_create_sql, ts_col) in table_specs.items():
+                        conn.execute(
+                            f'DELETE FROM "{table}" WHERE julianday("{ts_col}") < julianday(?)',
+                            (cutoff_iso,),
+                        )
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:
+                    pass
+                try:
+                    conn.execute("VACUUM")
+                except sqlite3.Error:
+                    pass
+            if db_path.name == "observations.sqlite3":
+                baseline_refreshed = self._refresh_active_revision_observations_baseline()
 
         bytes_after = sum(
             p.stat().st_size for p in (db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")) if p.is_file()
         )
         return {
-            "status": "ARCHIVED_AND_VACUUMED",
+            "status": "ARCHIVED_AND_VACUUMED" if prune_hot_rows else "ARCHIVED_COLD_ONLY_HOT_PRESERVED",
             "cold_archive_db": str(cold_db_path),
             "cold_sha256": cold_sha,
             "exported_counts": exported_counts,
             "exported_rows": total_exported,
+            "hot_rows_pruned": bool(prune_hot_rows),
+            "baseline_refreshed": baseline_refreshed,
             "bytes_before": bytes_before,
             "bytes_after": bytes_after,
         }
@@ -547,7 +694,12 @@ class StorageJanitor:
 
         return {"archived_lines": archived_total, "cold_files": cold_files}
 
-    def run_maintenance(self, now: Any = None) -> dict[str, Any]:
+    def run_maintenance(
+        self,
+        now: Any = None,
+        *,
+        prune_hot_observations: bool = True,
+    ) -> dict[str, Any]:
         """Execute a full bi-weekly cold-archive and hot-compaction pass."""
         if not self._lock.acquire(blocking=False):
             return {"status": "SKIPPED", "reason": "JANITOR_ALREADY_RUNNING"}
@@ -570,6 +722,7 @@ class StorageJanitor:
                 now_dt,
                 archive_prefix="observations_archive",
                 table_time_cols={"snapshots": "saved_at", "receipts": "received_at"},
+                prune_hot_rows=bool(prune_hot_observations),
             )
             tel_result = self._rotate_one_sqlite(
                 self.runtime / "book_telemetry.sqlite3",
@@ -578,7 +731,9 @@ class StorageJanitor:
                 now_dt,
                 archive_prefix="book_telemetry_archive",
                 table_time_cols={"samples": "target_at", "decision_links": "observed_at"},
+                prune_hot_rows=True,
             )
+            self._yield_for_trading_window()
             log_result = self._rotate_audit_logs(cold_root, cutoff_dt, now_dt)
 
             # Re-verify active revision integrity after maintenance
@@ -635,6 +790,54 @@ class StorageJanitor:
         finally:
             self._lock.release()
 
+    def _async_worker_main(self, *, now: Any, prune_hot_observations: bool) -> None:
+        self._tls.in_async_worker = True
+        try:
+            self._last_async_result = self.run_maintenance(
+                now=now,
+                prune_hot_observations=prune_hot_observations,
+            )
+        except Exception as exc:
+            self._last_async_result = {"status": "FAILED", "error": f"{type(exc).__name__}:{exc}"}
+        finally:
+            self._tls.in_async_worker = False
+
+    def trigger_async_if_due(
+        self,
+        *,
+        now: Any = None,
+        elapsed_in_window: float | None = None,
+        inputs: Any = None,
+    ) -> dict[str, Any]:
+        """Non-blocking (<0.1ms) check on the main trading thread; spawns daemon worker if due."""
+        with self._async_lock:
+            if self._worker_thread is not None and self._worker_thread.is_alive():
+                return {"status": "ALREADY_RUNNING_ASYNC"}
+            due, reason = self.should_run(now=now, elapsed_in_window=elapsed_in_window)
+            if not due:
+                return {"status": "NOT_DUE", "reason": reason}
+            if inputs is not None:
+                outstanding = getattr(inputs, "_outstanding", ())
+                if any(not f.done() for f in outstanding):
+                    return {"status": "DEFERRED_INPUTS_BUSY"}
+            cfg = self._config()
+            obs_mb = self._observations_size_mb()
+            # Guarantee C: keep observations.sqlite3 hardlink prefix intact unless >= 15 GB
+            prune_hot_obs = obs_mb >= cfg["max_hot_observations_mb"]
+            worker = threading.Thread(
+                target=self._async_worker_main,
+                kwargs={"now": now, "prune_hot_observations": prune_hot_obs},
+                name="argon4-janitor-worker",
+                daemon=True,
+            )
+            self._worker_thread = worker
+            worker.start()
+            return {
+                "status": "TRIGGERED_ASYNC",
+                "reason": reason,
+                "prune_hot_observations": prune_hot_obs,
+            }
+
     def maybe_run_window_maintenance(
         self,
         *,
@@ -642,30 +845,8 @@ class StorageJanitor:
         elapsed_in_window: float | None = None,
         inputs: Any = None,
     ) -> dict[str, Any] | None:
-        due, reason = self.should_run(now=now, elapsed_in_window=elapsed_in_window)
-        if not due:
-            return None
-        if inputs is not None:
-            outstanding = getattr(inputs, "_outstanding", ())
-            if any(not f.done() for f in outstanding):
-                return None
-            inp_lock = getattr(inputs, "_lock", None)
-            if inp_lock is not None:
-                if not inp_lock.acquire(blocking=False):
-                    return None
-                try:
-                    if not revisions._RECOVERY_LOCK.acquire(blocking=False):
-                        return None
-                    try:
-                        # Release _RECOVERY_LOCK inside run_maintenance only around ensure_view_committed,
-                        # or call run_maintenance directly after releasing _RECOVERY_LOCK while holding inp_lock.
-                        pass
-                    finally:
-                        revisions._RECOVERY_LOCK.release()
-                    return self.run_maintenance(now=now)
-                finally:
-                    inp_lock.release()
-        return self.run_maintenance(now=now)
+        res = self.trigger_async_if_due(now=now, elapsed_in_window=elapsed_in_window, inputs=inputs)
+        return res if res.get("status") == "TRIGGERED_ASYNC" else None
 
     def status(self, now: Any = None) -> dict[str, Any]:
         cfg = self._config()
@@ -685,6 +866,7 @@ class StorageJanitor:
             hot_free_gb = None
         cold_total_mb = round(_dir_size_bytes(cold_root) / (1024 * 1024), 3) if cold_root.exists() else 0.0
         due, due_reason = self.should_run(now=now_dt)
+        worker_alive = bool(self._worker_thread is not None and self._worker_thread.is_alive())
         return {
             "enabled": cfg["enabled"],
             "scan_interval_days": cfg["scan_interval_days"],
@@ -695,11 +877,13 @@ class StorageJanitor:
             "hot_free_gb": hot_free_gb,
             "observations_sqlite_mb": self._observations_size_mb(),
             "max_hot_observations_mb": cfg["max_hot_observations_mb"],
+            "max_hot_total_gb": cfg["max_hot_total_gb"],
             "cold_archive_total_mb": cold_total_mb,
             "last_scan_utc": last_scan_utc,
             "next_scan_due_utc": next_due_utc,
             "due_now": due,
             "due_reason": due_reason,
+            "async_worker_alive": worker_alive,
             "last_result": state.get("last_result"),
         }
 

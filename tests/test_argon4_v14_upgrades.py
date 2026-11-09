@@ -1284,13 +1284,132 @@ def test_v14r9_storage_janitor_biweekly_cold_archive_and_revision_integrity(runt
     # Active revision remains 100% COMMITTED
     assert revisions.ensure_view_committed(runtime)["status"] == "COMMITTED"
 
-    # Subsequent price revision after janitor compaction still commits cleanly!
+    # Subsequent price revision after janitor compaction still commits cleanly and hardlinks the refreshed baseline!
+    assert maint["observations_sqlite"]["baseline_refreshed"] is True
     changed2 = list(NEW)
     changed2[4], changed2[8] = "105.5", 33
     _add_receipt(runtime, "2026-11-06T02:05:05Z", changed2)
     _add_receipt(runtime, "2026-11-06T02:10:05Z", changed2)
     res2 = revisions.reconcile_confirmed_price_revisions(runtime, [_error()], NOW + pd.Timedelta(minutes=30))
     assert res2["status"] == "COMMITTED"
+    rev1_obs = Path(res1["archive_path"]) / "observations.sqlite3"
+    rev2_obs = Path(res2["archive_path"]) / "observations.sqlite3"
+    assert rev1_obs.stat().st_ino == rev2_obs.stat().st_ino
+
+
+def test_v14r10_async_janitor_trading_yield_min_buy_policy_and_active_risk_status(tmp_path):
+    """v14r10:
+    1. storage_maintenance configures 15GB/35GB thresholds and [95, 210] idle window;
+       _yield_for_trading_window pauses during [T-15s, T+25s]; trigger_async_if_due runs non-blocking.
+    2. Account rejects price-skip receipts whose min_buy_price mismatches cohort policy.
+    3. Account and allocation report NO_RISK_BUDGET (not DAILY_LOSS_LIMIT) when active_risk temporarily
+       consumes remaining daily loss room while realized drawdown is still above the -5.5% limit.
+    """
+    from test_argon4_forward_execution import BOUNDARY, clock as make_clock, fixture_inputs, v5_policy
+    from tools.argon4_forward import allocation
+    from tools.argon4_forward.execution import PaperExecutor
+    from tools.argon4_forward.storage_janitor import StorageJanitor
+
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    sm = policy["storage_maintenance"]
+    assert sm["max_hot_observations_mb"] == 15000
+    assert sm["max_hot_total_gb"] == 35.0
+    assert sm["allowed_window_seconds_Range"] == [95, 210]
+
+    # 1. Verify _yield_for_trading_window pauses during [T-15s, T+25s] and returns immediately at T+120s
+    janitor = StorageJanitor(tmp_path / "rt_yield", cold_root=tmp_path / "cold_yield")
+    fake_clock = [290.0]  # T - 10s (inside [285, 300))
+    slept_steps = []
+
+    def fake_time():
+        return fake_clock[0]
+
+    def fake_sleep(dt):
+        slept_steps.append(dt)
+        fake_clock[0] += dt
+
+    total_slept = janitor._yield_for_trading_window(active=True, time_fn=fake_time, sleep_fn=fake_sleep)
+    assert total_slept > 35.0
+    assert 25.0 < (fake_clock[0] % 300.0) < 285.0
+    assert janitor._yield_for_trading_window(active=True, time_fn=lambda: 120.0, sleep_fn=fake_sleep) == 0.0
+
+    # 2. Verify Account rejects price-skip receipt with forged min_buy_price mismatching cohort policy
+    pol_sm = {
+        **v5_policy(),
+        "min_buy_price": 0.37,
+        "stream_min_buy_price": {"BTC_15m": 0.42, "ETH_5m": 0.37},
+    }
+    ledger_sm = account.Account(
+        tmp_path / "v14r10_min_buy.sqlite3", initial_capital=10000, started_at=BOUNDARY - pd.Timedelta(seconds=1)
+    )
+    executor = PaperExecutor(ledger_sm, pol_sm)
+    decisions, markets = fixture_inputs(boundary=BOUNDARY)
+    markets["BTC_15m"]["books"]["UP"]["asks"] = [{"price": "0.39", "size": "400"}, {"price": "0.48", "size": "500"}]
+    now_ts = BOUNDARY + pd.Timedelta(seconds=1)
+    res = executor.process_cohort(BOUNDARY.isoformat(), decisions, markets, now=now_ts, clock=make_clock(now_ts))
+    assert res["stream_results"]["BTC_15m"]["status"] == "PRICE_LIMIT_NOT_MET"
+
+    # Attempt to record a price skip on a new cohort with forged min_buy_price=0.45 when policy is 0.42
+    b2 = BOUNDARY + pd.Timedelta(minutes=15)
+    ledger_sm2 = account.Account(
+        tmp_path / "v14r10_min_buy_forged.sqlite3", initial_capital=10000, started_at=b2 - pd.Timedelta(seconds=1)
+    )
+    ledger_sm2.ensure_cohort(b2.isoformat(), pol_sm, now=b2 + pd.Timedelta(seconds=1))
+    with ledger_sm._connection() as con:
+        valid_row = con.execute(
+            "SELECT receipt_json FROM cohort_streams WHERE stream='BTC_15m'"
+        ).fetchone()
+    forged_receipt = json.loads(valid_row[0])
+    forged_receipt["min_buy_price"] = "0.45"
+    with pytest.raises(account.AccountRejected, match="price skip min_buy_price does not match cohort policy"):
+        ledger_sm.record_cohort_skip(
+            BOUNDARY.isoformat(), "BTC_15m", "PRICE_LIMIT_NOT_MET", forged_receipt, now=now_ts
+        )
+
+    # 3. Verify NO_RISK_BUDGET vs DAILY_LOSS_LIMIT when active_risk consumes remaining daily loss room
+    day0 = account._ts("2026-11-08T12:00:00Z")
+    ledger_ar = account.Account(
+        tmp_path / "v14r10_active_risk.sqlite3", initial_capital=10000, started_at=day0 - pd.Timedelta(hours=2)
+    )
+    with ledger_ar._connection() as con:
+        # Realized loss today is -$300 (-3.0% on $10,000, well above -$550 limit), leaving $250 realized room
+        con.execute("UPDATE account SET cash_atoms = cash_atoms - 560000000, realized_atoms = -300000000 WHERE id=1")
+        ledger_ar._event(
+            con,
+            "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+            {"market_id": "m-loss-300", "realized_pnl_usd": -300.0},
+            day0 - pd.Timedelta(minutes=20),
+        )
+        # Insert an unexpired active order of $260 (expires at day0 + 10m)
+        con.execute(
+            "INSERT INTO signals VALUES('sig-ar','{}',?)",
+            (account._iso(day0 - pd.Timedelta(minutes=4)),),
+        )
+        con.execute(
+            "INSERT INTO orders VALUES('ord-ar','sig-ar','m-ar','BTC','UP','520',260000000,0,'OPEN',?,?,?)",
+            (
+                account._iso(day0 - pd.Timedelta(minutes=4)),
+                account._iso(day0 + pd.Timedelta(minutes=10)),
+                json.dumps({"stream": "BTC_15m"}),
+            ),
+        )
+    c_ar = ledger_ar.ensure_cohort(day0.isoformat(), v5_policy(), now=day0 + pd.Timedelta(seconds=1))
+    assert c_ar["budget_usd"] == 0.0
+    assert c_ar["blocked_reason"] == "NO_RISK_BUDGET"
+
+    plan_ar = allocation.plan_waterfall(
+        v5_policy(),
+        [],
+        equity=9700,
+        cash=9440,
+        open_risk=260,
+        now=day0 + pd.Timedelta(seconds=1),
+        day_pnl=-300,
+        day_start_equity=10000,
+    )
+    assert plan_ar["initial_tick_budget_usd"] == 0.0
+    assert plan_ar["reasons"] == ["NO_RISK_BUDGET"]
+
 
 
 

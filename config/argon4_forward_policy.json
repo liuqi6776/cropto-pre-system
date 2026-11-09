@@ -295,10 +295,11 @@
     "scan_interval_days": 14,
     "retain_hot_days": 14,
     "cold_archive_root": "D:/argon4_cold_archive",
-    "max_hot_observations_mb": 1500,
+    "max_hot_observations_mb": 15000,
+    "max_hot_total_gb": 35.0,
     "allowed_window_seconds_Range": [
       95,
-      230
+      210
     ]
   }
 }
