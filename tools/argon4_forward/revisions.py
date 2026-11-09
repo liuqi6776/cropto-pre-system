@@ -531,6 +531,7 @@ def _discover_prior_deltas(prior_snapshot, prior_deltas=None):
 
 
 _VERIFIED_PREFIX_PAIR_CACHE = {}
+_ARCHIVED_SQLITE_META_CACHE = {}
 
 
 def _sqlite_snapshot_key(path):
@@ -553,37 +554,54 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
     deltas = _discover_prior_deltas(prior_snapshot, prior_deltas)
     if deltas is None or any(not d.is_file() or d.is_symlink() for d in deltas):
         return False
+    snap_key = _sqlite_snapshot_key(prior_snapshot)
+    delta_keys = tuple(_sqlite_snapshot_key(d) for d in deltas)
     pair_key = (
-        _sqlite_snapshot_key(prior_snapshot),
-        tuple(_sqlite_snapshot_key(d) for d in deltas),
+        snap_key,
+        delta_keys,
         tuple(sorted((str(k), int(v or 0)) for k, v in (prior_covered_max or {}).items())),
         _sqlite_snapshot_key(source),
     )
     with _COMMITTED_ARCHIVE_HASH_LOCK:
         if _VERIFIED_PREFIX_PAIR_CACHE.get(pair_key) is True:
             return True
-    table_cols = {}
-    with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived, \
-            closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
-        if archived.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-            return False
-        schemas = dict(archived.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+        cached_snap_meta = _ARCHIVED_SQLITE_META_CACHE.get(snap_key)
+    if cached_snap_meta is not None:
+        schemas, table_cols = cached_snap_meta
+    else:
+        table_cols = {}
+        with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived:
+            if archived.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                return False
+            schemas = dict(archived.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+            if not schemas or not set(schemas) <= {"receipts", "snapshots", "decisions"}:
+                return False
+            for name in schemas:
+                info = list(archived.execute('PRAGMA table_info("' + name + '")'))
+                primary = [row[1] for row in info if row[5]]
+                if primary != ["id"]:
+                    return False
+                table_cols[name] = [row[1] for row in info if row[1] != "id"]
+        with _COMMITTED_ARCHIVE_HASH_LOCK:
+            _ARCHIVED_SQLITE_META_CACHE[snap_key] = (schemas, table_cols)
+    with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
         live_schemas = dict(current.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
-        if not schemas or schemas != live_schemas or not set(schemas) <= {"receipts", "snapshots", "decisions"}:
+        if schemas != live_schemas:
             return False
-        for name in schemas:
-            info = list(archived.execute('PRAGMA table_info("' + name + '")'))
-            primary = [row[1] for row in info if row[5]]
-            if primary != ["id"]:
+    for dpath, dkey in zip(deltas, delta_keys):
+        with _COMMITTED_ARCHIVE_HASH_LOCK:
+            d_schemas = _ARCHIVED_SQLITE_META_CACHE.get(dkey)
+        if d_schemas is None:
+            with closing(sqlite3.connect(dpath.as_uri() + "?mode=ro", uri=True)) as dconn:
+                if dconn.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                    return False
+                d_schemas = dict(dconn.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+            if not d_schemas:
                 return False
-            table_cols[name] = [row[1] for row in info if row[1] != "id"]
-    for dpath in deltas:
-        with closing(sqlite3.connect(dpath.as_uri() + "?mode=ro", uri=True)) as dconn:
-            if dconn.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-                return False
-            d_schemas = dict(dconn.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
-            if not d_schemas or any(schemas.get(k) != v for k, v in d_schemas.items()):
-                return False
+            with _COMMITTED_ARCHIVE_HASH_LOCK:
+                _ARCHIVED_SQLITE_META_CACHE[dkey] = d_schemas
+        if any(schemas.get(k) != v for k, v in d_schemas.items()):
+            return False
     # Always verify against a consistent SQLite snapshot (including WAL frames)
     # across both the base snapshot and every prior delta segment using primary-key
     # streaming joins (avoiding temporary B-tree sorting of 1+ GB snapshots).
@@ -725,6 +743,7 @@ def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_
     delta_max_ids = {}
     schemas = {}
     chain = list(prior_chain or [])
+    compact_chain = len(chain) >= 8
     with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived, \
             closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
         live_tables = dict(current.execute(
@@ -736,7 +755,7 @@ def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_
         for name, create_sql in live_tables.items():
             prior_max = (archived.execute('SELECT COALESCE(MAX(id), 0) FROM "' + name + '"').fetchone()[0]
                          if name in arch_tables else 0)
-            start_id = max(int(prior_max or 0), int((prior_covered_max or {}).get(name, 0) or 0))
+            start_id = int(prior_max or 0) if compact_chain else max(int(prior_max or 0), int((prior_covered_max or {}).get(name, 0) or 0))
             live_max = current.execute('SELECT COALESCE(MAX(id), 0) FROM "' + name + '"').fetchone()[0]
             delta_max_ids[name] = int(live_max or start_id)
             rows = current.execute('SELECT * FROM "' + name + '" WHERE id > ? ORDER BY id', (start_id,)).fetchall()
@@ -758,7 +777,7 @@ def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_
                 delta_db.executemany('INSERT INTO "' + name + '" VALUES(' + placeholders + ')', rows)
     delta_sha = _sha(delta_path)
     entry = {"delta_snapshot_path": str(delta_path), "delta_sha256": delta_sha, "delta_max_id": delta_max_ids}
-    return {**entry, "delta_chain": chain + [entry]}
+    return {**entry, "delta_chain": [entry] if compact_chain else chain + [entry]}
 
 
 def _backup_sqlite(source, target):

@@ -271,9 +271,10 @@ class MonitorAuditLogger:
     def log_cohort_execution(self, cohort: str, policy: dict, decisions: dict,
                              outcome: dict, timing: dict | None = None) -> dict:
         order = policy.get("order") or list(decisions.keys())
-        stream_outcomes = outcome.get("streams") or {}
+        stream_outcomes = outcome.get("streams") or outcome.get("stream_results") or {}
         fills = outcome.get("fills") or []
-        fills_by_stream = {f.get("stream"): f for f in fills if isinstance(f, dict)}
+        fills_by_stream = {f.get("stream"): f for f in fills if isinstance(f, dict) and f.get("stream")}
+        fills_by_signal = {f.get("signal_id"): f for f in fills if isinstance(f, dict) and f.get("signal_id")}
         blocked_list = outcome.get("blocked") or []
         overall_status = outcome.get("status", "UNKNOWN")
 
@@ -287,7 +288,8 @@ class MonitorAuditLogger:
             pred = dec.get("prediction") or {}
             st_out = stream_outcomes.get(stream) or {}
             st_status = st_out.get("status")
-            fill = fills_by_stream.get(stream)
+            sig_id = (dec.get("signal") or {}).get("signal_id")
+            fill = fills_by_stream.get(stream) or (fills_by_signal.get(sig_id) if sig_id else None)
 
             z_v4 = pred.get("z_v4")
             abs_z = abs(float(z_v4)) if isinstance(z_v4, (int, float)) else None

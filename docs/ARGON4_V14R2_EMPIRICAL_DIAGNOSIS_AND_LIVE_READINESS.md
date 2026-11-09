@@ -108,6 +108,43 @@ The entire drop from `56.25%` (Binance K-line win rate) to `37.50%` (Polymarket 
 6. **Persistent 5-Losing-Day Cooldown Latch Across Offline Days & SQLite C-Engine `ATTACH + EXCEPT` 100% Row Audit (`v14r6`)**:
    - **Persistent Cooldown Latch Across Offline Days (`account.py`)**: `Account.ensure_cohort` checks all historical settlement dates (`daily`) for any 5-consecutive-losing-day streak (`unsettled_five_loss_end`) and any prior `COOLDOWN_STATE_REQUIRED` cohort; cooldown remains latched (`COOLDOWN_STATE_REQUIRED` or `COOLDOWN_ACTIVE`) even if the machine is powered off for arbitrary days with zero database entries, until an explicit `cooldown_until` after the 5th losing day has been configured and completed.
    - **SQLite C-Engine `ATTACH DATABASE ... EXCEPT` Full-Row Prefix Audit (`revisions.py`)**: `_is_valid_observations_prefix` uses SQLite's native C-engine `ATTACH DATABASE ? AS arch_db` + `SELECT 1 FROM (SELECT * FROM arch_db."table" EXCEPT SELECT * FROM main."table" WHERE id<=?) LIMIT 1` to verify 100% of all historical rows and columns (including middle rows such as `id=25000` in `>50,000`-row databases) in ~120ms, paired with a 100-byte SQLite header change-counter cache key.
+7. **WAL-Aware Snapshot Key, Chained Delta Verification & Compaction, Same-Day Cooldown Unlock, and PK Streaming Join (`v14r7` / `v14r8`)**:
+   - **WAL-Aware Snapshot Key & PK Streaming `LEFT JOIN` (`revisions.py`)**: Replaced `SELECT * ... EXCEPT` (which sorted 1.03 GB in a temporary B-tree taking `5.3s`) with primary-key ordered `LEFT JOIN main."table" m ON a.id = m.id` (`1.2s`), cached immutable archived `PRAGMA quick_check` / schemas in `_ARCHIVED_SQLITE_META_CACHE`, and bound `_sqlite_snapshot_key` to both the main database file and any uncheckpointed `-wal` file (`(wst.st_size, wst.st_mtime_ns, _sha(wal))`).
+   - **Chained Delta Verification & Automatic Compaction (`revisions.py`)**: Tracked `delta_chain` across chained revisions, verified every prior delta segment (`prev_max < id <= max_id`), and automatically compacted `delta_chain` into a single cumulative `observations_delta.sqlite3` whenever `len(chain) >= 8`.
+   - **Same-Day Cooldown Unlock (`account.py`)**: Tracked the exact 5th losing day trigger timestamp (`trigger_ts = 5th_loss_day + 1 day 00:00Z`) separately from blocked cohort dates so short same-day cooldowns (e.g., 6 hours) unlock cleanly upon expiration and stay unlocked on subsequent days.
+   - **Live Audit Logger Binding (`monitor_logger.py`)**: Bound `stream_outcomes` to `outcome.get("streams") or outcome.get("stream_results")` and matched `fills` by `signal_id` as well as `stream`, ensuring live `ADVERSE_SELECTION_GUARD` skips and `FILLED_BUDGET` orders are accurately rendered in `logs/monitor_audit.jsonl`.
+
+---
+
+## 5. Live Operational Audit Log (`2026-11-08 10:15 UTC` to `2026-11-09 00:25 UTC`) / 实盘模拟运行与风控审计日志实录
+
+### English
+1. **`2026-11-08 UTC` Daily Loss Limit Protection (`10:35:58 UTC` – `23:59:59 UTC`)**:
+   - At `2026-11-08T10:15:11 UTC` (`18:15:11 BJT`), Order #45 (`BTC UP`, `$149.55` total cost) was filled and subsequently settled as `LOST` at `10:35:58 UTC` (`18:35:58 BJT`), bringing `2026-11-08 UTC`'s cumulative realized PnL across 17 settled trades to **`-$681.50` (`-6.49%` of `$10,501.62` start-of-day equity)**, breaching the `-5.5%` (`-$577.59`) `DAILY_LOSS_LIMIT`.
+   - Between `10:45 UTC` (`18:45 BJT`) and `23:50 UTC` (`07:50 BJT`), the pipeline evaluated **76 signal cohorts** and properly blocked every single one under `blocked_reason = "DAILY_LOSS_LIMIT"`.
+2. **`2026-11-09 00:00 UTC` (`08:00 BJT`) Automatic Rollover & Live `v14r5` Guard Verification**:
+   - **`2026-11-09T00:10:00+00:00` (`08:10 BJT`)**: `DAILY_LOSS_LIMIT` automatically unlocked for the new UTC day (`blocked_reason = None`, `overall_status = "PROCESSED"`).
+   - **`2026-11-09T00:15:00+00:00` (`08:15 BJT`) — Live Multi-Level `ADVERSE_SELECTION_GUARD` Intercept**:
+     - `BTC_15m` generated a `DOWN` signal (`|z_v4| = 2.0492 > 1.3917`, `rv12 = 19.00 bps`). Live Polymarket CLOB orderbook had crashed to **`best_ask = 0.29`** (with resting asks at `0.37..0.99`). The `v14r5` multi-level orderbook guard (`min_buy_price = 0.37`) immediately rejected `BTC_15m` on `attempt = 0` (`PRICE_LIMIT_NOT_MET`) without waiting for 3 rechecks, cascading immediately to `SOL_5m`.
+     - `SOL_5m` generated a `DOWN` signal (`|z_v4| = 1.98 > 1.6953`), where the live Polymarket CLOB orderbook had crashed to **`best_ask = 0.20 < 0.37`**. The guard immediately rejected `SOL_5m` (`PRICE_LIMIT_NOT_MET`), preventing two toxic falling-knife fills.
+   - **`2026-11-09T00:20:00+00:00` (`08:20 BJT`) — Order #46 Filled in Healthy Ask Zone (`0.46 ~ 0.49`)**:
+     - `ETH_5m` generated an `UP` signal (`|z_v4| = 1.8451 > 1.7207`, `rv12 = 27.84 bps`).
+     - Live Polymarket CLOB orderbook had healthy asks at `0.46 ~ 0.49` (within `[0.37, 0.515]`).
+     - **Order #46 (`paper:5b099c2bf9cb7a5714888b3bf02d596e8a277a53a4a43e1df30d1d2bf9db31d5`)** filled at `2026-11-09T00:20:09.115461+00:00` (`08:20:09 BJT`) for **`294.16` shares (`cost_usd = $142.16`, `fee_usd = $5.14`, `total = $147.30`)** across 4 levels (`24 @ 0.46`, `20 @ 0.47`, `85.58 @ 0.48`, `164.58 @ 0.49`).
+
+### 中文
+1. **`2026-11-08 UTC` 单日亏损熔断保护实录 (`10:35:58 UTC` – `23:59:59 UTC`)**：
+   - 第 45 笔模拟单（`10:15:11 UTC` / 北京时间 `18:15:11`，`BTC UP`）于 `10:35:58 UTC`（北京时间 `18:35:58`）结算为亏损后，`2026-11-08` 当日 17 笔已结算订单累计实现盈亏达 **`-$681.50`（占日初权益 `$10,501.62` 的 `-6.49%`）**，触发 `-5.5%`（`-$577.59`）的 `DAILY_LOSS_LIMIT` 单日亏损熔断线。
+   - 此后至 `23:50 UTC`（北京时间次日 `07:50`）共 **76 个决策批次**均被风控门禁以 `DAILY_LOSS_LIMIT` 拦截保护。
+2. **`2026-11-09 00:00 UTC`（北京时间 `08:00`）跨日自动解锁与新护栏实战表现**：
+   - **`00:10:00 UTC`（`08:10 BJT`）**：跨入新 UTC 交易日后 `DAILY_LOSS_LIMIT` 自动清零解锁（`blocked_reason = None`）。
+   - **`00:15:00 UTC`（`08:15 BJT`）—— 多档盘口 `min_buy_price = 0.37` 逆向选择护栏实战拦截 2 笔飞刀单**：
+     - 优先级第 1 的 `BTC_15m` 触发 `DOWN` 信号（`|z_v4| = 2.0492 > 1.3917`），此时 Polymarket 真实多档盘口卖一价已暴跌至 **`best_ask = 0.29`**（上方 `0.37 ~ 0.99` 挂有远端卖单）。`v14r5` 护栏识别到 `0.29 < 0.37` 后，首轮（`attempt = 0`）直接整盘归零并记为 `PRICE_LIMIT_NOT_MET` 跳过，未跳档买 `0.37` 高价且未耗费 3 次重检等待，0.3 秒内将预算下放至 `SOL_5m`；
+     - `SOL_5m` 同样触发 `DOWN` 信号，盘口卖一价已跌至 **`best_ask = 0.20 < 0.37`**，护栏再次当场拦截跳过，成功避免两笔逆向崩盘亏损。
+   - **`00:20:00 UTC`（`08:20 BJT`）—— 第 46 笔订单在健康价格带 (`0.46 ~ 0.49`) 正常成交**：
+     - `ETH_5m` 触发 `UP` 信号（`|z_v4| = 1.8451 > 1.7207`），盘口卖单位于健康的 `0.46 ~ 0.49` 区间（满足 `0.37 <= ask <= 0.515`）；
+     - 系统于 `00:20:09.115 UTC`（北京时间 `08:20:09`）成功撮合 **第 46 笔模拟单 (`paper:5b099c2bf9cb...`)**，买入 `ETH UP` 共 `294.16` 份，总成本 **`$147.30`（本金 `$142.16` + 手续费 `$5.14`）**。
+
 
 
 
