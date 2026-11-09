@@ -24,6 +24,7 @@ SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT")
 ALL_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
 _MARK_REGISTRY_LOCK = threading.RLock()
 _MARK_REGISTRY_CACHE = {}
+_SAVE_JSON_LOCK = threading.RLock()
 
 
 def _policy_symbols(policy, profile=None):
@@ -40,11 +41,26 @@ def save_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
-    if path.exists() and path.read_text(encoding="utf-8") == content:
-        return
-    temp = path.with_suffix(".tmp")
-    temp.write_text(content, encoding="utf-8")
-    temp.replace(path)
+    with _SAVE_JSON_LOCK:
+        try:
+            if path.exists() and path.read_text(encoding="utf-8") == content:
+                return
+        except OSError:
+            pass
+        temp = path.with_name(f"{path.stem}.{threading.get_ident()}.tmp")
+        temp.write_text(content, encoding="utf-8")
+        for attempt in range(5):
+            try:
+                temp.replace(path)
+                return
+            except PermissionError:
+                if attempt < 4:
+                    time.sleep(0.02 * (attempt + 1))
+                else:
+                    try:
+                        path.write_text(content, encoding="utf-8")
+                    finally:
+                        temp.unlink(missing_ok=True)
 
 
 def cohort_at(value):
