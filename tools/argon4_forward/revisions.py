@@ -73,13 +73,26 @@ def _cached_sha(path, cache_bucket):
     st = resolved.stat()
     meta = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
     key = str(resolved)
+    inode_key = None
+    if st.st_ino and st.st_size >= 4096:
+        with resolved.open("rb") as fh:
+            hdr_4k = fh.read(4096)
+        inode_key = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, hdr_4k)
     with _COMMITTED_ARCHIVE_HASH_LOCK:
         cached = cache_bucket.get(key)
-    if cached is not None and cached[:5] == meta:
-        return cached[5]
+        if cached is not None and cached[:5] == meta:
+            return cached[5]
+        if inode_key is not None:
+            inode_cache = _COMMITTED_ARCHIVE_HASH_CACHE.setdefault("_inode_sha", {})
+            inode_digest = inode_cache.get(inode_key)
+            if inode_digest is not None:
+                cache_bucket[key] = (*meta, inode_digest)
+                return inode_digest
     digest = _sha(resolved)
     with _COMMITTED_ARCHIVE_HASH_LOCK:
         cache_bucket[key] = (*meta, digest)
+        if inode_key is not None:
+            _COMMITTED_ARCHIVE_HASH_CACHE.setdefault("_inode_sha", {})[inode_key] = digest
     return digest
 
 
@@ -607,11 +620,12 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
     # streaming joins (avoiding temporary B-tree sorting of 1+ GB snapshots).
     covered_max = {name: 0 for name in schemas}
     with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.execute("PRAGMA mmap_size=2147483648").fetchall()
         conn.execute("ATTACH DATABASE ? AS arch_db", (prior_snapshot.as_uri() + "?mode=ro",)).fetchall()
+        conn.execute("PRAGMA arch_db.mmap_size=2147483648").fetchall()
         try:
             for name in schemas:
-                max_id = conn.execute('SELECT MAX(id) FROM arch_db."' + name + '"').fetchall()[0][0]
-                arch_cnt = conn.execute('SELECT COUNT(*) FROM arch_db."' + name + '"').fetchall()[0][0]
+                max_id, arch_cnt = conn.execute('SELECT MAX(id), COUNT(*) FROM arch_db."' + name + '"').fetchall()[0]
                 if max_id is None or arch_cnt == 0:
                     continue
                 live_cnt = conn.execute('SELECT COUNT(*) FROM main."' + name + '" WHERE id<=?', (max_id,)).fetchall()[0][0]
@@ -629,6 +643,7 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
             conn.execute("DETACH DATABASE arch_db").fetchall()
         for dpath in deltas:
             conn.execute("ATTACH DATABASE ? AS delta_db", (dpath.as_uri() + "?mode=ro",)).fetchall()
+            conn.execute("PRAGMA delta_db.mmap_size=2147483648").fetchall()
             try:
                 d_tables = {
                     r[0] for r in conn.execute(
@@ -780,15 +795,17 @@ def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_
     return {**entry, "delta_chain": [entry] if compact_chain else chain + [entry]}
 
 
-def _backup_sqlite(source, target):
+def _backup_sqlite(source, target, *, prior_obs=None):
     if not source.is_file():
         raise ValueError("AUDIT_DATABASE_MISSING")
     if target.name == "observations.sqlite3" and not target.exists():
         delta_path = target.with_name("observations_delta.sqlite3")
         try:
             revisions_dir = target.resolve().parent.parent
-            prior_snapshot, expected_sha, prior_covered_max, prior_chain = _prior_committed_observations(
-                revisions_dir, source, include_delta_max_id=True
+            prior_snapshot, expected_sha, prior_covered_max, prior_chain = (
+                prior_obs if prior_obs is not None else _prior_committed_observations(
+                    revisions_dir, source, include_delta_max_id=True
+                )
             )
             if prior_snapshot is not None and expected_sha is not None:
                 try:
@@ -814,7 +831,7 @@ def _backup_sqlite(source, target):
     return {"source_path": str(source), "snapshot_path": str(target), "sha256": _sha(target)}
 
 
-def _disk_budget(runtime, raw_root, before_files, plans):
+def _disk_budget(runtime, raw_root, before_files, plans, *, prior_obs=None):
     raw_bytes = sum((raw_root / relative).stat().st_size for relative in before_files)
     database_bytes = 0
     for source in (runtime / "features/http_receipts.sqlite3", runtime / "observations.sqlite3"):
@@ -825,7 +842,7 @@ def _disk_budget(runtime, raw_root, before_files, plans):
             visible_pages = conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute("PRAGMA page_size").fetchone()[0]
         full_db_bytes = max(physical, visible_pages)
         if source.name == "observations.sqlite3":
-            prior_snap, _ = _prior_committed_observations(runtime / "features/revisions", source)
+            prior_snap = prior_obs[0] if prior_obs is not None else _prior_committed_observations(runtime / "features/revisions", source)[0]
             if prior_snap is not None:
                 full_db_bytes = min(full_db_bytes, 16 * 1024 * 1024)
         database_bytes += full_db_bytes
@@ -1250,7 +1267,8 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
             return {"status": "NO_CHANGE", "reason": "LATEST_OBSERVED_VALUES_ALREADY_MATCH", "data_root": str(raw_root)}
         if not (runtime / "observations.sqlite3").is_file():
             raise ValueError("AUDIT_DATABASE_MISSING")
-        disk_budget = _disk_budget(runtime, raw_root, before_files, plans)
+        prior_obs = _prior_committed_observations(revisions, runtime / "observations.sqlite3", include_delta_max_id=True)
+        disk_budget = _disk_budget(runtime, raw_root, before_files, plans, prior_obs=prior_obs)
         if disk_budget["available_free_bytes"] < disk_budget["required_free_bytes"]:
             return {"status": "BLOCKED", "reason": "INSUFFICIENT_SNAPSHOT_DISK_SPACE", "disk_budget": disk_budget}
         if _inventory(raw_root) != before_files or any(before_files[p["relative_path"]] != p["before_sha256"] for p in plans):
@@ -1287,7 +1305,7 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
             if _sha(target) != digest:
                 raise ValueError("SNAPSHOT_HASH_MISMATCH")
         backups = [_backup_sqlite(features / "http_receipts.sqlite3", archive / "receipts.sqlite3"),
-                   _backup_sqlite(runtime / "observations.sqlite3", archive / "observations.sqlite3")]
+                   _backup_sqlite(runtime / "observations.sqlite3", archive / "observations.sqlite3", prior_obs=prior_obs)]
         after_files = dict(before_files)
         for plan in plans:
             proposed = archive / "proposed_raw_data" / plan["relative_path"]

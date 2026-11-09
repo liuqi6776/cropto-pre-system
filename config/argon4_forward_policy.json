@@ -143,7 +143,7 @@
     "SOL_5m": "d024c28dbb773a6470b132cbc1ebd152ebdb706d0db8ee3047487493b3f4f822",
     "BNB_15m": "366484e02b2552e3acd095310b381d216b6f2016a39bd2fe001b1aad3660118f"
   },
-  "min_decision_delay_seconds": 4.0,
+  "min_decision_delay_seconds": 5.2,
   "input_revision_policy": {
     "scope": "OBSERVED_FUTURES_5M_1H_AND_MARK_1H_VIEWS_ONLY",
     "confirming_receipts": 2,
