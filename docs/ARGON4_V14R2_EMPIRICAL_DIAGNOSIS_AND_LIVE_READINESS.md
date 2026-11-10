@@ -163,10 +163,10 @@ The entire drop from `56.25%` (Binance K-line win rate) to `37.50%` (Polymarket 
    - Added `realized_balance` (`_usd(r["cash_atoms"] + r["locked_atoms"])`) to `Account.equity_history()` and `recent_orders` (with per-order `payout_usd`, `realized_pnl_usd`, `cumulative_pnl_usd`, `cumulative_balance_usd`) + `trade_events` (filtering `ACCOUNT_CREATED`, `PAPER_IOC`, `OFFICIAL_RESOLUTION_APPLIED_TO_PAPER`) to `Account.overview()`.
    - Updated `drawChart()` in `dashboard/argon4_forward/app.js` to plot `equity ?? realized_balance` continuously with shaded area, point markers, and Y-axis dollar labels, added a dedicated **`模拟成交与单笔收益明细` (`#tradeorders`)** table in `dashboard/argon4_forward/index.html`, and prioritized `trade_events` in `账户流水` (`#ledger`).
 
-### 6.2 `$1,000` Strategy B Paper Simulation Order & PnL Ledger (`2026-11-09 13:50 UTC` – `2026-11-10 00:35 UTC`) / `$1,000` 打法 B 模拟盘逐笔成交与结算收益实录
+### 6.2 `$1,000` Strategy B Paper Simulation Order & PnL Ledger (`2026-11-09 13:50 UTC` – `2026-11-10 04:17 UTC`) / `$1,000` 打法 B 模拟盘逐笔成交与结算收益实录
 
 - **Initial Capital / 初始本金**: `$1,000.00` (`single_stream_equity_fraction = 4% / $40`, `tick_equity_fraction = 8% / $80`, `daily_loss_fraction = 8% / -$80`)
-- **Cumulative Settled Performance / 累计结算表现**: **11 Orders (`8 WON / 3 LOST`, Win Rate `72.73%`), Realized PnL `+$162.61` (`+16.26%`), Realized Balance `$1,162.61`, Max Realized Drawdown `-7.72%`** (full machine-readable paper log exported to [`docs/ARGON4_PAPER_SIMULATION_LOG_20261110.json`](file:///c:/Users/liuqi/crypto-predict_system/docs/ARGON4_PAPER_SIMULATION_LOG_20261110.json)).
+- **Cumulative Settled Performance / 累计结算表现**: **22 Orders (`13 WON / 9 LOST`, Win Rate `59.09%`), Peak Realized Balance `$1,256.08` (`+25.61%`), Current Realized PnL `+$136.08` (`+13.61%`), Current Realized Balance `$1,136.08`, Max Realized Drawdown `-9.55%`** (full machine-readable paper log exported to [`docs/ARGON4_PAPER_SIMULATION_LOG_20261110.json`](file:///c:/Users/liuqi/crypto-predict_system/docs/ARGON4_PAPER_SIMULATION_LOG_20261110.json)).
 
 | # | Fill Time (UTC) | Stream | Side | Shares | Total Cost (Fee) | Status | Payout | Order Net PnL | Cumulative PnL (Balance) |
 | :-: | :--- | :--- | :-: | --: | --: | :-: | --: | --: | --: |
@@ -180,7 +180,18 @@ The entire drop from `56.25%` (Binance K-line win rate) to `37.50%` (Polymarket 
 | 8 | `2026-11-09 15:50:11` | `SOL_5m` | `DOWN` | `75.83` | `$40.00` (`$1.33`) | `WON` | `$75.83` | **`+$35.83`** | `+$40.82` (`$1,040.82`) |
 | 9 | `2026-11-09 16:15:11` | `BTC_15m` | `DOWN` | `82.06` | `$40.00` (`$1.43`) | `WON` | `$82.06` | **`+$42.06`** | `+$82.88` (`$1,082.88`) |
 | 10 | `2026-11-09 19:35:13` | `ETH_5m` | `UP` | `80.41` | `$40.00` (`$1.40`) | `WON` | `$80.41` | **`+$40.41`** | `+$123.29` (`$1,123.29`) |
-| 11 | `2026-11-09 21:45:10` | `ETH_5m` | `UP` | `79.33` | `$40.00` (`$1.39`) | `WON` | `$79.33` | **`+$39.33`** | **`+$162.61` (`$1,162.61`)** |
+| 11 | `2026-11-09 21:45:10` | `ETH_5m` | `UP` | `79.33` | `$40.00` (`$1.39`) | `WON` | `$79.33` | **`+$39.33`** | `+$162.61` (`$1,162.61`) |
+| 12 | `2026-11-10 00:45:18` | `BTC_5m` | `UP` | `93.69` | `$40.00` (`$1.59`) | `LOST` | `$0.00` | **`-$40.00`** | `+$122.61` (`$1,122.61`) |
+| 13 | `2026-11-10 00:55:09` | `ETH_5m` | `UP` | `81.21` | `$40.00` (`$1.41`) | `WON` | `$81.21` | **`+$41.21`** | `+$163.82` (`$1,163.82`) |
+| 14 | `2026-11-10 00:55:09` | `BTC_5m` | `UP` | `78.82` | `$40.00` (`$1.38`) | `WON` | `$78.82` | **`+$38.82`** | `+$202.64` (`$1,202.64`) |
+| 15 | `2026-11-10 02:10:10` | `BTC_5m` | `UP` | `66.40` | `$34.97` (`$1.16`) | `LOST` | `$0.00` | **`-$34.97`** | `+$167.68` (`$1,167.68`) |
+| 16 | `2026-11-10 02:30:15` | `BTC_15m` | `UP` | `100.88` | `$40.00` (`$1.66`) | `LOST` | `$0.00` | **`-$40.00`** | `+$127.68` (`$1,127.68`) |
+| 17 | `2026-11-10 02:45:10` | `BTC_15m` | `UP` | `75.83` | `$40.00` (`$1.33`) | `WON` | `$75.83` | **`+$35.83`** | `+$163.51` (`$1,163.51`) |
+| 18 | `2026-11-10 03:05:10` | `SOL_5m` | `UP` | `85.10` | `$40.00` (`$1.47`) | `WON` | `$85.10` | **`+$45.10`** | `+$208.61` (`$1,208.61`) |
+| 19 | `2026-11-10 03:05:11` | `BTC_5m` | `UP` | `87.48` | `$40.00` (`$1.50`) | `WON` | `$87.48` | **`+$47.48`** | `+$256.08` (`$1,256.08`) |
+| 20 | `2026-11-10 03:15:10` | `BTC_15m` | `UP` | `85.59` | `$40.00` (`$1.48`) | `LOST` | `$0.00` | **`-$40.00`** | `+$216.08` (`$1,216.08`) |
+| 21 | `2026-11-10 03:40:10` | `ETH_5m` | `UP` | `80.41` | `$40.00` (`$1.40`) | `LOST` | `$0.00` | **`-$40.00`** | `+$176.08` (`$1,176.08`) |
+| 22 | `2026-11-10 03:40:10` | `SOL_5m` | `UP` | `79.92` | `$40.00` (`$1.40`) | `LOST` | `$0.00` | **`-$40.00`** | **`+$136.08` (`$1,136.08`)** |
 
 ---
 
