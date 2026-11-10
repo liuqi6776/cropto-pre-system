@@ -587,10 +587,16 @@ class ForwardPipeline:
     def _score_decisions(self, policy, inputs, cohort, profile, now_lower,
                          available, frames, decisions, snapshot,
                          build_feature_frames, predict_stream):
-        from .model_v14 import apply_volatility_regime_guard, compute_ex_ante_rv12_bps
+        from .model_v14 import (
+            apply_volatility_regime_guard,
+            compute_ex_ante_btc_macro_returns_pct,
+            compute_ex_ante_rv12_bps,
+        )
         vol_guard = (policy.get("volatility_regime_guard")
                      if isinstance(policy.get("volatility_regime_guard"), dict) else None)
         rv12_cache = {}
+        btc_macro_rets = compute_ex_ante_btc_macro_returns_pct(
+            inputs.get("data_root"), as_of=now_lower, snapshot=snapshot)
         for stream in policy["order"]:
             if stream in profile["disabled_streams"]:
                 decisions[stream] = disabled_decision(profile)
@@ -626,7 +632,14 @@ class ForwardPipeline:
             score = predict_stream(stream, f["base"], f["expert"], calibrated_now(self.clock), **score_kwargs)
             if rv12_cache[symbol] is not None or vol_guard is not None:
                 score = apply_volatility_regime_guard(
-                    stream, score, ex_ante_rv12_bps=rv12_cache[symbol], guard_config=vol_guard)
+                    stream,
+                    score,
+                    ex_ante_rv12_bps=rv12_cache[symbol],
+                    guard_config=vol_guard,
+                    cohort_time=cohort,
+                    btc_ret_1h_pct=btc_macro_rets.get("btc_ret_1h_pct"),
+                    btc_ret_4h_pct=btc_macro_rets.get("btc_ret_4h_pct"),
+                )
             self._decision_timing["inference_seconds"][stream] = time.perf_counter()-started
             if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
                 raise ValueError("missed feature decision window")

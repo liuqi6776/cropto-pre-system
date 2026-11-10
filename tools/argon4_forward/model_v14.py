@@ -63,18 +63,17 @@ def load_model_bundle_v14(stream, phase="deployment_q4", *, expected_manifest_sh
     return namespace["load_model_bundle"](stream, phase=phase, expected_manifest_sha256=expected_manifest_sha256)
 
 
-def compute_ex_ante_rv12_bps(data_root=None, symbol="BTCUSDT", *, as_of=None, snapshot=None, raw_frame=None):
-    """Compute causal 1h realized body volatility (rv_12_bps) over last 12 closed 5m candles."""
+def _resolve_5m_frame(data_root=None, symbol="BTCUSDT", *, as_of=None, snapshot=None, raw_frame=None, min_rows=12):
     frame = None
     if (raw_frame is not None and isinstance(raw_frame, pd.DataFrame)
-            and len(raw_frame) >= 12 and {"open", "close"} <= set(raw_frame.columns)):
+            and len(raw_frame) >= min_rows and {"open", "close"} <= set(raw_frame.columns)):
         frame = raw_frame
     if frame is None and snapshot is not None and hasattr(snapshot, "_validated"):
         target_names = {f"{symbol}_5m_futures.parquet", f"{symbol}_5m_futures_2023_2026.parquet"}
         for p, entry in snapshot._validated.items():
             if getattr(p, "name", "") in target_names and isinstance(entry, tuple) and len(entry) >= 1:
                 candidate = entry[0]
-                if isinstance(candidate, pd.DataFrame) and len(candidate) >= 12:
+                if isinstance(candidate, pd.DataFrame) and len(candidate) >= min_rows:
                     frame = candidate
                     break
     if frame is None and data_root is not None:
@@ -94,6 +93,12 @@ def compute_ex_ante_rv12_bps(data_root=None, symbol="BTCUSDT", *, as_of=None, sn
                 frame = df
         except Exception:
             frame = None
+    return frame
+
+
+def compute_ex_ante_rv12_bps(data_root=None, symbol="BTCUSDT", *, as_of=None, snapshot=None, raw_frame=None):
+    """Compute causal 1h realized body volatility (rv_12_bps) over last 12 closed 5m candles."""
+    frame = _resolve_5m_frame(data_root, symbol, as_of=as_of, snapshot=snapshot, raw_frame=raw_frame, min_rows=12)
     if frame is None or len(frame) < 12 or not ({"open", "close"} <= set(frame.columns)):
         return None
     tail = frame.tail(12)
@@ -107,13 +112,75 @@ def compute_ex_ante_rv12_bps(data_root=None, symbol="BTCUSDT", *, as_of=None, sn
     return float(np.mean(np.abs(closes - opens) / opens) * 10000.0)
 
 
-def apply_volatility_regime_guard(stream, prediction, *, ex_ante_rv12_bps=None, guard_config=None):
-    """Attach ex_ante_rv12_bps and optionally apply V5_Extreme / UltraLow_TWAP volatility regime guard."""
+def compute_ex_ante_btc_macro_returns_pct(data_root=None, symbol="BTCUSDT", *, as_of=None, snapshot=None, raw_frame=None):
+    """Compute causal 1h (12 bars) and 4h (48 bars) BTC percentage returns over closed 5m candles."""
+    out = {"btc_ret_1h_pct": None, "btc_ret_4h_pct": None}
+    frame = _resolve_5m_frame(data_root, symbol, as_of=as_of, snapshot=snapshot, raw_frame=raw_frame, min_rows=12)
+    if frame is None or len(frame) < 12 or not ({"open", "close"} <= set(frame.columns)):
+        return out
+    tail12 = frame.tail(12)
+    valid12 = True
+    if isinstance(tail12.index, pd.DatetimeIndex) and len(tail12.index) == 12:
+        if not np.all(np.diff(tail12.index.asi8) == pd.Timedelta(minutes=5).value):
+            valid12 = False
+    if valid12:
+        o12 = float(tail12["open"].iloc[0])
+        c12 = float(tail12["close"].iloc[-1])
+        if np.isfinite(o12) and np.isfinite(c12) and o12 > 0:
+            out["btc_ret_1h_pct"] = float((c12 / o12 - 1.0) * 100.0)
+    if len(frame) >= 48:
+        tail48 = frame.tail(48)
+        valid48 = True
+        if isinstance(tail48.index, pd.DatetimeIndex) and len(tail48.index) == 48:
+            if not np.all(np.diff(tail48.index.asi8) == pd.Timedelta(minutes=5).value):
+                valid48 = False
+        if valid48:
+            o48 = float(tail48["open"].iloc[0])
+            c48 = float(tail48["close"].iloc[-1])
+            if np.isfinite(o48) and np.isfinite(c48) and o48 > 0:
+                out["btc_ret_4h_pct"] = float((c48 / o48 - 1.0) * 100.0)
+    return out
+
+
+def _resolve_cohort_utc(cohort_time=None, prediction=None):
+    if cohort_time is not None:
+        ts = pd.Timestamp(cohort_time)
+        return ts.tz_convert("UTC") if ts.tzinfo is not None else ts.tz_localize("UTC")
+    if isinstance(prediction, dict):
+        if prediction.get("feature_bar_open"):
+            ts = pd.Timestamp(prediction["feature_bar_open"])
+            ts = ts.tz_convert("UTC") if ts.tzinfo is not None else ts.tz_localize("UTC")
+            return ts + pd.Timedelta(minutes=5)
+        if prediction.get("decision_time"):
+            ts = pd.Timestamp(prediction["decision_time"])
+            ts = ts.tz_convert("UTC") if ts.tzinfo is not None else ts.tz_localize("UTC")
+            return ts.floor("5min")
+    return None
+
+
+def apply_volatility_regime_guard(
+    stream,
+    prediction,
+    *,
+    ex_ante_rv12_bps=None,
+    guard_config=None,
+    cohort_time=None,
+    btc_ret_1h_pct=None,
+    btc_ret_4h_pct=None,
+):
+    """Attach ex_ante_rv12_bps / macro returns and apply volatility, US-open blackout & macro trend guards."""
     res = dict(prediction)
     if ex_ante_rv12_bps is not None:
         res["ex_ante_rv12_bps"] = float(ex_ante_rv12_bps)
-    if isinstance(guard_config, dict) and guard_config.get("enabled") is True and ex_ante_rv12_bps is not None:
-        action = str(guard_config.get("action", "SKIP_OR_HALF_STAKE")).upper()
+    if btc_ret_1h_pct is not None:
+        res["ex_ante_btc_ret_1h_pct"] = float(btc_ret_1h_pct)
+    if btc_ret_4h_pct is not None:
+        res["ex_ante_btc_ret_4h_pct"] = float(btc_ret_4h_pct)
+    if not (isinstance(guard_config, dict) and guard_config.get("enabled") is True):
+        return res
+
+    action = str(guard_config.get("action", "SKIP_OR_HALF_STAKE")).upper()
+    if ex_ante_rv12_bps is not None:
         limits = guard_config.get("max_rv12_bps")
         cap = limits.get(stream) if isinstance(limits, dict) else None
         min_limits = guard_config.get("min_rv12_bps")
@@ -125,13 +192,64 @@ def apply_volatility_regime_guard(stream, prediction, *, ex_ante_rv12_bps=None, 
             res["volatility_regime_action"] = action
             if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
                 res["selected"] = False
-        elif min_cap is not None and float(ex_ante_rv12_bps) < float(min_cap):
+            return res
+        if min_cap is not None and float(ex_ante_rv12_bps) < float(min_cap):
             res["volatility_regime_guarded"] = True
             res["volatility_regime_min_rv12_bps"] = float(min_cap)
             res["volatility_regime_reason"] = "BELOW_MIN_RV12_BPS"
             res["volatility_regime_action"] = action
             if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
                 res["selected"] = False
+            return res
+
+    us_blackout = guard_config.get("us_open_blackout")
+    if isinstance(us_blackout, dict) and us_blackout.get("enabled") is True:
+        cohort_dt = _resolve_cohort_utc(cohort_time=cohort_time, prediction=res)
+        if cohort_dt is not None:
+            weekdays_only = bool(us_blackout.get("weekdays_only", True))
+            day_ok = (cohort_dt.weekday() < 5) if weekdays_only else True
+            minute_of_day = int(cohort_dt.hour) * 60 + int(cohort_dt.minute)
+            start_min = int(us_blackout.get("utc_start_minute", 870))
+            end_min = int(us_blackout.get("utc_end_minute", 960))
+            skip_streams = us_blackout.get("skip_streams") or []
+            if day_ok and start_min <= minute_of_day < end_min and stream in skip_streams:
+                res["volatility_regime_guarded"] = True
+                res["volatility_regime_reason"] = "US_OPEN_BLACKOUT"
+                res["volatility_regime_action"] = action
+                res["us_open_blackout_minute_utc"] = minute_of_day
+                if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                    res["selected"] = False
+                return res
+
+    macro_guard = guard_config.get("macro_trend_guard")
+    if isinstance(macro_guard, dict) and macro_guard.get("enabled") is True:
+        max_4h = macro_guard.get("max_btc_4h_abs_return_pct")
+        apply_streams = macro_guard.get("apply_streams")
+        in_apply = (stream in apply_streams) if isinstance(apply_streams, (list, tuple, set)) else True
+        if (max_4h is not None and btc_ret_4h_pct is not None and in_apply
+                and abs(float(btc_ret_4h_pct)) > float(max_4h)):
+            res["volatility_regime_guarded"] = True
+            res["volatility_regime_reason"] = "BTC_4H_MACRO_BREAKOUT"
+            res["volatility_regime_action"] = action
+            res["macro_trend_max_btc_4h_abs_return_pct"] = float(max_4h)
+            if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                res["selected"] = False
+            return res
+
+        chase_th = macro_guard.get("skip_1h_momentum_chase_above_pct")
+        side = str(res.get("side", "")).upper()
+        if chase_th is not None and btc_ret_1h_pct is not None and side in ("UP", "DOWN"):
+            ret_1h = float(btc_ret_1h_pct)
+            th_1h = float(chase_th)
+            if (ret_1h > th_1h and side == "UP") or (ret_1h < -th_1h and side == "DOWN"):
+                res["volatility_regime_guarded"] = True
+                res["volatility_regime_reason"] = "BTC_1H_MOMENTUM_CHASE"
+                res["volatility_regime_action"] = action
+                res["macro_trend_skip_1h_momentum_chase_above_pct"] = th_1h
+                if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                    res["selected"] = False
+                return res
+
     return res
 
 
@@ -146,6 +264,9 @@ def predict_stream_v14(
     threshold_override=None,
     ex_ante_rv12_bps=None,
     volatility_regime_guard=None,
+    cohort_time=None,
+    btc_ret_1h_pct=None,
+    btc_ret_4h_pct=None,
 ):
     if stream in model.STREAMS or model.predict_stream is not _ORIGINAL_PREDICT_STREAM:
         if phase == "deployment_q4":
@@ -165,11 +286,14 @@ def predict_stream_v14(
         th = float(threshold_override)
         zv = float(res["z_v4"])
         res = {**res, "threshold_frozen": th, "selected": abs(zv) >= th}
-    if ex_ante_rv12_bps is not None or volatility_regime_guard is not None:
+    if any(x is not None for x in (ex_ante_rv12_bps, volatility_regime_guard, cohort_time, btc_ret_1h_pct, btc_ret_4h_pct)):
         res = apply_volatility_regime_guard(
             stream,
             res,
             ex_ante_rv12_bps=ex_ante_rv12_bps,
             guard_config=volatility_regime_guard,
+            cohort_time=cohort_time,
+            btc_ret_1h_pct=btc_ret_1h_pct,
+            btc_ret_4h_pct=btc_ret_4h_pct,
         )
     return res

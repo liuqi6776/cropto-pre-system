@@ -1423,6 +1423,140 @@ def test_v14r10_async_janitor_trading_yield_min_buy_policy_and_active_risk_statu
     assert plan_ar["reasons"] == ["NO_RISK_BUDGET"]
 
 
+def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_path):
+    """v14r11:
+    1. Production policy configures stream_min_buy_price (0.425 for 5m streams, 0.37 for 15m streams),
+       us_open_blackout ([870, 960), weekdays_only, skip ETH_5m/BTC_5m/BTC_15m),
+       and macro_trend_guard (max_btc_4h_abs_return_pct=2.0, skip_1h_momentum_chase_above_pct=0.3).
+    2. apply_volatility_regime_guard skips ETH_5m/BTC_5m/BTC_15m during weekday 14:30-16:00 UTC while
+       leaving SOL_15m/SOL_5m unguarded and leaving weekend 14:30-16:00 UTC unguarded.
+    3. apply_volatility_regime_guard skips BTC/ETH when |btc_ret_4h_pct| > 2.0% and skips any stream
+       chasing 1h BTC momentum (> +0.3% buying UP or < -0.3% buying DOWN) while keeping mean-reverting signals.
+    """
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    assert policy["stream_min_buy_price"] == {
+        "BTC_5m": 0.425,
+        "ETH_5m": 0.425,
+        "SOL_5m": 0.425,
+        "BTC_15m": 0.37,
+        "SOL_15m": 0.37,
+    }
+    vg = policy["volatility_regime_guard"]
+    assert vg["us_open_blackout"]["enabled"] is True
+    assert vg["us_open_blackout"]["utc_start_minute"] == 870
+    assert vg["us_open_blackout"]["utc_end_minute"] == 960
+    assert vg["us_open_blackout"]["weekdays_only"] is True
+    assert set(vg["us_open_blackout"]["skip_streams"]) == {"ETH_5m", "BTC_5m", "BTC_15m"}
+    assert vg["macro_trend_guard"]["enabled"] is True
+    assert vg["macro_trend_guard"]["max_btc_4h_abs_return_pct"] == pytest.approx(2.0)
+    assert vg["macro_trend_guard"]["skip_1h_momentum_chase_above_pct"] == pytest.approx(0.3)
+
+    base_pred = {"selected": True, "side": "DOWN", "z_v4": -0.52}
+
+    # 1. Weekday 15:10 UTC (Monday 2026-11-09 15:10:00Z, minute=910): ETH_5m & BTC_5m skipped, SOL_5m allowed!
+    res_eth_open = model_v14.apply_volatility_regime_guard(
+        "ETH_5m",
+        base_pred,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-09T15:10:00+00:00",
+        btc_ret_1h_pct=0.45,
+        btc_ret_4h_pct=0.80,
+    )
+    assert res_eth_open["selected"] is False
+    assert res_eth_open["volatility_regime_reason"] == "US_OPEN_BLACKOUT"
+
+    res_sol_open = model_v14.apply_volatility_regime_guard(
+        "SOL_5m",
+        base_pred,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-09T15:10:00+00:00",
+        btc_ret_1h_pct=0.45,  # BTC +0.45% and buying DOWN = mean reversion (not momentum chase)
+        btc_ret_4h_pct=0.80,
+    )
+    assert res_sol_open["selected"] is True
+
+    # Weekend 15:10 UTC (Sunday 2026-11-08 15:10:00Z): ETH_5m is NOT blocked by US_OPEN_BLACKOUT
+    res_eth_sun = model_v14.apply_volatility_regime_guard(
+        "ETH_5m",
+        base_pred,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-08T15:10:00+00:00",
+        btc_ret_1h_pct=0.45,
+        btc_ret_4h_pct=0.80,
+    )
+    assert res_eth_sun["selected"] is True
+
+    # Weekday 16:00 UTC (minute=960, end of 90m blackout): ETH_5m resumes!
+    res_eth_after = model_v14.apply_volatility_regime_guard(
+        "ETH_5m",
+        base_pred,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-09T16:00:00+00:00",
+        btc_ret_1h_pct=0.45,
+        btc_ret_4h_pct=0.80,
+    )
+    assert res_eth_after["selected"] is True
+
+    # 2. Macro 4h breakout (|btc_ret_4h_pct| = 2.45% > 2.0%): skips BTC_15m/ETH_5m, allows SOL_15m
+    res_btc_4h = model_v14.apply_volatility_regime_guard(
+        "BTC_15m",
+        {"selected": True, "side": "UP", "z_v4": 0.60},
+        ex_ante_rv12_bps=12.0,
+        guard_config=vg,
+        cohort_time="2026-11-09T10:00:00+00:00",
+        btc_ret_1h_pct=-0.50,
+        btc_ret_4h_pct=-2.45,
+    )
+    assert res_btc_4h["selected"] is False
+    assert res_btc_4h["volatility_regime_reason"] == "BTC_4H_MACRO_BREAKOUT"
+
+    res_sol_4h = model_v14.apply_volatility_regime_guard(
+        "SOL_15m",
+        {"selected": True, "side": "UP", "z_v4": 0.60},
+        ex_ante_rv12_bps=12.0,
+        guard_config=vg,
+        cohort_time="2026-11-09T10:00:00+00:00",
+        btc_ret_1h_pct=-0.50,
+        btc_ret_4h_pct=-2.45,
+    )
+    assert res_sol_4h["selected"] is True
+
+    # 3. 1h momentum chase (btc_ret_1h_pct = +0.42% > +0.3% and side == "UP"): skipped!
+    res_chase_up = model_v14.apply_volatility_regime_guard(
+        "SOL_15m",
+        {"selected": True, "side": "UP", "z_v4": 0.60},
+        ex_ante_rv12_bps=12.0,
+        guard_config=vg,
+        cohort_time="2026-11-09T10:00:00+00:00",
+        btc_ret_1h_pct=0.42,
+        btc_ret_4h_pct=0.90,
+    )
+    assert res_chase_up["selected"] is False
+    assert res_chase_up["volatility_regime_reason"] == "BTC_1H_MOMENTUM_CHASE"
+
+    # Compute causal 1h/4h BTC returns from 48 closed 5m candles
+    intraday = tmp_path / "macro_root" / "intraday"
+    intraday.mkdir(parents=True)
+    times48 = pd.date_range("2026-11-09T06:00:00Z", periods=48, freq="5min")
+    opens = [100.0] * 48
+    closes = [100.0] * 48
+    opens[0] = 100.0
+    opens[36] = 101.0  # 1h ago (bar -12) open = 101.0
+    closes[-1] = 102.01  # close = 102.01 -> 4h ret = +2.01%, 1h ret = +1.0%
+    df48 = pd.DataFrame({"date": times48, "open_time": times48, "open": opens, "close": closes})
+    df48.to_parquet(intraday / "BTCUSDT_5m_futures.parquet", index=False)
+    macro_rets = model_v14.compute_ex_ante_btc_macro_returns_pct(
+        tmp_path / "macro_root", "BTCUSDT", as_of="2026-11-09T10:00:04Z"
+    )
+    assert macro_rets["btc_ret_1h_pct"] == pytest.approx(1.0)
+    assert macro_rets["btc_ret_4h_pct"] == pytest.approx(2.01)
+
+
+
 
 
 

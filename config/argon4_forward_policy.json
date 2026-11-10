@@ -28,6 +28,13 @@
   "max_underlying_open_risk_usd": 120,
   "max_buy_price": 0.515,
   "min_buy_price": 0.37,
+  "stream_min_buy_price": {
+    "BTC_5m": 0.425,
+    "ETH_5m": 0.425,
+    "SOL_5m": 0.425,
+    "BTC_15m": 0.37,
+    "SOL_15m": 0.37
+  },
   "daily_loss_fraction": 0.08,
   "cap_budget_by_daily_loss_room": true,
   "risk_limit_note": "Strategy B ($1,000 paper capital): $40 single order (4%), $80 window budget (8%), $120 active / $200 total open risk, -$80 (8%) daily stop loss",
@@ -280,7 +287,6 @@
       "ETH_5m": 35.0,
       "ETH_15m": 35.0
     },
-    "action": "SKIP_OR_HALF_STAKE",
     "min_rv12_bps": {
       "BTC_15m": 2.5,
       "SOL_15m": 3.0,
@@ -288,7 +294,30 @@
       "BTC_5m": 3.0,
       "ETH_5m": 3.0,
       "SOL_5m": 3.0
-    }
+    },
+    "us_open_blackout": {
+      "enabled": true,
+      "utc_start_minute": 870,
+      "utc_end_minute": 960,
+      "weekdays_only": true,
+      "skip_streams": [
+        "ETH_5m",
+        "BTC_5m",
+        "BTC_15m"
+      ]
+    },
+    "macro_trend_guard": {
+      "enabled": true,
+      "max_btc_4h_abs_return_pct": 2.0,
+      "apply_streams": [
+        "BTC_15m",
+        "BTC_5m",
+        "ETH_5m",
+        "ETH_15m"
+      ],
+      "skip_1h_momentum_chase_above_pct": 0.3
+    },
+    "action": "SKIP_OR_HALF_STAKE"
   },
   "early_window_book_ticker": {
     "enabled": false

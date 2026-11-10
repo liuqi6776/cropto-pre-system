@@ -182,6 +182,21 @@ The entire drop from `56.25%` (Binance K-line win rate) to `37.50%` (Polymarket 
 | 10 | `2026-11-09 19:35:13` | `ETH_5m` | `UP` | `80.41` | `$40.00` (`$1.40`) | `WON` | `$80.41` | **`+$40.41`** | `+$123.29` (`$1,123.29`) |
 | 11 | `2026-11-09 21:45:10` | `ETH_5m` | `UP` | `79.33` | `$40.00` (`$1.39`) | `WON` | `$79.33` | **`+$39.33`** | **`+$162.61` (`$1,162.61`)** |
 
+---
+
+## 7. ARGON-4 `v14r11`: 631-Day Macro/Session Correlation Hardening (`us_open_blackout`, `macro_trend_guard`, & `0.425` 5m Floor) / `v14r11` 宏观周期与美股开盘避险加固
+
+Based on the 631-day (`32,241` waterfall windows, `2025-01-01` to `2026-09-24`) and 57-order live/paper correlation study (`ARGON4_STREAK_AND_MACRO_CYCLE_CORRELATION_REPORT.txt`), `v14r11` deploys three empirical guards in [`config/argon4_forward_policy.json`](file:///c:/Users/liuqi/crypto-predict_system/config/argon4_forward_policy.json), [`tools/argon4_forward/model_v14.py`](file:///c:/Users/liuqi/crypto-predict_system/tools/argon4_forward/model_v14.py), and [`tools/argon4_forward/pipeline.py`](file:///c:/Users/liuqi/crypto-predict_system/tools/argon4_forward/pipeline.py):
+
+1. **5m Stream Minimum Buy Price Floor (`stream_min_buy_price = 0.425` for `BTC_5m / ETH_5m / SOL_5m`, `0.37` for `BTC_15m / SOL_15m`)**:
+   - Filters out deep-discount 5m adverse-selection traps (`0.37 ~ 0.42`, where all 3 losing trades `#2`, `#3`, `#7` on `2026-11-09` filled at `0.418 ~ 0.420`).
+2. **US Market Open 90-Minute Blackout (`us_open_blackout`: `14:30 – 16:00 UTC` / `minute 870..960`, Weekdays Only)**:
+   - Skips `ETH_5m`, `BTC_5m`, and `BTC_15m` during the first 90 minutes of the US equity session (`14:30 – 16:00 UTC` Monday–Friday, the only net-negative session across 631 days with `52.70%` win rate / `-12.2` units), automatically routing waterfall budget to `SOL_15m` and `SOL_5m`.
+3. **4-Hour Macro Breakout & 1-Hour Momentum Chase Guard (`macro_trend_guard`)**:
+   - Skips `BTC_15m / BTC_5m / ETH_5m / ETH_15m` when causal 4-hour BTC absolute return `|btc_ret_4h_pct| > 2.0%` (`BTC_4H_MACRO_BREAKOUT`), and skips any 1-hour momentum-chasing signal (`btc_ret_1h_pct > +0.3%` buying `UP`, or `btc_ret_1h_pct < -0.3%` buying `DOWN`, `BTC_1H_MOMENTUM_CHASE`, where historical win rate is only `51.12% ~ 51.28%`).
+   - Across the 631-day OOS evaluation, combining these three guards raises daily Sharpe from `3.92` to **`4.98`** (and to **`5.33`** with `-16.01%` max drawdown on `$10,000` compounding, or **31 days to `$10,000`** with `5.12` Sharpe on `$1,000` Strategy B).
+
+
 
 
 
