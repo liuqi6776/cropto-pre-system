@@ -1230,6 +1230,20 @@ class Account:
             positions = [dict(o) for o in con.execute("SELECT order_id,signal_id,market_id,underlying,outcome,quantity,cost_atoms,fee_atoms,fill_at,window_end FROM orders WHERE status='OPEN'")]
             signal_count = con.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
             latest_policy_row = con.execute("SELECT policy_json FROM decision_cohorts ORDER BY cohort_id DESC LIMIT 1").fetchone() if policy is None else None
+            order_rows = con.execute("""
+                SELECT o.order_id, o.signal_id, o.market_id, o.underlying, o.outcome, o.quantity,
+                       o.cost_atoms, o.fee_atoms, o.status, o.fill_at, o.window_end,
+                       s.payload AS signal_payload, r.settled_at AS settled_at
+                FROM orders o
+                LEFT JOIN signals s ON o.signal_id = s.signal_id
+                LEFT JOIN resolutions r ON o.market_id = r.market_id
+                ORDER BY o.fill_at ASC, o.rowid ASC
+            """).fetchall()
+            trade_event_rows = con.execute("""
+                SELECT * FROM events
+                WHERE event_type IN ('ACCOUNT_CREATED', 'PAPER_IOC', 'OFFICIAL_RESOLUTION_APPLIED_TO_PAPER')
+                ORDER BY seq DESC LIMIT 50
+            """).fetchall()
         effective_policy = policy if policy is not None else (
             json.loads(latest_policy_row[0]) if latest_policy_row else getattr(self, "policy", None)
         )
@@ -1246,6 +1260,72 @@ class Account:
         for p in positions:
             p["cost_usd"] = _usd(p.pop("cost_atoms"))
             p["fee_usd"] = _usd(p.pop("fee_atoms"))
+        recent_orders = []
+        running_pnl_atoms = 0
+        orders_by_market = {}
+        for idx, orow in enumerate(order_rows, 1):
+            invested_atoms = orow["cost_atoms"] + orow["fee_atoms"]
+            ostatus = orow["status"]
+            if ostatus == "WON":
+                payout_atoms = int((_d(orow["quantity"]) * MICRO).to_integral_value(rounding=ROUND_DOWN))
+                pnl_atoms = payout_atoms - invested_atoms
+                running_pnl_atoms += pnl_atoms
+            elif ostatus == "LOST":
+                payout_atoms = 0
+                pnl_atoms = -invested_atoms
+                running_pnl_atoms += pnl_atoms
+            elif ostatus == "VOID":
+                payout_atoms = invested_atoms
+                pnl_atoms = 0
+            else:
+                payout_atoms = None
+                pnl_atoms = None
+            sig_info = {}
+            if orow["signal_payload"]:
+                try:
+                    sig_info = json.loads(orow["signal_payload"])
+                except Exception:
+                    sig_info = {}
+            stream_name = sig_info.get("stream") or orow["underlying"]
+            item = {
+                "seq_num": idx,
+                "order_id": orow["order_id"],
+                "signal_id": orow["signal_id"],
+                "market_id": orow["market_id"],
+                "stream": stream_name,
+                "underlying": orow["underlying"],
+                "outcome": orow["outcome"],
+                "quantity": orow["quantity"],
+                "cost_usd": _usd(orow["cost_atoms"]),
+                "fee_usd": _usd(orow["fee_atoms"]),
+                "total_cost_usd": _usd(invested_atoms),
+                "status": ostatus,
+                "payout_usd": _usd(payout_atoms) if payout_atoms is not None else None,
+                "realized_pnl_usd": _usd(pnl_atoms) if pnl_atoms is not None else None,
+                "cumulative_pnl_usd": _usd(running_pnl_atoms),
+                "cumulative_balance_usd": _usd(a["initial_atoms"] + running_pnl_atoms),
+                "fill_at": orow["fill_at"],
+                "window_end": orow["window_end"],
+                "settled_at": orow["settled_at"],
+            }
+            recent_orders.append(item)
+            orders_by_market.setdefault(orow["market_id"], []).append(item)
+        recent_orders.reverse()
+        trade_events = []
+        for erow in trade_event_rows:
+            epayload = json.loads(erow["payload"])
+            if erow["event_type"] == "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER" and isinstance(epayload, dict):
+                m_orders = orders_by_market.get(epayload.get("market_id"), [])
+                if m_orders:
+                    epayload = {
+                        **epayload,
+                        "stream": m_orders[0].get("stream"),
+                        "underlying": m_orders[0].get("underlying"),
+                        "order_outcome": m_orders[0].get("outcome"),
+                        "order_status": m_orders[0].get("status"),
+                        "total_cost_usd": round(sum(x.get("total_cost_usd", 0.0) for x in m_orders), 6),
+                    }
+            trade_events.append({**dict(erow), "payload": epayload})
         wins, losses = counts.get("WON", 0), counts.get("LOST", 0)
         return {"classification": "EXPLORATORY_FORWARD_PAPER", "live_enabled": False,
                 "currency": a["currency"], "started_at": a["started_at"], "as_of": _iso(stamp),
@@ -1262,7 +1342,8 @@ class Account:
                 "win_rate_pct": 100*wins/(wins+losses) if wins+losses else None,
                 "signal_count": signal_count, "order_count": sum(counts.values()),
                 "filled_order_count": sum(v for k,v in counts.items() if k != "NO_FILL"),
-                "positions": positions, "runtime_status": runtime["status"], "blocked_reason": runtime["blocked_reason"],
+                "positions": positions, "recent_orders": recent_orders[:100], "trade_events": trade_events,
+                "runtime_status": runtime["status"], "blocked_reason": runtime["blocked_reason"],
                 "heartbeat_at": runtime["heartbeat_at"],
                 "heartbeat_age_seconds": max(0.0, (stamp-_ts(runtime["heartbeat_at"])).total_seconds()),
                 "runtime_details": json.loads(runtime["details"]),
@@ -1288,7 +1369,8 @@ class Account:
         with self._connection() as con:
             rows = con.execute("SELECT * FROM equity_observations ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
         return [{"utc": r["utc"], "cash": _usd(r["cash_atoms"]), "locked_cost": _usd(r["locked_atoms"]),
-                 "realized_pnl": _usd(r["realized_atoms"]), "equity": None if r["equity_atoms"] is None else _usd(r["equity_atoms"]),
+                 "realized_pnl": _usd(r["realized_atoms"]), "realized_balance": _usd(r["cash_atoms"] + r["locked_atoms"]),
+                 "equity": None if r["equity_atoms"] is None else _usd(r["equity_atoms"]),
                  "valuation_status": r["valuation_status"]} for r in reversed(rows)]
 
 

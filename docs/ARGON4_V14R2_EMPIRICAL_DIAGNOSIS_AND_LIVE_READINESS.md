@@ -145,6 +145,44 @@ The entire drop from `56.25%` (Binance K-line win rate) to `37.50%` (Polymarket 
      - `ETH_5m` 触发 `UP` 信号（`|z_v4| = 1.8451 > 1.7207`），盘口卖单位于健康的 `0.46 ~ 0.49` 区间（满足 `0.37 <= ask <= 0.515`）；
      - 系统于 `00:20:09.115 UTC`（北京时间 `08:20:09`）成功撮合 **第 46 笔模拟单 (`paper:5b099c2bf9cb...`)**，买入 `ETH UP` 共 `294.16` 份，总成本 **`$147.30`（本金 `$142.16` + 手续费 `$5.14`）**。
 
+---
+
+## 6. `$1,000` Strategy B Paper Simulation Log & Dashboard PnL Display Fix (`2026-11-09 13:50 UTC` – `2026-11-10 00:35 UTC`) / `$1,000` 打法 B 模拟盘运行实录与看板收益展示修复
+
+### 6.1 Root-Cause Investigation of Dashboard PnL / Equity Display Issue / 看板未能正确展示交易收益与曲线的根因调查
+
+1. **Root Cause 1 — Equity Chart (`#chart`) Broken by `150,000 ms` (`2.5 min`) Gap Threshold & `equity: null` on Overlapping Positions (`dashboard/argon4_forward/app.js` & `tools/argon4_forward/account.py`)**:
+   - **Why 17 of 23 snapshots were dropped**: Whenever an order was placed (`PAPER_IOC`) or settled while another order was still open (`locked_atoms > 0`), `Account._snapshot` recorded `equity_atoms = None`. Because orders #1–#5 overlapped between `15:05 UTC` and `15:46 UTC`, 17 out of 23 snapshots in `equity_observations` had `equity = null` and were filtered out by `drawChart()`.
+   - **Why the remaining 6 points drew 0 lines**: In `app.js` line 58, `drawChart()` checked `const gap = i && p.t - pts[i-1].t > 150000` (`2.5 minutes`). Because `equity_observations` only records snapshots when orders are placed or settled (typically 10 to 180 minutes apart), **100% of settled points had `dt > 150,000 ms` (`gap = true`)**, causing the SVG `<path>` to emit only `M x,y` (`MoveTo`) commands without a single `L x,y` (`LineTo`) segment—leaving the entire equity chart visually blank except for a single dot on the right edge!
+2. **Root Cause 2 — Trade & Settlement Records (`PAPER_IOC` / `OFFICIAL_RESOLUTION_APPLIED_TO_PAPER`) Drowned Out of `/api/ledger` by Routine 5m Skips**:
+   - Every 5-minute decision window writes 8 events (`1 DECISION_COHORT_CREATED + 7 COHORT_STREAM_SKIPPED`, i.e., **96 events/hour**) into the `events` table.
+   - `Account.ledger()` queried `SELECT * FROM events ORDER BY seq DESC LIMIT 100` (~1 hour of 5m skip events), and `app.js` rendered only `rows.slice(0, 20)` (~12 minutes). Consequently, all 11 filled orders and their official settlement PnL records were pushed out of `/api/ledger` by routine `DISABLED_BY_STAGE` / `NOT_DUE` / `NO_SIGNAL` skip rows!
+3. **Root Cause 3 — Top Hero Card (`#equity`) Showing `"待估值"` During Any Active Order**:
+   - Whenever an order was `OPEN` (in-flight or awaiting Chainlink resolution), `account.overview()` returned `equity: null` (`UNVALUED_OPEN_POSITIONS`), causing `app.js` to replace the dollar balance on the `#equity` card with `"待估值"` instead of displaying `realized_balance` (`initial_capital + realized_pnl`).
+4. **Fix Implemented**:
+   - Added `realized_balance` (`_usd(r["cash_atoms"] + r["locked_atoms"])`) to `Account.equity_history()` and `recent_orders` (with per-order `payout_usd`, `realized_pnl_usd`, `cumulative_pnl_usd`, `cumulative_balance_usd`) + `trade_events` (filtering `ACCOUNT_CREATED`, `PAPER_IOC`, `OFFICIAL_RESOLUTION_APPLIED_TO_PAPER`) to `Account.overview()`.
+   - Updated `drawChart()` in `dashboard/argon4_forward/app.js` to plot `equity ?? realized_balance` continuously with shaded area, point markers, and Y-axis dollar labels, added a dedicated **`模拟成交与单笔收益明细` (`#tradeorders`)** table in `dashboard/argon4_forward/index.html`, and prioritized `trade_events` in `账户流水` (`#ledger`).
+
+### 6.2 `$1,000` Strategy B Paper Simulation Order & PnL Ledger (`2026-11-09 13:50 UTC` – `2026-11-10 00:35 UTC`) / `$1,000` 打法 B 模拟盘逐笔成交与结算收益实录
+
+- **Initial Capital / 初始本金**: `$1,000.00` (`single_stream_equity_fraction = 4% / $40`, `tick_equity_fraction = 8% / $80`, `daily_loss_fraction = 8% / -$80`)
+- **Cumulative Settled Performance / 累计结算表现**: **11 Orders (`8 WON / 3 LOST`, Win Rate `72.73%`), Realized PnL `+$162.61` (`+16.26%`), Realized Balance `$1,162.61`, Max Realized Drawdown `-7.72%`** (full machine-readable paper log exported to [`docs/ARGON4_PAPER_SIMULATION_LOG_20261110.json`](file:///c:/Users/liuqi/crypto-predict_system/docs/ARGON4_PAPER_SIMULATION_LOG_20261110.json)).
+
+| # | Fill Time (UTC) | Stream | Side | Shares | Total Cost (Fee) | Status | Payout | Order Net PnL | Cumulative PnL (Balance) |
+| :-: | :--- | :--- | :-: | --: | --: | :-: | --: | --: | --: |
+| 1 | `2026-11-09 15:05:13` | `ETH_5m` | `DOWN` | `76.17` | `$40.00` (`$1.33`) | `WON` | `$76.17` | **`+$36.17`** | `+$36.17` (`$1,036.17`) |
+| 2 | `2026-11-09 15:10:10` | `ETH_5m` | `DOWN` | `91.99` | `$40.00` (`$1.57`) | `LOST` | `$0.00` | **`-$40.00`** | `-$3.83` (`$996.17`) |
+| 3 | `2026-11-09 15:10:11` | `BTC_5m` | `DOWN` | `91.52` | `$40.00` (`$1.56`) | `LOST` | `$0.00` | **`-$40.00`** | `-$43.83` (`$956.17`) |
+| 4 | `2026-11-09 15:15:10` | `SOL_15m` | `DOWN` | `10.00` | `$5.27` (`$0.17`) | `WON` | `$10.00` | **`+$4.73`** | `-$39.10` (`$960.90`) |
+| 5 | `2026-11-09 15:20:10` | `BTC_5m` | `DOWN` | `77.92` | `$30.90` (`$1.29`) | `WON` | `$77.92` | **`+$47.03`** | `+$7.92` (`$1,007.92`) |
+| 6 | `2026-11-09 15:35:12` | `SOL_5m` | `DOWN` | `77.06` | `$40.00` (`$1.35`) | `WON` | `$77.06` | **`+$37.06`** | `+$44.99` (`$1,044.99`) |
+| 7 | `2026-11-09 15:40:11` | `SOL_5m` | `DOWN` | `91.78` | `$40.00` (`$1.56`) | `LOST` | `$0.00` | **`-$40.00`** | `+$4.99` (`$1,004.99`) |
+| 8 | `2026-11-09 15:50:11` | `SOL_5m` | `DOWN` | `75.83` | `$40.00` (`$1.33`) | `WON` | `$75.83` | **`+$35.83`** | `+$40.82` (`$1,040.82`) |
+| 9 | `2026-11-09 16:15:11` | `BTC_15m` | `DOWN` | `82.06` | `$40.00` (`$1.43`) | `WON` | `$82.06` | **`+$42.06`** | `+$82.88` (`$1,082.88`) |
+| 10 | `2026-11-09 19:35:13` | `ETH_5m` | `UP` | `80.41` | `$40.00` (`$1.40`) | `WON` | `$80.41` | **`+$40.41`** | `+$123.29` (`$1,123.29`) |
+| 11 | `2026-11-09 21:45:10` | `ETH_5m` | `UP` | `79.33` | `$40.00` (`$1.39`) | `WON` | `$79.33` | **`+$39.33`** | **`+$162.61` (`$1,162.61`)** |
+
+
 
 
 
