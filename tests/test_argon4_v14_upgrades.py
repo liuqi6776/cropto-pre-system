@@ -726,7 +726,7 @@ def test_v14r4_snapshots_only_large_observations_hardlink_chained_delta_and_acti
 
     # Verify production policy has both empirical guards enabled and MonitorAuditLogger formats both
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == 0.37
+    assert policy["min_buy_price"] == 0.415
     assert policy["volatility_regime_guard"]["enabled"] is True
     assert policy["volatility_regime_guard"]["min_rv12_bps"]["BTC_5m"] == 3.0
 
@@ -775,7 +775,7 @@ def test_v14r5_multilevel_orderbook_adverse_selection_guard_and_immediate_skip_w
     from tools.argon4_forward.execution import PaperExecutor
 
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == 0.37
+    assert policy["min_buy_price"] == 0.415
     assert policy["execution"]["multi_look_ioc"] is True
 
     market_btc = {
@@ -1438,8 +1438,9 @@ def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_p
         "BTC_5m": 0.425,
         "ETH_5m": 0.425,
         "SOL_5m": 0.425,
-        "BTC_15m": 0.37,
-        "SOL_15m": 0.37,
+        "BTC_15m": 0.415,
+        "ETH_15m": 0.415,
+        "SOL_15m": 0.415,
     }
     vg = policy["volatility_regime_guard"]
     assert vg["us_open_blackout"]["enabled"] is True
@@ -1556,11 +1557,159 @@ def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_p
     assert macro_rets["btc_ret_4h_pct"] == pytest.approx(2.01)
 
 
+def test_v14r12_audit_remediations_bleed_cap_stream_max_order_1h_retry_and_fast_revision(tmp_path):
+    """v14r12:
+    1. Issue 1: 15m stream_min_buy_price raised to 0.415 (blocking #16 BTC_15m UP @ 0.380).
+    2. Issue 2: single_order_per_window_on_2h_bleed marks bleed_single_order_window_cap=True when
+       |btc_ret_2h_pct| >= 0.50% and |btc_ema_gap_bps| >= 15.0 bps against signal direction, and
+       PaperExecutor enforces at most 1 order per window (skipping second signal as BLEED_WINDOW_SINGLE_ORDER_CAP).
+    3. Issue 3 & 4: engineering profile supports 3.8s min decision delay, 16.5s input deadline, 0.25s poll,
+       0.35s retry, 25s prefetch lead, 8s prefetch budget, and 18.0s/1.2s fast-path revision context.
+    4. Issue 5: Argon4ForwardPipeline.retryable_latest_candle allows top-of-hour 1h futures/mark latest candle lag.
+    5. Issue 6: _resolve_5m_frame reads from snapshot._raw in-memory via _read_validated without disk fallback.
+    6. Issue 7: stream_max_order_usd caps SOL_5m/SOL_15m at $45 and Step 1 $200 capital risk fractions (0.08/0.16) pass.
+    """
+    from datetime import datetime, timezone
+    import hashlib
+    from tools.argon4_forward.account import Account, _policy_risk_limits
+    from tools.argon4_forward.execution import PaperExecutor
+    from tools.argon4_forward.pipeline import ForwardPipeline
+    from tools.argon4_forward.runtime_profile import engineering_profile
 
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    assert policy["min_buy_price"] == pytest.approx(0.415)
+    assert policy["stream_min_buy_price"]["BTC_15m"] == pytest.approx(0.415)
+    assert policy["stream_min_buy_price"]["SOL_15m"] == pytest.approx(0.415)
+    assert policy["stream_max_order_usd"] == {
+        "BTC_15m": 100,
+        "BTC_5m": 100,
+        "ETH_15m": 90,
+        "ETH_5m": 90,
+        "SOL_15m": 45,
+        "SOL_5m": 45,
+    }
+    eng = engineering_profile(policy)
+    assert eng["enabled"] is True
+    assert eng["window_poll_interval_seconds"] == pytest.approx(0.25)
+    assert eng["input_deadline_after_boundary_seconds"] == pytest.approx(16.5)
+    assert eng["input_ready_retry_interval_seconds"] == pytest.approx(0.35)
+    assert eng["prefetch_lead_seconds"] == pytest.approx(25.0)
+    assert eng["prefetch_budget_seconds"] == pytest.approx(8.0)
 
+    # Issue 7: Step 1 ($200 capital, 0.08 single / 0.16 tick / 0.16 daily_loss) passes _policy_risk_limits
+    step1_policy = {
+        **policy,
+        "initial_capital_usd": 200,
+        "single_stream_equity_fraction": 0.08,
+        "tick_equity_fraction": 0.16,
+        "max_tick_budget_usd": 32,
+        "max_order_usd": 16,
+        "max_active_window_risk_usd": 48,
+        "max_open_risk_usd": 64,
+        "max_underlying_active_risk_usd": 32,
+        "max_underlying_open_risk_usd": 48,
+        "daily_loss_fraction": 0.16,
+    }
+    step1_limits = _policy_risk_limits(step1_policy)
+    assert float(step1_limits["single_stream_equity_fraction"]) == pytest.approx(0.08)
+    assert float(step1_limits["tick_equity_fraction"]) == pytest.approx(0.16)
+    assert float(step1_limits["stream_max_order_usd"]["SOL_5m"]) == pytest.approx(45.0)
 
+    # Issue 5: retryable_latest_candle allows 1h futures/mark lag at top-of-hour (minute == 0), rejects at minute != 0
+    inputs_1h = {
+        "status": "BLOCKED",
+        "errors": [],
+        "gaps": [
+            {"source": "BTCUSDT:futures:5m", "error": "LATEST_CLOSED_BAR_MISSING"},
+            {"source": "BTCUSDT:futures:1h", "error": "LATEST_CLOSED_BAR_MISSING"},
+            {"source": "ETHUSDT:mark:1h", "error": "LATEST_CLOSED_BAR_MISSING"},
+        ],
+        "sources": {
+            "BTCUSDT:futures:5m": {
+                "latest_closed": "2026-11-10T03:55:00+00:00",
+                "rows": 4500,
+                "issues": ["LATEST_CLOSED_BAR_MISSING"],
+            },
+            "BTCUSDT:futures:1h": {
+                "latest_closed": "2026-11-10T03:00:00+00:00",
+                "rows": 400,
+                "issues": ["LATEST_CLOSED_BAR_MISSING"],
+            },
+            "ETHUSDT:mark:1h": {
+                "latest_closed": "2026-11-10T03:00:00+00:00",
+                "rows": 400,
+                "issues": ["LATEST_CLOSED_BAR_MISSING"],
+            },
+        },
+    }
+    assert ForwardPipeline.retryable_latest_candle(
+        inputs_1h, datetime(2026, 11, 10, 4, 0, tzinfo=timezone.utc)
+    ) is True
+    assert ForwardPipeline.retryable_latest_candle(
+        inputs_1h, datetime(2026, 11, 10, 4, 5, tzinfo=timezone.utc)
+    ) is False
 
+    # Issue 6: _resolve_5m_frame uses snapshot._raw + snapshot._read_validated without disk fallback
+    class DummySnapshot:
+        def __init__(self, frame):
+            self._validated = {}
+            self._raw = {Path("intraday/BTCUSDT_5m_futures.parquet"): b"in_memory_bytes"}
+            self._frame = frame
+            self.read_calls = 0
 
+        def _read_validated(self, key):
+            assert getattr(key, "name", "") == "BTCUSDT_5m_futures.parquet"
+            self.read_calls += 1
+            return self._frame, "sha", 0
 
+    times48 = pd.date_range("2026-11-10T00:00:00Z", periods=48, freq="5min")
+    # Construct a 2h downward bleed: open 2h ago = 100.0, close = 99.30 (-0.70%), EMA12 < EMA36 by > 15 bps
+    prices = [100.0] * 24 + [100.0 - 0.03 * (i + 1) for i in range(24)]
+    df_bleed = pd.DataFrame({"date": times48, "open_time": times48, "open": prices, "close": prices})
+    snap = DummySnapshot(df_bleed)
+    macro_bleed = model_v14.compute_ex_ante_btc_macro_returns_pct(
+        tmp_path / "nonexistent_dir", "BTCUSDT", as_of="2026-11-10T04:00:04Z", snapshot=snap
+    )
+    assert snap.read_calls == 1
+    assert macro_bleed["btc_ret_2h_pct"] < -0.50
+    assert macro_bleed["btc_ema_gap_bps"] < -15.0
 
+    # Issue 2: apply_volatility_regime_guard marks bleed_single_order_window_cap=True on counter-trend UP during 2h bleed
+    pred_up = model_v14.apply_volatility_regime_guard(
+        "ETH_5m",
+        {"selected": True, "side": "UP", "z_v4": 0.55},
+        ex_ante_rv12_bps=10.0,
+        guard_config=policy["volatility_regime_guard"],
+        cohort_time="2026-11-10T03:40:00+00:00",
+        btc_ret_1h_pct=-0.35,
+        btc_ret_2h_pct=macro_bleed["btc_ret_2h_pct"],
+        btc_ret_4h_pct=-0.85,
+        btc_ema_gap_bps=macro_bleed["btc_ema_gap_bps"],
+    )
+    assert pred_up["selected"] is True
+    assert pred_up.get("bleed_single_order_window_cap") is True
+
+    # Verify PaperExecutor fills Rank 1 (BTC_15m UP) and skips Rank 2 (ETH_5m UP) via BLEED_WINDOW_SINGLE_ORDER_CAP
+    from test_argon4_forward_execution import BOUNDARY, clock as make_clock, fixture_inputs, v5_policy
+
+    bleed_policy = {
+        **v5_policy(),
+        "min_buy_price": 0.415,
+        "stream_min_buy_price": policy["stream_min_buy_price"],
+        "stream_max_order_usd": policy["stream_max_order_usd"],
+        "execution": policy["execution"],
+    }
+    ledger = Account(tmp_path / "bleed_account.sqlite3", initial_capital=10000, started_at=BOUNDARY - pd.Timedelta(seconds=1))
+    exec_paper = PaperExecutor(ledger, bleed_policy)
+    decisions, markets = fixture_inputs(boundary=BOUNDARY)
+    for st_name in decisions:
+        if decisions.get(st_name, {}).get("status") == "SIGNAL":
+            decisions[st_name]["signal"]["bleed_single_order_window_cap"] = True
+            decisions[st_name]["signal"]["max_orders_in_window"] = 1
+    now_ts = BOUNDARY + pd.Timedelta(seconds=1)
+    res_exec = exec_paper.process_cohort(BOUNDARY.isoformat(), decisions, markets, now=now_ts, clock=make_clock(now_ts))
+    assert res_exec["status"] == "PROCESSED", res_exec
+    assert len(res_exec["fills"]) == 1
+    assert res_exec["stream_results"]["BTC_15m"]["status"] == "FILLED_BUDGET"
+    assert res_exec["stream_results"]["ETH_5m"]["status"] == "BLEED_WINDOW_SINGLE_ORDER_CAP"
 

@@ -448,11 +448,17 @@ class ForwardPipeline:
                 "CONFLICTING_CLOSED_OBSERVATION", "ValueError:CONFLICTING_CLOSED_OBSERVATION")
                 or not _supported_fast_source(e.get("source")) for e in errors):
             return inputs, None
-        deadline = cohort+timedelta(seconds=engineering["input_deadline_after_boundary_seconds"])
+        raw_deadline_sec = float(engineering.get("input_deadline_after_boundary_seconds", 14.0))
+        if raw_deadline_sec > 14.0:
+            deadline = cohort + timedelta(seconds=min(18.5, max(raw_deadline_sec, 18.0)))
+            confirm_wait_sec = 1.2
+        else:
+            deadline = cohort + timedelta(seconds=raw_deadline_sec)
+            confirm_wait_sec = 2.0
         clock = dict(self.clock)
         guard = lambda: self._revision_guard(policy, cohort, deadline, clock)
         context = {"profile": self._revision_fastpath["profile"], "cohort": cohort.isoformat(),
-                   "deadline": deadline.isoformat(), "minimum_spacing_seconds": 2.0,
+                   "deadline": deadline.isoformat(), "minimum_spacing_seconds": confirm_wait_sec,
                    "clock_evidence_sha256": clock["receipt_sha256"]}
         revision = None
         self._same_cohort_revision = None
@@ -479,9 +485,9 @@ class ForwardPipeline:
                 if (attempt or revision.get("status") != "WAITING_CONFIRMATION"
                         or revision.get("fast_confirmation_eligible") is not True):
                     return inputs, revision
-                if calibrated_now(clock)+timedelta(seconds=2) >= deadline:
+                if calibrated_now(clock)+timedelta(seconds=confirm_wait_sec) >= deadline:
                     return inputs, revision
-                if self.stop.wait(2):
+                if self.stop.wait(confirm_wait_sec):
                     raise ValueError("STOPPED_DURING_REVISION_CONFIRMATION")
                 guard()
                 inputs = self.refresh_decision_inputs(engineering, cohort, calibrated_now(clock, upper=False))
@@ -496,6 +502,9 @@ class ForwardPipeline:
             view = ensure_view_committed(self.runtime)
             if any(view.get(k) != revision.get(k) for k in ("revision_id", "manifest_sha256")):
                 raise ValueError("REVISION_VIEW_CHANGED_BEFORE_REFRESH")
+            if raw_deadline_sec > 14.0:
+                self._same_cohort_revision = {"cohort": cohort, "revision_id": view["revision_id"],
+                                              "manifest_sha256": view["manifest_sha256"], "clock": clock}
             inputs = self.refresh_decision_inputs(engineering, cohort, calibrated_now(clock, upper=False))
             self.observations.save("post_revision_inputs", inputs)
             guard()
@@ -638,7 +647,9 @@ class ForwardPipeline:
                     guard_config=vol_guard,
                     cohort_time=cohort,
                     btc_ret_1h_pct=btc_macro_rets.get("btc_ret_1h_pct"),
+                    btc_ret_2h_pct=btc_macro_rets.get("btc_ret_2h_pct"),
                     btc_ret_4h_pct=btc_macro_rets.get("btc_ret_4h_pct"),
+                    btc_ema_gap_bps=btc_macro_rets.get("btc_ema_gap_bps"),
                 )
             self._decision_timing["inference_seconds"][stream] = time.perf_counter()-started
             if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
@@ -653,6 +664,9 @@ class ForwardPipeline:
                           "validation_status": "INPUTS_VALIDATED", "feature_available_at": available.isoformat(),
                           "decision_at": decision_time.isoformat(), "valid_until": (cohort+timedelta(seconds=20)).isoformat(),
                           "window_start": cohort.isoformat(), "window_end": (cohort+timedelta(seconds=duration)).isoformat()}
+                if score.get("bleed_single_order_window_cap") is True:
+                    signal["bleed_single_order_window_cap"] = True
+                    signal["max_orders_in_window"] = 1
                 decisions[stream].update(status="SIGNAL", signal=signal)
         return decisions
 
@@ -844,19 +858,27 @@ class ForwardPipeline:
 
     @staticmethod
     def retryable_latest_candle(inputs, cohort):
-        """Only a single not-yet-published 5m close is retryable, never gaps."""
+        """Only a single not-yet-published 5m close (or 1h close at top-of-hour) is retryable, never multi-bar gaps."""
         gaps = inputs.get("gaps") or []
         if inputs.get("errors") or not gaps or inputs.get("status") != "BLOCKED":
             return False
-        allowed = {f"{symbol}:futures:5m" for symbol in ALL_SYMBOLS}
+        allowed_5m = {f"{symbol}:futures:5m" for symbol in ALL_SYMBOLS}
+        allowed_1h = ({f"{symbol}:futures:1h" for symbol in ALL_SYMBOLS}
+                      | {f"{symbol}:mark:1h" for symbol in ALL_SYMBOLS}) if cohort.minute == 0 else set()
+        allowed = allowed_5m | allowed_1h
         for gap in gaps:
-            if not isinstance(gap, dict) or gap.get("source") not in allowed or gap.get("error") != "LATEST_CLOSED_BAR_MISSING":
+            src = gap.get("source") if isinstance(gap, dict) else None
+            if src not in allowed or gap.get("error") != "LATEST_CLOSED_BAR_MISSING":
                 return False
-            info = inputs.get("sources", {}).get(gap["source"], {})
+            info = inputs.get("sources", {}).get(src, {})
             try:
                 latest = datetime.fromisoformat(info["latest_closed"].replace("Z", "+00:00"))
-                if latest != cohort-timedelta(minutes=5) or info["rows"] < 4320:
-                    return False
+                if src in allowed_5m:
+                    if latest != cohort-timedelta(minutes=5) or info["rows"] < 4320:
+                        return False
+                else:
+                    if latest != cohort-timedelta(hours=1) or info["rows"] < 360:
+                        return False
                 if info.get("issues") != ["LATEST_CLOSED_BAR_MISSING"]:
                     return False
             except (KeyError, TypeError, ValueError):

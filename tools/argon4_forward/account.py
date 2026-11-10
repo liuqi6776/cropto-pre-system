@@ -29,7 +29,7 @@ ALL_STREAMS = {**STREAMS, "XRP_15m": ("XRP", 900)}
 MICRO = Decimal("1000000")
 QTY_STEP = Decimal("0.00000001")
 V5_SEMANTICS = "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1"
-V5_UNLOCKED = ("FILLED_BUDGET", "NO_SIGNAL", "NOT_DUE", "PRICE_LIMIT_NOT_MET", DISABLED)
+V5_UNLOCKED = ("FILLED_BUDGET", "NO_SIGNAL", "NOT_DUE", "PRICE_LIMIT_NOT_MET", "BLEED_WINDOW_SINGLE_ORDER_CAP", DISABLED)
 LEGACY_UNLOCKED = ("FILLED_CAPACITY", "NO_SIGNAL", "NOT_DUE")
 FORBIDDEN = re.compile(r"private[_ -]?key|mnemonic|secret|seed[_ -]?phrase|api[_ -]?key|password", re.I)
 
@@ -151,10 +151,22 @@ def _policy_risk_limits(policy=None):
             if not Decimal("0") <= d_val <= Decimal("0.500"):
                 raise AccountRejected("invalid policy risk limits")
             stream_min_buy_price[str(s_key)] = d_val
-    if (not Decimal("0.005") <= single_frac <= Decimal("0.050")
-            or not Decimal("0.010") <= tick_frac <= Decimal("0.100")
+    raw_stream_max = risk_block.get("stream_max_order_usd") if "stream_max_order_usd" in risk_block else src.get("stream_max_order_usd")
+    stream_max_order_usd = {}
+    if raw_stream_max is not None:
+        if not isinstance(raw_stream_max, Mapping):
+            raise AccountRejected("invalid policy risk limits")
+        for s_key, s_val in raw_stream_max.items():
+            if s_key not in ALL_STREAMS or isinstance(s_val, bool):
+                raise AccountRejected("invalid policy risk limits")
+            d_val = _d(s_val)
+            if d_val <= 0:
+                raise AccountRejected("invalid policy risk limits")
+            stream_max_order_usd[str(s_key)] = d_val
+    if (not Decimal("0.005") <= single_frac <= Decimal("0.100")
+            or not Decimal("0.010") <= tick_frac <= Decimal("0.200")
             or single_frac > tick_frac
-            or not Decimal("0.010") <= daily_loss <= Decimal("0.100")
+            or not Decimal("0.010") <= daily_loss <= Decimal("0.200")
             or not Decimal("0") <= min_buy_price <= Decimal("0.500")
             or max_tick <= 0 or max_order <= 0 or max_open <= 0 or max_underlying <= 0
             or max_active_open <= 0 or max_active_underlying <= 0
@@ -174,6 +186,8 @@ def _policy_risk_limits(policy=None):
         "daily_loss_fraction": daily_loss,
         "min_buy_price": min_buy_price,
         "stream_min_buy_price": stream_min_buy_price,
+        "stream_max_order_usd": stream_max_order_usd,
+        "stream_max_order_atoms": {k: _atoms(v) for k, v in stream_max_order_usd.items()},
         "max_tick_budget_atoms": _atoms(max_tick),
         "max_order_atoms": _atoms(max_order),
         "max_open_risk_atoms": _atoms(max_open),
@@ -554,12 +568,15 @@ class Account:
         stamp, boundary = current_time(), _ts(cohort_id)
         key = _iso(boundary)
         _safe(receipt)
-        if (stream not in ALL_STREAMS or decision_status not in ("NO_SIGNAL", "NOT_DUE", "PRICE_LIMIT_NOT_MET")
+        if (stream not in ALL_STREAMS or decision_status not in ("NO_SIGNAL", "NOT_DUE", "PRICE_LIMIT_NOT_MET", "BLEED_WINDOW_SINGLE_ORDER_CAP")
                 or not isinstance(receipt, Mapping)):
             raise AccountRejected("explicit validated skip receipt required")
         clean = None
         if decision_status == "PRICE_LIMIT_NOT_MET":
             clean = self._validate_price_skip_receipt(stream, boundary, receipt, stamp)
+        elif decision_status == "BLEED_WINDOW_SINGLE_ORDER_CAP":
+            if receipt.get("source") != "BLEED_WINDOW_SINGLE_ORDER_CAP":
+                raise AccountRejected("explicit bleed window single order cap receipt required")
         with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             stamp = current_time()
@@ -1044,7 +1061,8 @@ class Account:
                 if cohort_capacity <= 0 or budget > cohort_capacity:
                     raise AccountRejected("cohort observed capacity invalid")
             limits = _policy_risk_limits(cohort_policy if cohort_policy is not None else (json.loads(latest["policy_json"]) if latest else getattr(self, "policy", None)))
-            if budget > limits["max_order_atoms"]:
+            stream_max_atoms = (limits.get("stream_max_order_atoms") or {}).get(clean["stream"], limits["max_order_atoms"])
+            if budget > min(limits["max_order_atoms"], stream_max_atoms):
                 raise AccountRejected("order price or stake exceeds limit")
             rank_use = con.execute("SELECT 1 FROM allocation_consumption WHERE plan_id=? AND rank=?",
                                    (authorization["plan_id"], authorization["rank"])).fetchone()
@@ -1350,6 +1368,7 @@ class Account:
                 "ready_streams": [],
                 "risk_limits": {"default_order_usd": _num(default_order),
                                 "max_order_usd": _num(limits["max_order_usd"]),
+                                "stream_max_order_usd": {k: _num(v) for k, v in (limits.get("stream_max_order_usd") or {}).items()},
                                 "max_stream_cohort_usd": _num(limits["max_order_usd"]),
                                 "max_total_open_cost_usd": _num(limits["max_open_risk_usd"]),
                                 "max_underlying_open_cost_usd": _num(limits["max_underlying_open_risk_usd"]),

@@ -370,7 +370,9 @@ def plan_waterfall(policy, candidates, equity, cash, open_risk, now, day_pnl=0,
             continue
         preview.update(capacity_usd=float(capacity), capacity_source=source,
                        capacity_observed_at=observed.isoformat(), status="UNLOCKED")
-        can_cover_capacity = effective_single >= capacity
+        stream_max_order = (limits.get("stream_max_order_usd") or {}).get(name, limits["max_order_usd"])
+        effective_stream_single = min(effective_single, stream_max_order)
+        can_cover_capacity = effective_stream_single >= capacity
         if "signal" not in candidate:
             preview.update(status="SIGNAL_UNKNOWN", reason="SIGNAL_STATE_MISSING")
             locked_by = name
@@ -392,7 +394,7 @@ def plan_waterfall(policy, candidates, equity, cash, open_risk, now, day_pnl=0,
             locked_by = name
             block("SIGNAL_INVALID", "Upper-rank signal identity or timing is invalid", name, rank)
             continue
-        approved = _money(min(capacity, effective_single, remaining))
+        approved = _money(min(capacity, effective_stream_single, remaining))
         if approved <= 0:
             preview.update(status="NO_ALLOCATION", reason="BELOW_CURRENCY_PRECISION")
             locked_by = name

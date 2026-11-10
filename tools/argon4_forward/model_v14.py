@@ -68,14 +68,25 @@ def _resolve_5m_frame(data_root=None, symbol="BTCUSDT", *, as_of=None, snapshot=
     if (raw_frame is not None and isinstance(raw_frame, pd.DataFrame)
             and len(raw_frame) >= min_rows and {"open", "close"} <= set(raw_frame.columns)):
         frame = raw_frame
-    if frame is None and snapshot is not None and hasattr(snapshot, "_validated"):
+    if frame is None and snapshot is not None:
         target_names = {f"{symbol}_5m_futures.parquet", f"{symbol}_5m_futures_2023_2026.parquet"}
-        for p, entry in snapshot._validated.items():
-            if getattr(p, "name", "") in target_names and isinstance(entry, tuple) and len(entry) >= 1:
-                candidate = entry[0]
-                if isinstance(candidate, pd.DataFrame) and len(candidate) >= min_rows:
-                    frame = candidate
-                    break
+        if hasattr(snapshot, "_validated"):
+            for p, entry in snapshot._validated.items():
+                if getattr(p, "name", "") in target_names and isinstance(entry, tuple) and len(entry) >= 1:
+                    candidate = entry[0]
+                    if isinstance(candidate, pd.DataFrame) and len(candidate) >= min_rows:
+                        frame = candidate
+                        break
+        if frame is None and hasattr(snapshot, "_raw") and hasattr(snapshot, "_read_validated"):
+            for p in list(getattr(snapshot, "_raw", {}).keys()):
+                if getattr(p, "name", "") in target_names:
+                    try:
+                        candidate, _, _ = snapshot._read_validated(p)
+                        if isinstance(candidate, pd.DataFrame) and len(candidate) >= min_rows:
+                            frame = candidate
+                            break
+                    except Exception:
+                        pass
     if frame is None and data_root is not None:
         try:
             intraday_dir = Path(str(data_root)) / "intraday"
@@ -113,32 +124,40 @@ def compute_ex_ante_rv12_bps(data_root=None, symbol="BTCUSDT", *, as_of=None, sn
 
 
 def compute_ex_ante_btc_macro_returns_pct(data_root=None, symbol="BTCUSDT", *, as_of=None, snapshot=None, raw_frame=None):
-    """Compute causal 1h (12 bars) and 4h (48 bars) BTC percentage returns over closed 5m candles."""
-    out = {"btc_ret_1h_pct": None, "btc_ret_4h_pct": None}
+    """Compute causal 1h (12 bars), 2h (24 bars), 4h (48 bars) BTC returns and EMA12-EMA36 gap (bps)."""
+    out = {
+        "btc_ret_1h_pct": None,
+        "btc_ret_2h_pct": None,
+        "btc_ret_4h_pct": None,
+        "btc_ema_gap_bps": None,
+    }
     frame = _resolve_5m_frame(data_root, symbol, as_of=as_of, snapshot=snapshot, raw_frame=raw_frame, min_rows=12)
     if frame is None or len(frame) < 12 or not ({"open", "close"} <= set(frame.columns)):
         return out
-    tail12 = frame.tail(12)
-    valid12 = True
-    if isinstance(tail12.index, pd.DatetimeIndex) and len(tail12.index) == 12:
-        if not np.all(np.diff(tail12.index.asi8) == pd.Timedelta(minutes=5).value):
-            valid12 = False
-    if valid12:
-        o12 = float(tail12["open"].iloc[0])
-        c12 = float(tail12["close"].iloc[-1])
-        if np.isfinite(o12) and np.isfinite(c12) and o12 > 0:
-            out["btc_ret_1h_pct"] = float((c12 / o12 - 1.0) * 100.0)
-    if len(frame) >= 48:
-        tail48 = frame.tail(48)
-        valid48 = True
-        if isinstance(tail48.index, pd.DatetimeIndex) and len(tail48.index) == 48:
-            if not np.all(np.diff(tail48.index.asi8) == pd.Timedelta(minutes=5).value):
-                valid48 = False
-        if valid48:
-            o48 = float(tail48["open"].iloc[0])
-            c48 = float(tail48["close"].iloc[-1])
-            if np.isfinite(o48) and np.isfinite(c48) and o48 > 0:
-                out["btc_ret_4h_pct"] = float((c48 / o48 - 1.0) * 100.0)
+
+    def _window_ret_pct(n_bars):
+        if len(frame) < n_bars:
+            return None
+        tail = frame.tail(n_bars)
+        if isinstance(tail.index, pd.DatetimeIndex) and len(tail.index) == n_bars:
+            if not np.all(np.diff(tail.index.asi8) == pd.Timedelta(minutes=5).value):
+                return None
+        o_val = float(tail["open"].iloc[0])
+        c_val = float(tail["close"].iloc[-1])
+        if np.isfinite(o_val) and np.isfinite(c_val) and o_val > 0:
+            return float((c_val / o_val - 1.0) * 100.0)
+        return None
+
+    out["btc_ret_1h_pct"] = _window_ret_pct(12)
+    out["btc_ret_2h_pct"] = _window_ret_pct(24)
+    out["btc_ret_4h_pct"] = _window_ret_pct(48)
+    if len(frame) >= 36:
+        tail_ema = frame["close"].tail(144).astype(float)
+        if np.isfinite(tail_ema.to_numpy()).all() and (tail_ema > 0).all():
+            ema12 = float(tail_ema.ewm(span=12, adjust=False).mean().iloc[-1])
+            ema36 = float(tail_ema.ewm(span=36, adjust=False).mean().iloc[-1])
+            if ema36 > 0:
+                out["btc_ema_gap_bps"] = float((ema12 / ema36 - 1.0) * 10000.0)
     return out
 
 
@@ -166,7 +185,9 @@ def apply_volatility_regime_guard(
     guard_config=None,
     cohort_time=None,
     btc_ret_1h_pct=None,
+    btc_ret_2h_pct=None,
     btc_ret_4h_pct=None,
+    btc_ema_gap_bps=None,
 ):
     """Attach ex_ante_rv12_bps / macro returns and apply volatility, US-open blackout & macro trend guards."""
     res = dict(prediction)
@@ -174,8 +195,12 @@ def apply_volatility_regime_guard(
         res["ex_ante_rv12_bps"] = float(ex_ante_rv12_bps)
     if btc_ret_1h_pct is not None:
         res["ex_ante_btc_ret_1h_pct"] = float(btc_ret_1h_pct)
+    if btc_ret_2h_pct is not None:
+        res["ex_ante_btc_ret_2h_pct"] = float(btc_ret_2h_pct)
     if btc_ret_4h_pct is not None:
         res["ex_ante_btc_ret_4h_pct"] = float(btc_ret_4h_pct)
+    if btc_ema_gap_bps is not None:
+        res["ex_ante_btc_ema_gap_bps"] = float(btc_ema_gap_bps)
     if not (isinstance(guard_config, dict) and guard_config.get("enabled") is True):
         return res
 
@@ -250,6 +275,18 @@ def apply_volatility_regime_guard(
                     res["selected"] = False
                 return res
 
+        bleed_cfg = macro_guard.get("single_order_per_window_on_2h_bleed")
+        if isinstance(bleed_cfg, dict) and bleed_cfg.get("enabled") is True:
+            min_2h = float(bleed_cfg.get("min_btc_2h_abs_return_pct", 0.50))
+            min_gap = float(bleed_cfg.get("min_btc_ema12_36_gap_bps", 15.0))
+            if btc_ret_2h_pct is not None and btc_ema_gap_bps is not None:
+                r2h = float(btc_ret_2h_pct)
+                egap = float(btc_ema_gap_bps)
+                is_down_bleed = (r2h <= -min_2h and egap <= -min_gap and side == "UP")
+                is_up_squeeze = (r2h >= min_2h and egap >= min_gap and side == "DOWN")
+                if is_down_bleed or is_up_squeeze:
+                    res["bleed_single_order_window_cap"] = True
+
     return res
 
 
@@ -266,7 +303,9 @@ def predict_stream_v14(
     volatility_regime_guard=None,
     cohort_time=None,
     btc_ret_1h_pct=None,
+    btc_ret_2h_pct=None,
     btc_ret_4h_pct=None,
+    btc_ema_gap_bps=None,
 ):
     if stream in model.STREAMS or model.predict_stream is not _ORIGINAL_PREDICT_STREAM:
         if phase == "deployment_q4":
@@ -286,7 +325,7 @@ def predict_stream_v14(
         th = float(threshold_override)
         zv = float(res["z_v4"])
         res = {**res, "threshold_frozen": th, "selected": abs(zv) >= th}
-    if any(x is not None for x in (ex_ante_rv12_bps, volatility_regime_guard, cohort_time, btc_ret_1h_pct, btc_ret_4h_pct)):
+    if any(x is not None for x in (ex_ante_rv12_bps, volatility_regime_guard, cohort_time, btc_ret_1h_pct, btc_ret_2h_pct, btc_ret_4h_pct, btc_ema_gap_bps)):
         res = apply_volatility_regime_guard(
             stream,
             res,
@@ -294,6 +333,8 @@ def predict_stream_v14(
             guard_config=volatility_regime_guard,
             cohort_time=cohort_time,
             btc_ret_1h_pct=btc_ret_1h_pct,
+            btc_ret_2h_pct=btc_ret_2h_pct,
             btc_ret_4h_pct=btc_ret_4h_pct,
+            btc_ema_gap_bps=btc_ema_gap_bps,
         )
     return res

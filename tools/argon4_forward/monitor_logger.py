@@ -353,6 +353,8 @@ class MonitorAuditLogger:
                                f"limit_price={st_out.get('limit_price')}, 等待窗口内第 {st_out.get('attempt')} 次重检 @ {st_out.get('next_retry_at')})")
                 elif st_status == "UNREACHED":
                     why = f"UNREACHED ({st_out.get('reason', 'COHORT_BUDGET_EXHAUSTED')}: 高优先级流已用尽本窗口预算)"
+                elif st_status == "BLEED_WINDOW_SINGLE_ORDER_CAP":
+                    why = "BLEED_WINDOW_SINGLE_ORDER_CAP (2小时阴跌/逼空期同窗口限1单护栏触发: 已成交第1顺位主力单，跳过第2单防同窗双杀)"
                 elif st_status == "ERROR":
                     why = f"EXECUTION_REJECTED ({st_out.get('reason', 'UNKNOWN_ERROR')})"
                 elif st_status is None:

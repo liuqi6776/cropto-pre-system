@@ -367,17 +367,25 @@ def _fast_context(context, validation_at):
             or set(context) != {"profile", "cohort", "deadline", "minimum_spacing_seconds", "clock_evidence_sha256"}
             or context["profile"] != FAST_PROFILE
             or isinstance(context["minimum_spacing_seconds"], bool)
-            or context["minimum_spacing_seconds"] != 2.0):
+            or float(context["minimum_spacing_seconds"]) not in (1.2, 2.0)):
         raise ValueError("INVALID_FAST_REVISION_CONTEXT")
+    spacing_sec = float(context["minimum_spacing_seconds"])
     clock_hash = context["clock_evidence_sha256"]
     if not isinstance(clock_hash, str) or re.fullmatch(r"[0-9a-f]{64}", clock_hash) is None:
         raise ValueError("INVALID_FAST_REVISION_CLOCK_IDENTITY")
     cohort, deadline = _time(context["cohort"]), _time(context["deadline"])
-    if (cohort != cohort.floor("5min") or deadline != cohort+pd.Timedelta(seconds=14)
+    allowed_deadlines = {
+        cohort + pd.Timedelta(seconds=14),
+        cohort + pd.Timedelta(seconds=16.5),
+        cohort + pd.Timedelta(seconds=18),
+        cohort + pd.Timedelta(seconds=18.2),
+        cohort + pd.Timedelta(seconds=18.5),
+    }
+    if (cohort != cohort.floor("5min") or deadline not in allowed_deadlines
             or not cohort <= validation_at <= deadline):
         raise ValueError("FAST_REVISION_OUTSIDE_INPUT_BUDGET")
     return {"profile": FAST_PROFILE, "cohort": cohort.isoformat(), "deadline": deadline.isoformat(),
-            "minimum_spacing_seconds": 2.0, "clock_evidence_sha256": clock_hash}
+            "minimum_spacing_seconds": spacing_sec, "clock_evidence_sha256": clock_hash}
 
 
 def _guard_evidence(guard, phase, context):
@@ -457,6 +465,7 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
                                     "fast_confirmation_eligible": False})
                     continue
             confirm = None
+            min_spacing_sec = float(fast_context.get("minimum_spacing_seconds", 2.0)) if fast else 60.0
             for earlier in receipts[1:]:
                 if earlier["numbers"] != latest["numbers"]:
                     break
@@ -464,7 +473,7 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
                         and _time(latest["requested_at"]) >= _time(earlier["received_at"])
                         and ((_time(latest["received_at"]) - _time(earlier["received_at"])).total_seconds() >= 60
                              if not fast else
-                             (_time(latest["requested_at"]) - _time(earlier["received_at"])).total_seconds() >= 2
+                             (_time(latest["requested_at"]) - _time(earlier["received_at"])).total_seconds() >= min_spacing_sec
                              and _time(earlier["requested_at"]) >= cohort
                              and earlier["time_basis"] == "CALIBRATED_UTC_UPPER_BOUND"
                              and earlier["clock_evidence_sha256"] == latest["clock_evidence_sha256"])):
@@ -475,7 +484,7 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
                                 "reason": ("TWO_CURRENT_MATCHING_CALIBRATED_RECEIPTS_REQUEST_2S_AFTER_RECEIPT_REQUIRED"
                                            if fast else "TWO_INDEPENDENT_MATCHING_RECEIPTS_60S_APART_REQUIRED"),
                                 **({"fast_confirmation_eligible": True,
-                                    "next_confirmation_request_at": (_time(latest["received_at"])+pd.Timedelta(seconds=2)).isoformat()}
+                                    "next_confirmation_request_at": (_time(latest["received_at"])+pd.Timedelta(seconds=min_spacing_sec)).isoformat()}
                                    if fast else {})})
                 continue
             before = {field: float(old.at[index, field]) for field in PRICE_FIELDS.values()}

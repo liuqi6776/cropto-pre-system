@@ -27,13 +27,22 @@
   "max_underlying_active_risk_usd": 80,
   "max_underlying_open_risk_usd": 120,
   "max_buy_price": 0.515,
-  "min_buy_price": 0.37,
+  "min_buy_price": 0.415,
   "stream_min_buy_price": {
     "BTC_5m": 0.425,
     "ETH_5m": 0.425,
     "SOL_5m": 0.425,
-    "BTC_15m": 0.37,
-    "SOL_15m": 0.37
+    "BTC_15m": 0.415,
+    "ETH_15m": 0.415,
+    "SOL_15m": 0.415
+  },
+  "stream_max_order_usd": {
+    "BTC_15m": 100,
+    "BTC_5m": 100,
+    "ETH_15m": 90,
+    "ETH_5m": 90,
+    "SOL_15m": 45,
+    "SOL_5m": 45
   },
   "daily_loss_fraction": 0.08,
   "cap_budget_by_daily_loss_room": true,
@@ -153,7 +162,7 @@
     "SOL_5m": "d024c28dbb773a6470b132cbc1ebd152ebdb706d0db8ee3047487493b3f4f822",
     "BNB_15m": "366484e02b2552e3acd095310b381d216b6f2016a39bd2fe001b1aad3660118f"
   },
-  "min_decision_delay_seconds": 5.2,
+  "min_decision_delay_seconds": 3.8,
   "input_revision_policy": {
     "scope": "OBSERVED_FUTURES_5M_1H_AND_MARK_1H_VIEWS_ONLY",
     "confirming_receipts": 2,
@@ -249,15 +258,17 @@
   },
   "input_http_min_spacing_seconds": 0.25,
   "engineering": {
+    "enabled": true,
     "profile": "argon4-latency-v12",
-    "input_deadline_after_boundary_seconds": 14.0,
-    "feature_snapshot_cache": true,
+    "window_poll_interval_seconds": 0.25,
+    "minimum_decision_delay_seconds": 3.8,
+    "input_deadline_after_boundary_seconds": 16.5,
+    "input_ready_retry_interval_seconds": 0.35,
     "auxiliary_prefetch": true,
-    "prefetch_lead_seconds": 10.0,
-    "prefetch_budget_seconds": 3.0,
+    "prefetch_lead_seconds": 25.0,
+    "prefetch_budget_seconds": 8.0,
+    "feature_snapshot_cache": true,
     "book_telemetry": true,
-    "window_poll_interval_seconds": 0.2,
-    "input_ready_retry_interval_seconds": 0.5,
     "telemetry_sampling_profile": "clock_center_v12"
   },
   "execution": {
@@ -315,7 +326,12 @@
         "ETH_5m",
         "ETH_15m"
       ],
-      "skip_1h_momentum_chase_above_pct": 0.3
+      "skip_1h_momentum_chase_above_pct": 0.3,
+      "single_order_per_window_on_2h_bleed": {
+        "enabled": true,
+        "min_btc_2h_abs_return_pct": 0.5,
+        "min_btc_ema12_36_gap_bps": 15.0
+      }
     },
     "action": "SKIP_OR_HALF_STAKE"
   },

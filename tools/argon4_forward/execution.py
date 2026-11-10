@@ -295,8 +295,9 @@ class PaperExecutor:
                                   if not p.get("window_end") or _ts(p["window_end"]) > stamp)
                 active_coin_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
                                        if p["underlying"]==signal["underlying"] and (not p.get("window_end") or _ts(p["window_end"]) > stamp))
+                stream_max_order = (limits.get("stream_max_order_usd") or {}).get(stream, limits["max_order_usd"])
                 amount = min(capacity,_d(cohort["single_usd"]),_d(cohort["remaining_usd"]),_d(summary["cash"]),
-                             limits["max_order_usd"],limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
+                             limits["max_order_usd"],stream_max_order,limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
                              limits["max_underlying_open_risk_usd"]-_d(coin_cost),
                              limits["max_active_window_risk_usd"]-active_cost,
                              limits["max_underlying_active_risk_usd"]-active_coin_cost)
@@ -357,8 +358,9 @@ class PaperExecutor:
                           if not p.get("window_end") or _ts(p["window_end"]) > stamp)
         active_coin_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
                                if p["underlying"] == asset and (not p.get("window_end") or _ts(p["window_end"]) > stamp))
+        stream_max_order = (limits.get("stream_max_order_usd") or {}).get(stream, limits["max_order_usd"])
         budget = min(_d(cohort["single_usd"]), _d(cohort["remaining_usd"]), _d(summary["cash"]),
-                     limits["max_order_usd"], limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
+                     limits["max_order_usd"], stream_max_order, limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
                      limits["max_underlying_open_risk_usd"]-coin_cost,
                      limits["max_active_window_risk_usd"]-active_cost,
                      limits["max_underlying_active_risk_usd"]-active_coin_cost)
@@ -411,7 +413,7 @@ class PaperExecutor:
                     state = previous["state"]
                     stream_results[stream] = {"status":state if state in V5_UNLOCKED else "PARTIAL",
                         "persisted":True,"approved_usd":previous["approved_usd"],"spent_usd":previous["spent_usd"]}
-                    if state not in ("NO_SIGNAL","NOT_DUE"):
+                    if state not in ("NO_SIGNAL","NOT_DUE","BLEED_WINDOW_SINGLE_ORDER_CAP"):
                         stream_results[stream]["raw_capacity_usd"] = previous["capacity_usd"]
                     if state in V5_UNLOCKED:
                         continue
@@ -452,6 +454,20 @@ class PaperExecutor:
                     stream_results[stream] = {"status":"UNREACHED","reason":"COHORT_BUDGET_EXHAUSTED"}
                     break
                 signal = dict(decision["signal"])
+                bleed_cap_active = bool(
+                    signal.get("bleed_single_order_window_cap")
+                    or (isinstance(decision.get("prediction"), dict)
+                        and decision["prediction"].get("bleed_single_order_window_cap") is True)
+                    or signal.get("max_orders_in_window") == 1
+                )
+                has_cohort_fill = any(s["state"] == "FILLED_BUDGET" for s in cohort["streams"]) or bool(result["fills"])
+                if bleed_cap_active and has_cohort_fill:
+                    receipt = {"source": "BLEED_WINDOW_SINGLE_ORDER_CAP", "cohort_id": cohort["cohort_id"], "stream": stream}
+                    self.account.record_cohort_skip(cohort["cohort_id"], stream, "BLEED_WINDOW_SINGLE_ORDER_CAP", receipt,
+                                                    now=now if multi_look is not None else stamp)
+                    stream_results[stream] = {"status": "BLEED_WINDOW_SINGLE_ORDER_CAP", "reason": "BLEED_WINDOW_SINGLE_ORDER_CAP",
+                                              "approved_usd": 0., "spent_usd": 0., "book_checked": False, "persisted": True}
+                    continue
                 if market_refresh is not None:
                     self._precheck_market_refresh(signal,stream,boundary,stamp,summary,cohort,policy=self.policy)
                 try:
@@ -553,8 +569,9 @@ class PaperExecutor:
                                   if not p.get("window_end") or _ts(p["window_end"]) > stamp)
                 active_coin_cost = sum(_d(p["cost_usd"])+_d(p["fee_usd"]) for p in summary["positions"]
                                        if p["underlying"]==signal["underlying"] and (not p.get("window_end") or _ts(p["window_end"]) > stamp))
+                stream_max_order = (limits.get("stream_max_order_usd") or {}).get(stream, limits["max_order_usd"])
                 amount = min(capacity,_d(cohort["single_usd"]),_d(cohort["remaining_usd"]),_d(summary["cash"]),
-                             limits["max_order_usd"],limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
+                             limits["max_order_usd"],stream_max_order,limits["max_open_risk_usd"]-_d(summary["locked_cost"]),
                              limits["max_underlying_open_risk_usd"]-coin_cost,
                              limits["max_active_window_risk_usd"]-active_cost,
                              limits["max_underlying_active_risk_usd"]-active_coin_cost)
