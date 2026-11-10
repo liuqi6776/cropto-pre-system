@@ -243,16 +243,16 @@ def test_correction2_dynamic_policy_risk_limits_for_1k_trial_and_10k_default(tmp
     policy_path = Path("config/argon4_forward_policy.json")
     default_policy = json.loads(policy_path.read_text(encoding="utf-8"))
     default_limits = account._policy_risk_limits(default_policy)
-    assert default_policy["initial_capital_usd"] == 1000
-    assert default_limits["single_stream_equity_fraction"] == Decimal("0.04")
-    assert default_limits["tick_equity_fraction"] == Decimal("0.08")
-    assert default_limits["max_order_usd"] == Decimal("40")
-    assert default_limits["max_tick_budget_usd"] == Decimal("80")
-    assert default_limits["max_active_window_risk_usd"] == Decimal("120")
-    assert default_limits["max_open_risk_usd"] == Decimal("200")
-    assert default_limits["max_underlying_active_risk_usd"] == Decimal("80")
-    assert default_limits["max_underlying_open_risk_usd"] == Decimal("120")
-    assert default_limits["daily_loss_fraction"] == Decimal("0.08")
+    assert default_policy["initial_capital_usd"] == 1269
+    assert default_limits["single_stream_equity_fraction"] == Decimal("0.08")
+    assert default_limits["tick_equity_fraction"] == Decimal("0.15")
+    assert default_limits["max_order_usd"] == Decimal("240")
+    assert default_limits["max_tick_budget_usd"] == Decimal("380")
+    assert default_limits["max_active_window_risk_usd"] == Decimal("450")
+    assert default_limits["max_open_risk_usd"] == Decimal("650")
+    assert default_limits["max_underlying_active_risk_usd"] == Decimal("300")
+    assert default_limits["max_underlying_open_risk_usd"] == Decimal("450")
+    assert default_limits["daily_loss_fraction"] == Decimal("0.1")
 
     trial_policy = json.loads(policy_path.read_text(encoding="utf-8"))
     trial_policy["risk"] = {
@@ -356,18 +356,19 @@ def test_correction5_and_6_production_policy_preserves_verified_v13r2_parameters
     assert policy["order"] == [
         "BTC_15m",
         "ETH_5m",
+        "ETH_15m",
+        "BTC_5m",
         "SOL_15m",
         "SOL_5m",
-        "BTC_5m",
-        "ETH_15m",
         "BNB_15m",
     ]
     assert policy["execution_stage"]["enabled_streams"] == [
         "BTC_15m",
         "ETH_5m",
+        "ETH_15m",
+        "BTC_5m",
         "SOL_15m",
         "SOL_5m",
-        "BTC_5m",
     ]
     from tools.argon4_forward import runtime_profile
     assert runtime_profile.revision_fastpath_profile(policy)["profile"] == "argon4-aged-revision-v13"
@@ -1581,11 +1582,11 @@ def test_v14r12_audit_remediations_bleed_cap_stream_max_order_1h_retry_and_fast_
     assert policy["stream_min_buy_price"]["BTC_15m"] == pytest.approx(0.415)
     assert policy["stream_min_buy_price"]["SOL_15m"] == pytest.approx(0.415)
     assert policy["stream_max_order_usd"] == {
-        "BTC_15m": 100,
-        "BTC_5m": 100,
-        "ETH_15m": 90,
-        "ETH_5m": 90,
-        "SOL_15m": 45,
+        "BTC_15m": 240,
+        "BTC_5m": 220,
+        "ETH_15m": 180,
+        "ETH_5m": 180,
+        "SOL_15m": 50,
         "SOL_5m": 45,
     }
     eng = engineering_profile(policy)
@@ -1712,4 +1713,103 @@ def test_v14r12_audit_remediations_bleed_cap_stream_max_order_1h_retry_and_fast_
     assert len(res_exec["fills"]) == 1
     assert res_exec["stream_results"]["BTC_15m"]["status"] == "FILLED_BUDGET"
     assert res_exec["stream_results"]["ETH_5m"]["status"] == "BLEED_WINDOW_SINGLE_ORDER_CAP"
+
+
+def test_v14r13_tiered_delta_compaction_and_same_cohort_post_completion_clock_refresh(tmp_path):
+    """v14r13:
+    1. _write_observations_delta preserves >=16MB anchor delta segments in prior_chain without re-copying them,
+       compacting only trailing small delta segments once len(trailing_chain) >= 8.
+    2. _same_cohort_view_admitted rejects clock changes while execution/recheck is pending, but preserves
+       same-cohort admission after cohort execution has completed so routine clock refreshes later in the
+       5m window do not overwrite PAPER_CYCLE_COMPLETE with REVISION_WAITING_FUTURE_WINDOW.
+    """
+    from contextlib import closing
+    from datetime import datetime, timezone
+    from tools.argon4_forward.pipeline import ForwardPipeline
+
+    # 1. Verify tiered delta compaction preserves >=16MB anchor delta segment
+    base_snap = tmp_path / "base_obs.sqlite3"
+    live_src = tmp_path / "live_obs.sqlite3"
+    anchor_delta = tmp_path / "anchor_delta.sqlite3"
+    with closing(sqlite3.connect(base_snap)) as conn, conn:
+        conn.execute("CREATE TABLE snapshots(id INTEGER PRIMARY KEY, kind TEXT, saved_at TEXT, payload TEXT)")
+        conn.execute("INSERT INTO snapshots VALUES(1, 'init', '2026-11-10T00:00:00Z', 'row1')")
+    with closing(sqlite3.connect(live_src)) as conn, conn:
+        conn.execute("CREATE TABLE snapshots(id INTEGER PRIMARY KEY, kind TEXT, saved_at TEXT, payload TEXT)")
+        for i in range(1, 12):
+            conn.execute("INSERT INTO snapshots VALUES(?, 'k', '2026-11-10T00:00:00Z', ?)", (i, f"row_{i}"))
+
+    # Create a >=16MB anchor delta file covering up to id=2
+    anchor_delta.write_bytes(b"\x00" * (16 * 1024 * 1024 + 1024))
+    chain_with_7_small = [
+        {"delta_snapshot_path": str(anchor_delta), "delta_sha256": "a" * 64, "delta_max_id": {"snapshots": 2}},
+        *[
+            {
+                "delta_snapshot_path": str(tmp_path / f"small_{idx}.sqlite3"),
+                "delta_sha256": f"{idx}" * 64,
+                "delta_max_id": {"snapshots": 2 + idx},
+            }
+            for idx in range(1, 8)
+        ],
+    ]
+    # Total chain length is 8 (1 anchor + 7 small), so trailing_chain has 7 (<8): must NOT compact yet
+    delta_out_1 = tmp_path / "new_delta_1.sqlite3"
+    info_1 = revisions._write_observations_delta(
+        live_src, base_snap, delta_out_1, prior_covered_max={"snapshots": 9}, prior_chain=chain_with_7_small
+    )
+    assert len(info_1["delta_chain"]) == 9
+    with closing(sqlite3.connect(delta_out_1)) as conn:
+        assert [r[0] for r in conn.execute("SELECT id FROM snapshots ORDER BY id")] == [10, 11]
+
+    # Now trailing_chain has 8 small segments after the >=16MB anchor: compacts ONLY ids > 2 (never id=2 from anchor)
+    chain_with_8_small = info_1["delta_chain"]
+    with closing(sqlite3.connect(live_src)) as conn, conn:
+        conn.execute("INSERT INTO snapshots VALUES(12, 'k', '2026-11-10T00:05:00Z', 'row_12')")
+    delta_out_2 = tmp_path / "new_delta_2.sqlite3"
+    info_2 = revisions._write_observations_delta(
+        live_src, base_snap, delta_out_2, prior_covered_max={"snapshots": 11}, prior_chain=chain_with_8_small
+    )
+    assert len(info_2["delta_chain"]) == 2
+    assert info_2["delta_chain"][0]["delta_snapshot_path"] == str(anchor_delta)
+    with closing(sqlite3.connect(delta_out_2)) as conn:
+        assert [r[0] for r in conn.execute("SELECT id FROM snapshots ORDER BY id")] == list(range(3, 13))
+
+    # 2. Verify _same_cohort_view_admitted before vs after cohort completion when clock refreshes
+    from tools.argon4_forward.clock_sync import calibrated_now
+    from tools.argon4_forward.pipeline import cohort_at
+
+    clock_1 = {
+        "status": "CALIBRATED",
+        "server_minus_local_seconds": 0.0,
+        "uncertainty_seconds": 0.05,
+        "calibrated_at_local": datetime.now(timezone.utc).isoformat(),
+        "calibrated_monotonic": time.monotonic(),
+        "receipt_sha256": "1" * 64,
+    }
+    cohort_dt = cohort_at(calibrated_now(clock_1, upper=False))
+    clock_2 = {**clock_1, "receipt_sha256": "2" * 64}
+    view = {"revision_id": "rev_1040", "manifest_sha256": "m" * 64}
+
+    dummy = ForwardPipeline.__new__(ForwardPipeline)
+    dummy.last_cohort = cohort_dt
+    dummy.clock = clock_1
+    dummy._pending_execution = {"cohort": cohort_dt}
+    dummy._same_cohort_revision = {
+        "cohort": cohort_dt,
+        "revision_id": "rev_1040",
+        "manifest_sha256": "m" * 64,
+        "clock": clock_1,
+    }
+    assert dummy._same_cohort_view_admitted(view) is True
+
+    # While _pending_execution is active (not completed), changing clock must reject admission
+    dummy.clock = clock_2
+    assert dummy._same_cohort_view_admitted(view) is False
+
+    # Once cohort execution is completed (_pending_execution is None and completed=True),
+    # a routine clock refresh later in the same 5m cohort preserves admission!
+    dummy._pending_execution = None
+    dummy._same_cohort_revision["completed"] = True
+    assert dummy._same_cohort_view_admitted(view) is True
+
 
