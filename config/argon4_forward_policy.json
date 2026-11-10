@@ -44,9 +44,9 @@
     "SOL_15m": 50,
     "SOL_5m": 45
   },
-  "daily_loss_fraction": 0.1,
+  "daily_loss_fraction": 0.15,
   "cap_budget_by_daily_loss_room": true,
-  "risk_limit_note": "Unified $1,269 portfolio: 8% single stream / 15% window budget, $240 max order ($240/$220/$180/$180/$50/$45 per stream), $380 window budget, $450 active / $650 total open risk, $300/$450 underlying active/open risk, 10% daily stop loss",
+  "risk_limit_note": "Unified $1,269 portfolio: 8% single stream / 15% window budget, $240 max order ($240/$220/$180/$180/$50/$45 per stream), $380 window budget, $450 active / $650 total open risk, $300/$450 underlying active/open risk, 15% daily stop loss",
   "paper_trading_active": true,
   "live_enabled": false,
   "ranking_confirmed_at": "2026-11-07T07:11:56.924576+00:00",
@@ -315,7 +315,8 @@
       "skip_streams": [
         "ETH_5m",
         "BTC_5m",
-        "BTC_15m"
+        "BTC_15m",
+        "ETH_15m"
       ]
     },
     "macro_trend_guard": {

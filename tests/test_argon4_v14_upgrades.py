@@ -252,7 +252,7 @@ def test_correction2_dynamic_policy_risk_limits_for_1k_trial_and_10k_default(tmp
     assert default_limits["max_open_risk_usd"] == Decimal("650")
     assert default_limits["max_underlying_active_risk_usd"] == Decimal("300")
     assert default_limits["max_underlying_open_risk_usd"] == Decimal("450")
-    assert default_limits["daily_loss_fraction"] == Decimal("0.1")
+    assert default_limits["daily_loss_fraction"] == Decimal("0.15")
 
     trial_policy = json.loads(policy_path.read_text(encoding="utf-8"))
     trial_policy["risk"] = {
@@ -1448,7 +1448,7 @@ def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_p
     assert vg["us_open_blackout"]["utc_start_minute"] == 870
     assert vg["us_open_blackout"]["utc_end_minute"] == 960
     assert vg["us_open_blackout"]["weekdays_only"] is True
-    assert set(vg["us_open_blackout"]["skip_streams"]) == {"ETH_5m", "BTC_5m", "BTC_15m"}
+    assert set(vg["us_open_blackout"]["skip_streams"]) == {"ETH_5m", "BTC_5m", "BTC_15m", "ETH_15m"}
     assert vg["macro_trend_guard"]["enabled"] is True
     assert vg["macro_trend_guard"]["max_btc_4h_abs_return_pct"] == pytest.approx(2.0)
     assert vg["macro_trend_guard"]["skip_1h_momentum_chase_above_pct"] == pytest.approx(0.3)
@@ -1467,6 +1467,18 @@ def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_p
     )
     assert res_eth_open["selected"] is False
     assert res_eth_open["volatility_regime_reason"] == "US_OPEN_BLACKOUT"
+
+    res_eth15_open = model_v14.apply_volatility_regime_guard(
+        "ETH_15m",
+        base_pred,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-10T14:45:00+00:00",
+        btc_ret_1h_pct=0.45,
+        btc_ret_4h_pct=0.80,
+    )
+    assert res_eth15_open["selected"] is False
+    assert res_eth15_open["volatility_regime_reason"] == "US_OPEN_BLACKOUT"
 
     res_sol_open = model_v14.apply_volatility_regime_guard(
         "SOL_5m",
