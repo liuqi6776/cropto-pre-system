@@ -225,10 +225,17 @@ class ForwardPipeline:
         return policy
 
     def update_clock(self):
-        age = time.monotonic()-self.clock.get("calibrated_monotonic", 0) if self.clock else None
-        refresh = age is None or age > 40
-        reason = "PERIODIC_OR_INITIAL"
-        if not refresh and self.clock.get("status") == "CALIBRATED" and age > 20:
+        is_calibrated = bool(self.clock and self.clock.get("status") == "CALIBRATED")
+        has_mono = bool(self.clock and isinstance(self.clock.get("calibrated_monotonic"), (int, float)))
+        last_attempt_mono = (
+            self.clock["calibrated_monotonic"]
+            if has_mono
+            else getattr(self, "_last_clock_attempt_mono", None)
+        )
+        age = time.monotonic()-last_attempt_mono if last_attempt_mono is not None else None
+        refresh = age is None or age > 40 or (not is_calibrated and age >= 1.0)
+        reason = "PERIODIC_OR_INITIAL" if (is_calibrated or age is None or age > 40) else "UNCALIBRATED_RETRY"
+        if not refresh and is_calibrated and age > 20:
             lower = calibrated_now(self.clock, upper=False)
             until_boundary = (cohort_at(lower)+timedelta(minutes=5)-lower).total_seconds()
             if 0 < until_boundary <= 10:
@@ -240,7 +247,7 @@ class ForwardPipeline:
             kwargs = {}
             if self._revision_fastpath.get("enabled"):
                 extra_allowed, budget = False, 6.
-                if self.clock and self.clock.get("status") == "CALIBRATED" and age <= 60:
+                if is_calibrated and age is not None and age <= 60:
                     lower, upper = calibrated_now(self.clock, upper=False), calibrated_now(self.clock)
                     elapsed = (lower-cohort_at(lower)).total_seconds()
                     until = (cohort_at(lower)+timedelta(minutes=5)-upper).total_seconds()
@@ -255,9 +262,25 @@ class ForwardPipeline:
                         extra_allowed = True
                     elif 0 < until <= 6:
                         budget = max(.1, until-.25)
+                elif not is_calibrated:
+                    wall_elapsed = datetime.now(timezone.utc).timestamp() % 300.0
+                    wall_until = 300.0 - wall_elapsed
+                    if 22.0 < wall_elapsed < 293.0 and not self._critical_window():
+                        extra_allowed = True
+                    elif 0.0 <= wall_elapsed <= 12.0:
+                        extra_allowed = True
+                        budget = 4.5
+                    elif 0.0 < wall_until <= 6.0:
+                        budget = max(0.5, wall_until - 0.25)
                 kwargs = {"retry_borderline": extra_allowed,
                           "budget_monotonic": time.monotonic()+budget}
+            self._last_clock_attempt_mono = time.monotonic()
             self.clock = calibrate(transport=self.public_transport, **kwargs)
+            self._last_clock_attempt_mono = (
+                self.clock["calibrated_monotonic"]
+                if isinstance(self.clock.get("calibrated_monotonic"), (int, float))
+                else time.monotonic()
+            )
             self.clock["refresh_reason"] = reason
             self.observations.save("execution_clock", self.clock)
         if self.clock.get("status") != "CALIBRATED":
@@ -1023,6 +1046,7 @@ class ForwardPipeline:
                     and self._same_cohort_revision.get("cohort") == cohort):
                 self._same_cohort_revision["completed"] = True
             timing = self.finish_timing(outcome.get("status", "COMPLETE"))
+        self._last_logged_block_key = None
         self.monitor_log.log_cohort_execution(cohort.isoformat(), policy, decisions, outcome, timing)
         self.publish(status="PAPER_WAITING_PRICE_RECHECK" if waiting else "PAPER_CYCLE_COMPLETE",
             active=True, reason="当前优先流价格未达限价，等待本窗口内重检；下层暂不占预算" if waiting else None,
@@ -1416,9 +1440,15 @@ class ForwardPipeline:
                 try:
                     self.cycle()
                 except Exception as exc:
+                    err_cohort = (
+                        (self._pending_timing or {}).get("cohort")
+                        if isinstance(getattr(self, "_pending_timing", None), dict)
+                        else None
+                    ) or cohort_at(datetime.now(timezone.utc)).isoformat()
                     self.abandon_prepared("CHECK_FAILED_DURING_RECHECK")
-                    self.monitor_log.log_cohort_blocked(
-                        self.last_cohort.isoformat() if self.last_cohort else None,
+                    self._log_block_once(
+                        ("PIPELINE_CYCLE_EXCEPTION", err_cohort, type(exc).__name__, str(exc)[:120]),
+                        err_cohort,
                         "PIPELINE_CYCLE_EXCEPTION",
                         f"本地模拟检查未通过：{type(exc).__name__}: {exc}",
                         error_type=type(exc).__name__,

@@ -332,25 +332,46 @@ class MonitorAuditLogger:
             elif dec_status == "SIGNAL":
                 best_ask_val = st_out.get("best_ask")
                 min_buy_val = st_out.get("min_buy_price")
+                limit_val = st_out.get("limit_price")
+                min_depth_val = st_out.get("min_executable_depth_usd")
+                obs_depth_val = st_out.get("observed_executable_depth_usd")
                 is_below_min_buy = (
                     isinstance(best_ask_val, (int, float))
                     and isinstance(min_buy_val, (int, float))
                     and float(best_ask_val) < float(min_buy_val)
                 )
+                is_thin_book = (
+                    isinstance(min_depth_val, (int, float))
+                    and isinstance(obs_depth_val, (int, float))
+                    and float(obs_depth_val) < float(min_depth_val)
+                )
+                is_tiered_cap = (
+                    isinstance(limit_val, (int, float))
+                    and float(limit_val) < 0.5149
+                )
                 if st_status == "PRICE_LIMIT_NOT_MET":
                     if is_below_min_buy:
                         why = (f"ADVERSE_SELECTION_GUARD (信号触发 方向={side}, 但盘口最优卖价 best_ask={best_ask_val} "
                                f"< 逆向选择保护下限 min_buy_price={min_buy_val})")
+                    elif is_thin_book:
+                        why = (f"THIN_BOOK_DEPTH_GUARD (信号触发 方向={side}, best_ask={best_ask_val}, "
+                               f"但限价内可执行深度 ${float(obs_depth_val):.2f} < 最低深度门槛 ${float(min_depth_val):.2f})")
+                    elif is_tiered_cap:
+                        why = (f"CONFIDENCE_TIERED_PRICE_CAP (信号触发 方向={side}, 微弱信号分层限价 limit_price={limit_val}, "
+                               f"盘口最优卖价 best_ask={best_ask_val} > {limit_val})")
                     else:
                         why = (f"PRICE_LIMIT_NOT_MET (信号触发 方向={side}, 但盘口最优卖价 best_ask={best_ask_val} "
-                               f"> 限价上限 limit_price={st_out.get('limit_price')})")
+                               f"> 限价上限 limit_price={limit_val})")
                 elif st_status == "WAITING_PRICE_RECHECK":
                     if is_below_min_buy:
                         why = (f"WAITING_PRICE_RECHECK (信号触发 方向={side}, best_ask={best_ask_val} < "
                                f"min_buy_price={min_buy_val}, 等待窗口内第 {st_out.get('attempt')} 次重检 @ {st_out.get('next_retry_at')})")
+                    elif is_thin_book:
+                        why = (f"WAITING_PRICE_RECHECK_THIN_BOOK (信号触发 方向={side}, best_ask={best_ask_val}, "
+                               f"可执行深度 ${float(obs_depth_val):.2f} < ${float(min_depth_val):.2f}, 等待第 {st_out.get('attempt')} 次重检 @ {st_out.get('next_retry_at')})")
                     else:
                         why = (f"WAITING_PRICE_RECHECK (信号触发 方向={side}, best_ask={best_ask_val} > "
-                               f"limit_price={st_out.get('limit_price')}, 等待窗口内第 {st_out.get('attempt')} 次重检 @ {st_out.get('next_retry_at')})")
+                               f"limit_price={limit_val}, 等待窗口内第 {st_out.get('attempt')} 次重检 @ {st_out.get('next_retry_at')})")
                 elif st_status == "UNREACHED":
                     why = f"UNREACHED ({st_out.get('reason', 'COHORT_BUDGET_EXHAUSTED')}: 高优先级流已用尽本窗口预算)"
                 elif st_status == "BLEED_WINDOW_SINGLE_ORDER_CAP":

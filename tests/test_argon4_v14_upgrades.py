@@ -1999,4 +1999,91 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
     assert res_look1["fills"][0]["cost_usd"] > 15.0
 
 
+def test_update_clock_recovers_fast_after_uncertainty_too_large_and_monitor_logs_v14r14_guards(tmp_path, monkeypatch):
+    """Verify:
+    1. ForwardPipeline.update_clock() does NOT stay locked out for 40 seconds after
+       calibrate() returns UNCERTAINTY_TOO_LARGE — it respects a 1.0s anti-spam cooldown
+       and immediately re-calibrates on the next >=1.0s worker tick.
+    2. MonitorAuditLogger.log_cohort_execution emits THIN_BOOK_DEPTH_GUARD and
+       CONFIDENCE_TIERED_PRICE_CAP with exact numbers.
+    """
+    from types import SimpleNamespace
+    from tools.argon4_forward import pipeline as pl_mod
+    from tools.argon4_forward.monitor_logger import MonitorAuditLogger
+
+    mono = {"now": 200.0}
+    calls = []
+    saved = []
+    p = pl_mod.ForwardPipeline(
+        None,
+        tmp_path,
+        SimpleNamespace(save=lambda kind, data: saved.append((kind, data))),
+    )
+    p._revision_fastpath = {"enabled": True}
+    monkeypatch.setattr(pl_mod.time, "monotonic", lambda: mono["now"])
+
+    def fake_calibrate(*, transport, **kwargs):
+        calls.append((mono["now"], kwargs))
+        if len(calls) == 1:
+            return {"status": "UNCERTAINTY_TOO_LARGE", "uncertainty_seconds": 0.56, "calibrated_monotonic": mono["now"]}
+        return {"status": "CALIBRATED", "uncertainty_seconds": 0.12, "calibrated_monotonic": mono["now"]}
+
+    monkeypatch.setattr(pl_mod, "calibrate", fake_calibrate)
+    try:
+        with pytest.raises(ValueError, match="clock uncertainty"):
+            p.update_clock()
+        assert len(calls) == 1
+
+        # Within < 1.0s (e.g. 0.4s later), does not spam /time
+        mono["now"] = 200.4
+        with pytest.raises(ValueError, match="clock uncertainty"):
+            p.update_clock()
+        assert len(calls) == 1
+
+        # At >= 1.0s (e.g. 1.5s worker tick), immediately re-calibrates instead of waiting 40s!
+        mono["now"] = 201.5
+        recovered = p.update_clock()
+        assert len(calls) == 2
+        assert recovered["status"] == "CALIBRATED"
+        assert recovered["refresh_reason"] == "UNCALIBRATED_RETRY"
+    finally:
+        p.close()
+
+    # Verify MonitorAuditLogger tags THIN_BOOK_DEPTH_GUARD and CONFIDENCE_TIERED_PRICE_CAP
+    mlog = MonitorAuditLogger(tmp_path / "rt")
+    rec = mlog.log_cohort_execution(
+        "2026-11-11T00:05:00+00:00",
+        {"order": ["BTC_15m", "ETH_5m"]},
+        {
+            "BTC_15m": {"status": "SIGNAL", "outcome": "UP", "prediction": {"z_v4": 1.95, "threshold_frozen": 1.8, "side": "UP"}},
+            "ETH_5m": {"status": "SIGNAL", "outcome": "DOWN", "prediction": {"z_v4": -1.78, "threshold_frozen": 1.72, "side": "DOWN"}},
+        },
+        {
+            "status": "PROCESSED",
+            "fills": [],
+            "stream_results": {
+                "BTC_15m": {
+                    "status": "PRICE_LIMIT_NOT_MET",
+                    "best_ask": 0.48,
+                    "limit_price": 0.515,
+                    "min_buy_price": 0.415,
+                    "min_executable_depth_usd": 25.0,
+                    "observed_executable_depth_usd": 3.57,
+                },
+                "ETH_5m": {
+                    "status": "PRICE_LIMIT_NOT_MET",
+                    "best_ask": 0.504,
+                    "limit_price": 0.49,
+                    "min_buy_price": 0.425,
+                },
+            },
+        },
+        {"duration_seconds": 4.8},
+    )
+    streams_info = rec["details"]["streams"]
+    assert "THIN_BOOK_DEPTH_GUARD" in streams_info["BTC_15m"]["no_trade_reason"]
+    assert "CONFIDENCE_TIERED_PRICE_CAP" in streams_info["ETH_5m"]["no_trade_reason"]
+
+
+
 
