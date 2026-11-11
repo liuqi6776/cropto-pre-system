@@ -163,10 +163,10 @@ def _policy_risk_limits(policy=None):
             if d_val <= 0:
                 raise AccountRejected("invalid policy risk limits")
             stream_max_order_usd[str(s_key)] = d_val
-    if (not Decimal("0.005") <= single_frac <= Decimal("0.100")
-            or not Decimal("0.010") <= tick_frac <= Decimal("0.200")
+    if (not Decimal("0.005") <= single_frac <= Decimal("0.250")
+            or not Decimal("0.010") <= tick_frac <= Decimal("0.350")
             or single_frac > tick_frac
-            or not Decimal("0.010") <= daily_loss <= Decimal("0.200")
+            or not Decimal("0.010") <= daily_loss <= Decimal("0.250")
             or not Decimal("0") <= min_buy_price <= Decimal("0.500")
             or max_tick <= 0 or max_order <= 0 or max_open <= 0 or max_underlying <= 0
             or max_active_open <= 0 or max_active_underlying <= 0
@@ -794,28 +794,35 @@ class Account:
         if not _ts(clean["decision_at"]) <= source <= received <= stamp or (stamp-source).total_seconds() > 2:
             raise AccountRejected("price skip book is stale or future")
         skip_limit = _d(receipt.get("limit_price", ".515"))
-        if skip_limit not in (Decimal(".515"), Decimal(".520")):
+        if not Decimal(".450") <= skip_limit <= Decimal(".520"):
             raise AccountRejected("unsupported price skip limit")
         min_limit = _d(receipt.get("min_buy_price", "0"))
         if not Decimal("0") <= min_limit <= Decimal(".500"):
             raise AccountRejected("unsupported min buy price limit")
+        min_exec_depth = _d(receipt.get("min_executable_depth_usd", "0"))
+        if not Decimal("0") <= min_exec_depth <= Decimal("250"):
+            raise AccountRejected("unsupported min executable depth")
         self._fee_per_share(fee, skip_limit, stamp, clean["market_id"], clean["outcome"])
         asks = book.get("asks")
         if not isinstance(asks, list) or not asks:
             raise AccountRejected("nonempty observed asks required for price skip")
         positive = []
+        executable_depth = Decimal(0)
         for ask in asks:
             price, size = _d(ask.get("price")), _d(ask.get("size"))
             if not 0 < price < 1 or size < 0:
                 raise AccountRejected("invalid price skip ask level")
             if size > 0:
                 positive.append(price)
-        if not positive or (min_limit <= min(positive) <= skip_limit):
+                if min_limit <= price <= skip_limit:
+                    executable_depth += size * (price + self._fee_per_share(fee, price, stamp, clean["market_id"], clean["outcome"]))
+        executable_depth = executable_depth.quantize(Decimal(".000001"), rounding=ROUND_DOWN)
+        if not positive or (min_limit <= min(positive) <= skip_limit and executable_depth >= max(Decimal(".000001"), min_exec_depth)):
             raise AccountRejected("price skip requires all positive asks above the limit")
         if cohort_policy is not None:
             limits = _policy_risk_limits(cohort_policy)
             expected_min_buy = (limits.get("stream_min_buy_price") or {}).get(stream, limits["min_buy_price"])
-            if "min_buy_price" in receipt or (expected_min_buy > 0 and min(positive) < skip_limit):
+            if "min_buy_price" in receipt or (expected_min_buy > 0 and min(positive) < skip_limit and min_exec_depth <= 0):
                 if min_limit != expected_min_buy:
                     raise AccountRejected("price skip min_buy_price does not match cohort policy")
         return clean

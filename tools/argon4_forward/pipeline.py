@@ -528,7 +528,11 @@ class ForwardPipeline:
 
     def _same_cohort_view_admitted(self, view):
         admission = self._same_cohort_revision
-        if not admission or self.clock != admission["clock"]:
+        if not admission:
+            return False
+        if self.clock != admission["clock"] and not (
+            admission.get("completed") is True and self._pending_execution is None
+        ):
             return False
         return (cohort_at(calibrated_now(self.clock, upper=False)) == admission["cohort"]
                 and self.last_cohort == admission["cohort"]
@@ -600,10 +604,12 @@ class ForwardPipeline:
             apply_volatility_regime_guard,
             compute_ex_ante_btc_macro_returns_pct,
             compute_ex_ante_rv12_bps,
+            compute_ex_ante_symbol_returns,
         )
         vol_guard = (policy.get("volatility_regime_guard")
                      if isinstance(policy.get("volatility_regime_guard"), dict) else None)
         rv12_cache = {}
+        own_rets_cache = {}
         btc_macro_rets = compute_ex_ante_btc_macro_returns_pct(
             inputs.get("data_root"), as_of=now_lower, snapshot=snapshot)
         for stream in policy["order"]:
@@ -632,6 +638,9 @@ class ForwardPipeline:
             if symbol not in rv12_cache:
                 rv12_cache[symbol] = compute_ex_ante_rv12_bps(
                     inputs.get("data_root"), symbol, as_of=now_lower, snapshot=snapshot)
+            if symbol not in own_rets_cache:
+                own_rets_cache[symbol] = compute_ex_ante_symbol_returns(
+                    inputs.get("data_root"), symbol, as_of=now_lower, snapshot=snapshot)
             started = time.perf_counter()
             threshold_override = (policy.get("stream_thresholds", {}).get(stream)
                                   if isinstance(policy.get("stream_thresholds"), dict) else None)
@@ -640,6 +649,7 @@ class ForwardPipeline:
                 score_kwargs["threshold_override"] = threshold_override
             score = predict_stream(stream, f["base"], f["expert"], calibrated_now(self.clock), **score_kwargs)
             if rv12_cache[symbol] is not None or vol_guard is not None:
+                own_rets = own_rets_cache.get(symbol) or {}
                 score = apply_volatility_regime_guard(
                     stream,
                     score,
@@ -650,6 +660,9 @@ class ForwardPipeline:
                     btc_ret_2h_pct=btc_macro_rets.get("btc_ret_2h_pct"),
                     btc_ret_4h_pct=btc_macro_rets.get("btc_ret_4h_pct"),
                     btc_ema_gap_bps=btc_macro_rets.get("btc_ema_gap_bps"),
+                    own_ret_1h_pct=own_rets.get("own_ret_1h_pct"),
+                    own_ret_15m_bps=own_rets.get("own_ret_15m_bps"),
+                    own_streak_3bar=own_rets.get("own_streak_3bar"),
                 )
             self._decision_timing["inference_seconds"][stream] = time.perf_counter()-started
             if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
@@ -667,6 +680,9 @@ class ForwardPipeline:
                 if score.get("bleed_single_order_window_cap") is True:
                     signal["bleed_single_order_window_cap"] = True
                     signal["max_orders_in_window"] = 1
+                if score.get("effective_max_buy_price") is not None:
+                    signal["effective_max_buy_price"] = float(score["effective_max_buy_price"])
+                    decisions[stream]["effective_max_buy_price"] = float(score["effective_max_buy_price"])
                 decisions[stream].update(status="SIGNAL", signal=signal)
         return decisions
 
@@ -1003,6 +1019,9 @@ class ForwardPipeline:
             timing.update(status="WAITING_PRICE_RECHECK", next_retry_at=outcome["next_retry_at"])
         else:
             self._pending_execution = None
+            if (isinstance(self._same_cohort_revision, dict)
+                    and self._same_cohort_revision.get("cohort") == cohort):
+                self._same_cohort_revision["completed"] = True
             timing = self.finish_timing(outcome.get("status", "COMPLETE"))
         self.monitor_log.log_cohort_execution(cohort.isoformat(), policy, decisions, outcome, timing)
         self.publish(status="PAPER_WAITING_PRICE_RECHECK" if waiting else "PAPER_CYCLE_COMPLETE",
@@ -1027,6 +1046,10 @@ class ForwardPipeline:
             reason = "CLOCK_CHANGED_DURING_RECHECK"
         if reason:
             self.abandon_prepared(reason)
+            if (reason == "WINDOW_EXPIRED"
+                    and isinstance(self._same_cohort_revision, dict)
+                    and self._same_cohort_revision.get("cohort") == pending["cohort"]):
+                self._same_cohort_revision["completed"] = True
             self.publish(status="PAPER_CYCLE_COMPLETE", active=True,
                 reason="本窗口重检已停止；不重算预测、不补历史订单",
                 execution=self.state["execution"], timing=self.state["timing"])
@@ -1043,12 +1066,13 @@ class ForwardPipeline:
         self._last_logged_block_key = key
         self.monitor_log.log_cohort_blocked(cohort, code, reason, **extra)
 
-    def _try_recover_shared_proxy_backoff(self, backoff_path, backoff):
+    def _try_recover_shared_proxy_backoff(self, backoff_path, backoff, *, force=False):
         """Probe fapi.binance.com on a fresh TCP session when a shared TUN/VPN node caused a 418/429."""
         if not isinstance(backoff, dict) or backoff.get("reason") not in ("PUBLIC_HTTP_418", "PUBLIC_HTTP_429"):
             return False
         now_mono = time.monotonic()
-        if now_mono - getattr(self, "_last_backoff_probe_mono", 0.0) < 30.0:
+        min_interval = 3.0 if force else 30.0
+        if now_mono - getattr(self, "_last_backoff_probe_mono", 0.0) < min_interval:
             return False
         self._last_backoff_probe_mono = now_mono
         try:
@@ -1065,8 +1089,10 @@ class ForwardPipeline:
                 if resp.status_code != 200:
                     return False
                 weight_hdr = resp.headers.get("X-MBX-USED-WEIGHT-1M") or resp.headers.get("x-mbx-used-weight-1m")
-                weight_val = float(weight_hdr) if weight_hdr is not None else 0.0
-                if weight_val >= 1200.0:
+                if weight_hdr is None:
+                    return False
+                weight_val = float(weight_hdr)
+                if not (0.0 <= weight_val < 1200.0):
                     return False
             backoff_path.unlink(missing_ok=True)
             receipts_db = self.runtime / "features/http_receipts.sqlite3"
@@ -1271,6 +1297,34 @@ class ForwardPipeline:
         with self.monitor_log.phase("pipeline", "refresh_decision_inputs",
                                     cohort=cohort.isoformat(), slow_warn_seconds=6.0):
             inputs = self.refresh_decision_inputs(engineering, cohort, now_lower)
+        if (inputs.get("status") not in ("READY", "COMPLETE", "OBSERVED")
+                and isinstance(self.inputs, OnlineInputs)
+                and backoff_path.exists()):
+            has_transient_rate_err = any(
+                isinstance(err_item, dict)
+                and any(
+                    tag in str(err_item.get("error", ""))
+                    for tag in ("PUBLIC_HTTP_STATUS_418", "PUBLIC_HTTP_STATUS_429", "PUBLIC_RATE_LIMIT_BACKOFF")
+                )
+                for err_item in (inputs.get("errors") or [])
+            )
+            rem_input_budget = (
+                cohort
+                + timedelta(seconds=engineering.get("input_deadline_after_boundary_seconds", 14))
+                - calibrated_now(self.clock)
+            ).total_seconds()
+            if has_transient_rate_err and rem_input_budget >= 3.0:
+                try:
+                    mid_backoff = json.loads(backoff_path.read_text(encoding="utf-8"))
+                except Exception:
+                    mid_backoff = None
+                if self._try_recover_shared_proxy_backoff(backoff_path, mid_backoff, force=True):
+                    self.inputs = OnlineInputs(self.runtime, **input_kwargs)
+                    with self.monitor_log.phase("pipeline", "refresh_decision_inputs_after_418_recovery",
+                                                cohort=cohort.isoformat(), slow_warn_seconds=6.0):
+                        inputs = self.refresh_decision_inputs(
+                            engineering, cohort, calibrated_now(self.clock, upper=False)
+                        )
         revision = None
         if inputs.get("status") not in ("READY", "COMPLETE", "OBSERVED"):
             with self.monitor_log.phase("pipeline", "reconcile_current_cohort",

@@ -161,6 +161,43 @@ def compute_ex_ante_btc_macro_returns_pct(data_root=None, symbol="BTCUSDT", *, a
     return out
 
 
+def compute_ex_ante_symbol_returns(data_root=None, symbol="BTCUSDT", *, as_of=None, snapshot=None, raw_frame=None):
+    """Compute causal 15m (3-bar bps), 1h (12-bar pct), and 3-bar directional streak for any symbol."""
+    out = {
+        "own_ret_15m_bps": None,
+        "own_ret_1h_pct": None,
+        "own_streak_3bar": None,
+    }
+    frame = _resolve_5m_frame(data_root, symbol, as_of=as_of, snapshot=snapshot, raw_frame=raw_frame, min_rows=3)
+    if frame is None or len(frame) < 3 or not ({"open", "close"} <= set(frame.columns)):
+        return out
+
+    tail3 = frame.tail(3)
+    if not (isinstance(tail3.index, pd.DatetimeIndex) and len(tail3.index) == 3
+            and not np.all(np.diff(tail3.index.asi8) == pd.Timedelta(minutes=5).value)):
+        o3 = tail3["open"].to_numpy(dtype=float)
+        c3 = tail3["close"].to_numpy(dtype=float)
+        if len(o3) == 3 and np.isfinite(o3).all() and np.isfinite(c3).all() and (o3 > 0).all():
+            out["own_ret_15m_bps"] = float((c3[-1] / o3[0] - 1.0) * 10000.0)
+            diffs = c3 - o3
+            if np.all(diffs > 0):
+                out["own_streak_3bar"] = 3
+            elif np.all(diffs < 0):
+                out["own_streak_3bar"] = -3
+            else:
+                out["own_streak_3bar"] = 0
+
+    if len(frame) >= 12:
+        tail12 = frame.tail(12)
+        if not (isinstance(tail12.index, pd.DatetimeIndex) and len(tail12.index) == 12
+                and not np.all(np.diff(tail12.index.asi8) == pd.Timedelta(minutes=5).value)):
+            o12 = float(tail12["open"].iloc[0])
+            c12 = float(tail12["close"].iloc[-1])
+            if np.isfinite(o12) and np.isfinite(c12) and o12 > 0:
+                out["own_ret_1h_pct"] = float((c12 / o12 - 1.0) * 100.0)
+    return out
+
+
 def _resolve_cohort_utc(cohort_time=None, prediction=None):
     if cohort_time is not None:
         ts = pd.Timestamp(cohort_time)
@@ -188,6 +225,9 @@ def apply_volatility_regime_guard(
     btc_ret_2h_pct=None,
     btc_ret_4h_pct=None,
     btc_ema_gap_bps=None,
+    own_ret_1h_pct=None,
+    own_ret_15m_bps=None,
+    own_streak_3bar=None,
 ):
     """Attach ex_ante_rv12_bps / macro returns and apply volatility, US-open blackout & macro trend guards."""
     res = dict(prediction)
@@ -201,6 +241,12 @@ def apply_volatility_regime_guard(
         res["ex_ante_btc_ret_4h_pct"] = float(btc_ret_4h_pct)
     if btc_ema_gap_bps is not None:
         res["ex_ante_btc_ema_gap_bps"] = float(btc_ema_gap_bps)
+    if own_ret_1h_pct is not None:
+        res["ex_ante_own_ret_1h_pct"] = float(own_ret_1h_pct)
+    if own_ret_15m_bps is not None:
+        res["ex_ante_own_ret_15m_bps"] = float(own_ret_15m_bps)
+    if own_streak_3bar is not None:
+        res["ex_ante_own_streak_3bar"] = int(own_streak_3bar)
     if not (isinstance(guard_config, dict) and guard_config.get("enabled") is True):
         return res
 
@@ -287,6 +333,86 @@ def apply_volatility_regime_guard(
                 if is_down_bleed or is_up_squeeze:
                     res["bleed_single_order_window_cap"] = True
 
+    own_guard = guard_config.get("own_asset_crash_guard")
+    if isinstance(own_guard, dict) and own_guard.get("enabled") is True:
+        side = str(res.get("side", "")).upper()
+        max_1h_map = own_guard.get("max_own_1h_counter_return_pct")
+        max_1h = (
+            max_1h_map.get(stream)
+            if isinstance(max_1h_map, dict)
+            else (float(max_1h_map) if isinstance(max_1h_map, (int, float)) else None)
+        )
+        if max_1h is not None and own_ret_1h_pct is not None and side in ("UP", "DOWN"):
+            r1h = float(own_ret_1h_pct)
+            th1h = float(max_1h)
+            if (side == "UP" and r1h <= -th1h) or (side == "DOWN" and r1h >= th1h):
+                res["volatility_regime_guarded"] = True
+                res["volatility_regime_reason"] = "OWN_ASSET_1H_WATERFALL_GUARD"
+                res["volatility_regime_action"] = action
+                res["own_asset_max_1h_counter_return_pct"] = th1h
+                if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                    res["selected"] = False
+                return res
+
+        max_15m_map = own_guard.get("max_own_15m_counter_return_bps")
+        max_15m = (
+            max_15m_map.get(stream)
+            if isinstance(max_15m_map, dict)
+            else (float(max_15m_map) if isinstance(max_15m_map, (int, float)) else None)
+        )
+        if max_15m is not None and own_ret_15m_bps is not None and side in ("UP", "DOWN"):
+            r15m = float(own_ret_15m_bps)
+            th15m = float(max_15m)
+            if (side == "UP" and r15m <= -th15m) or (side == "DOWN" and r15m >= th15m):
+                res["volatility_regime_guarded"] = True
+                res["volatility_regime_reason"] = "OWN_ASSET_15M_WATERFALL_GUARD"
+                res["volatility_regime_action"] = action
+                res["own_asset_max_15m_counter_return_bps"] = th15m
+                if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                    res["selected"] = False
+                return res
+
+    tiered_cfg = guard_config.get("confidence_tiered_max_buy_price")
+    if isinstance(tiered_cfg, dict) and tiered_cfg.get("enabled") is True and res.get("selected") is True:
+        side = str(res.get("side", "")).upper()
+        z_abs = abs(float(res.get("z_v4", 0.0)))
+        th_val = float(res.get("threshold_frozen", 0.0))
+        delta_z = max(0.0, z_abs - th_val)
+        res["signal_excess_z"] = round(delta_z, 6)
+
+        streak_min_bps = float(tiered_cfg.get("counter_15m_streak_min_bps", 45.0))
+        streak_marginal_dz = float(tiered_cfg.get("counter_15m_marginal_delta_z", 0.12))
+        streak_action = str(tiered_cfg.get("counter_15m_marginal_action", "CAP_OR_SKIP")).upper()
+        streak_max_buy = float(tiered_cfg.get("counter_15m_marginal_max_buy_price", 0.475))
+        strong_min_dz = float(tiered_cfg.get("strong_signal_min_delta_z", 0.15))
+        strong_cap = float(tiered_cfg.get("strong_max_buy_price", 0.515))
+        marginal_cap = float(tiered_cfg.get("marginal_max_buy_price", 0.49))
+
+        is_counter_15m_streak = False
+        if own_ret_15m_bps is not None and side in ("UP", "DOWN"):
+            r15 = float(own_ret_15m_bps)
+            s3 = int(own_streak_3bar or 0)
+            if (side == "DOWN" and r15 >= streak_min_bps and s3 >= 3) or (
+                side == "UP" and r15 <= -streak_min_bps and s3 <= -3
+            ):
+                is_counter_15m_streak = True
+
+        if is_counter_15m_streak and delta_z < streak_marginal_dz:
+            if streak_action == "SKIP":
+                res["volatility_regime_guarded"] = True
+                res["volatility_regime_reason"] = "MARGINAL_SIGNAL_AGAINST_15M_STREAK"
+                res["volatility_regime_action"] = action
+                res["selected"] = False
+                return res
+            res["effective_max_buy_price"] = streak_max_buy
+            res["price_tier_reason"] = "MARGINAL_AGAINST_15M_STREAK"
+        elif delta_z < strong_min_dz:
+            res["effective_max_buy_price"] = marginal_cap
+            res["price_tier_reason"] = "MARGINAL_SIGNAL_CAP"
+        else:
+            res["effective_max_buy_price"] = strong_cap
+            res["price_tier_reason"] = "STRONG_SIGNAL_CAP"
+
     return res
 
 
@@ -306,6 +432,9 @@ def predict_stream_v14(
     btc_ret_2h_pct=None,
     btc_ret_4h_pct=None,
     btc_ema_gap_bps=None,
+    own_ret_1h_pct=None,
+    own_ret_15m_bps=None,
+    own_streak_3bar=None,
 ):
     if stream in model.STREAMS or model.predict_stream is not _ORIGINAL_PREDICT_STREAM:
         if phase == "deployment_q4":
@@ -325,7 +454,21 @@ def predict_stream_v14(
         th = float(threshold_override)
         zv = float(res["z_v4"])
         res = {**res, "threshold_frozen": th, "selected": abs(zv) >= th}
-    if any(x is not None for x in (ex_ante_rv12_bps, volatility_regime_guard, cohort_time, btc_ret_1h_pct, btc_ret_2h_pct, btc_ret_4h_pct, btc_ema_gap_bps)):
+    if any(
+        x is not None
+        for x in (
+            ex_ante_rv12_bps,
+            volatility_regime_guard,
+            cohort_time,
+            btc_ret_1h_pct,
+            btc_ret_2h_pct,
+            btc_ret_4h_pct,
+            btc_ema_gap_bps,
+            own_ret_1h_pct,
+            own_ret_15m_bps,
+            own_streak_3bar,
+        )
+    ):
         res = apply_volatility_regime_guard(
             stream,
             res,
@@ -336,5 +479,8 @@ def predict_stream_v14(
             btc_ret_2h_pct=btc_ret_2h_pct,
             btc_ret_4h_pct=btc_ret_4h_pct,
             btc_ema_gap_bps=btc_ema_gap_bps,
+            own_ret_1h_pct=own_ret_1h_pct,
+            own_ret_15m_bps=own_ret_15m_bps,
+            own_streak_3bar=own_streak_3bar,
         )
     return res

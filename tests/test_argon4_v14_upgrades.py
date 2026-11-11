@@ -1825,3 +1825,178 @@ def test_v14r13_tiered_delta_compaction_and_same_cohort_post_completion_clock_re
     assert dummy._same_cohort_view_admitted(view) is True
 
 
+def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path):
+    """v14r14:
+    1. Optimization 1: ETH_15m included in us_open_blackout.skip_streams.
+    2. Optimization 2: compute_ex_ante_symbol_returns + own_asset_crash_guard blocks #3 SOL_5m UP
+       when SOL 1h return is -2.18% (<= -1.8%) and 15m return is -163.2 bps (<= -135 bps) even though
+       BTC 1h return is only -0.41% and BTC 4h return is -1.50%.
+    3. Optimization 3: min_executable_depth_usd ($25.00) rejects a $3.69 dust book on attempt=0
+       as WAITING_PRICE_RECHECK instead of eating $3.69 and marking FILLED_BUDGET, then fills
+       the full target budget on attempt=1 when depth replenishes.
+    4. Optimization 4: confidence_tiered_max_buy_price caps marginal signals (|z|-th < 0.15) at 0.490
+       and marginal signals against a 3-bar 15m streak (>= 45 bps) at 0.475 (blocking #5 ETH_5m DOWN
+       at ask=0.5042), while preserving 0.515 for strong signals (|z|-th >= 0.15, like #4 ETH_5m DOWN).
+    """
+    from copy import deepcopy
+    from datetime import timedelta
+    from tools.argon4_forward.account import Account
+    from tools.argon4_forward.execution import PaperExecutor
+    from test_argon4_forward_execution import BOUNDARY, ORDER, clock as make_clock, fixture_inputs, v5_policy
+
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    vg = policy["volatility_regime_guard"]
+    assert "ETH_15m" in vg["us_open_blackout"]["skip_streams"]
+    assert vg["own_asset_crash_guard"]["enabled"] is True
+    assert vg["confidence_tiered_max_buy_price"]["enabled"] is True
+    assert policy["execution"]["min_executable_depth_usd"] == pytest.approx(25.0)
+
+    # 2. Replay #3 SOL_5m UP (15:40 UTC): SOL 1h = -2.18%, SOL 15m = -163.2 bps, BTC 1h = -0.41%, BTC 4h = -1.50%
+    sol_pred = {
+        "selected": True,
+        "side": "UP",
+        "z_v4": 1.5944,
+        "threshold_frozen": 1.5204,
+    }
+    res_sol_crash = model_v14.apply_volatility_regime_guard(
+        "SOL_5m",
+        sol_pred,
+        ex_ante_rv12_bps=18.2,
+        guard_config=vg,
+        cohort_time="2026-11-10T15:40:00+00:00",
+        btc_ret_1h_pct=-0.41,
+        btc_ret_4h_pct=-1.50,
+        own_ret_1h_pct=-2.18,
+        own_ret_15m_bps=-163.2,
+        own_streak_3bar=-3,
+    )
+    assert res_sol_crash["selected"] is False
+    assert res_sol_crash["volatility_regime_reason"] == "OWN_ASSET_1H_WATERFALL_GUARD"
+
+    # Also verify 15m own waterfall guard when 1h is mild (-1.1%) but 15m is -145 bps (<= -135 bps)
+    res_sol_15m_crash = model_v14.apply_volatility_regime_guard(
+        "SOL_5m",
+        sol_pred,
+        ex_ante_rv12_bps=18.2,
+        guard_config=vg,
+        cohort_time="2026-11-10T15:40:00+00:00",
+        btc_ret_1h_pct=-0.41,
+        btc_ret_4h_pct=-1.50,
+        own_ret_1h_pct=-1.10,
+        own_ret_15m_bps=-145.0,
+        own_streak_3bar=-3,
+    )
+    assert res_sol_15m_crash["selected"] is False
+    assert res_sol_15m_crash["volatility_regime_reason"] == "OWN_ASSET_15M_WATERFALL_GUARD"
+
+    # Verify compute_ex_ante_symbol_returns on 12 closed 5m bars with a 3-bar positive streak
+    times12 = pd.date_range("2026-11-10T17:00:00Z", periods=12, freq="5min")
+    opens12 = [2000.0] * 9 + [2000.0, 2004.0, 2008.0]
+    closes12 = [2000.0] * 9 + [2004.0, 2008.0, 2012.0]  # 3 positive bars, +60 bps over 15m, +0.60% over 1h
+    df12 = pd.DataFrame({"date": times12, "open_time": times12, "open": opens12, "close": closes12}, index=times12)
+    sym_rets = model_v14.compute_ex_ante_symbol_returns(raw_frame=df12)
+    assert sym_rets["own_ret_15m_bps"] == pytest.approx(60.0)
+    assert sym_rets["own_ret_1h_pct"] == pytest.approx(0.60)
+    assert sym_rets["own_streak_3bar"] == 3
+
+    # 4. Replay #5 ETH_5m DOWN (17:55 UTC): |z|=1.8097, th=1.7207 (delta_z=0.089 < 0.12), own_ret_15m=+56.6 bps, streak=+3
+    eth_marginal = {
+        "selected": True,
+        "side": "DOWN",
+        "z_v4": -1.8097,
+        "threshold_frozen": 1.7207,
+    }
+    res_eth5_marginal = model_v14.apply_volatility_regime_guard(
+        "ETH_5m",
+        eth_marginal,
+        ex_ante_rv12_bps=12.4,
+        guard_config=vg,
+        cohort_time="2026-11-10T17:55:00+00:00",
+        btc_ret_1h_pct=0.25,
+        btc_ret_4h_pct=0.40,
+        own_ret_1h_pct=0.53,
+        own_ret_15m_bps=56.6,
+        own_streak_3bar=3,
+    )
+    assert res_eth5_marginal["selected"] is True
+    assert res_eth5_marginal["effective_max_buy_price"] == pytest.approx(0.475)
+    assert res_eth5_marginal["price_tier_reason"] == "MARGINAL_AGAINST_15M_STREAK"
+
+    # Replay #4 ETH_5m DOWN (17:35 UTC): |z|=2.5071, th=1.7207 (delta_z=0.7864 >= 0.15 -> strong signal)
+    eth_strong = {
+        "selected": True,
+        "side": "DOWN",
+        "z_v4": -2.5071,
+        "threshold_frozen": 1.7207,
+    }
+    res_eth4_strong = model_v14.apply_volatility_regime_guard(
+        "ETH_5m",
+        eth_strong,
+        ex_ante_rv12_bps=11.0,
+        guard_config=vg,
+        cohort_time="2026-11-10T17:35:00+00:00",
+        btc_ret_1h_pct=0.10,
+        btc_ret_4h_pct=0.20,
+        own_ret_1h_pct=0.20,
+        own_ret_15m_bps=25.0,
+        own_streak_3bar=1,
+    )
+    assert res_eth4_strong["selected"] is True
+    assert res_eth4_strong["effective_max_buy_price"] == pytest.approx(0.515)
+    assert res_eth4_strong["price_tier_reason"] == "STRONG_SIGNAL_CAP"
+
+    # 3. Verify PaperExecutor rejects $3.69 dust book on attempt=0 (WAITING_PRICE_RECHECK) and fills full budget on attempt=1
+    exec_policy = {
+        **v5_policy(),
+        "version": "v14r14-min-depth-test",
+        "single_stream_equity_fraction": policy["single_stream_equity_fraction"],
+        "tick_equity_fraction": policy["tick_equity_fraction"],
+        "min_buy_price": 0.415,
+        "stream_min_buy_price": policy["stream_min_buy_price"],
+        "stream_max_order_usd": policy["stream_max_order_usd"],
+        "engineering": {"profile": "argon4-latency-v12"},
+        "execution": deepcopy(policy["execution"]),
+    }
+    ledger = Account(tmp_path / "min_depth.sqlite3", initial_capital=1269, started_at=BOUNDARY - timedelta(seconds=1))
+    executor = PaperExecutor(ledger, exec_policy)
+    decisions, markets = fixture_inputs(capacity=200, boundary=BOUNDARY)
+    for d_val in decisions.values():
+        if d_val.get("signal"):
+            d_val["signal"]["valid_until"] = (BOUNDARY + timedelta(seconds=20)).isoformat()
+
+    now_cursor = BOUNDARY + timedelta(seconds=9)
+    # On attempt 0, Rank 1 (BTC_15m) only has 7 shares @ 0.51 ($3.57 < $25.00 min_executable_depth_usd)
+    attempt_sizes = [7, 400]
+
+    def book_refresh(market, side):
+        nonlocal now_cursor
+        now_cursor += timedelta(seconds=0.05)
+        b = deepcopy(market["books"][side])
+        b.update(source_at=now_cursor.isoformat(), received_at=now_cursor.isoformat())
+        if market["market_id"] == markets[ORDER[0]]["market_id"]:
+            sz = attempt_sizes.pop(0) if attempt_sizes else 400
+            b["asks"] = [{"price": 0.51, "size": sz}]
+        else:
+            b["asks"] = [{"price": 0.48, "size": 400}]
+        return b
+
+    res_look0 = executor.process_cohort(
+        BOUNDARY, decisions, markets, now=lambda: now_cursor, clock=make_clock(BOUNDARY), book_refresh=book_refresh
+    )
+    assert res_look0["status"] == "WAITING_PRICE_RECHECK"
+    assert res_look0["fills"] == []
+    assert res_look0["stream_results"][ORDER[0]]["observed_executable_depth_usd"] == pytest.approx(3.57)
+    assert res_look0["stream_results"][ORDER[0]]["min_executable_depth_usd"] == pytest.approx(25.0)
+
+    # Advance to next_retry_at (+2.5s): now book has 400 shares @ 0.51 ($204 >= $25), so Rank 1 fills full budget!
+    now_cursor = pd.Timestamp(res_look0["next_retry_at"]).to_pydatetime()
+    res_look1 = executor.process_cohort(
+        BOUNDARY, decisions, markets, now=lambda: now_cursor, clock=make_clock(BOUNDARY), book_refresh=book_refresh
+    )
+    assert res_look1["status"] == "PROCESSED"
+    assert len(res_look1["fills"]) >= 1
+    assert res_look1["fills"][0]["underlying"] == "BTC"
+    assert res_look1["fills"][0]["cost_usd"] > 15.0
+
+
+
