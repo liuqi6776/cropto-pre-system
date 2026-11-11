@@ -565,6 +565,17 @@ class PaperExecutor:
                         min(cfg_min_depth, (target_budget * cfg_min_frac).quantize(Decimal(".000001"), rounding=ROUND_DOWN))
                         if cfg_min_frac > 0 else cfg_min_depth
                     )
+                    expiry_ts = min(_ts(cohort["expires_at"]), _ts(signal["valid_until"]))
+                    can_retry_depth = (
+                        multi_look is not None
+                        and look_claim is not None
+                        and look_claim[1] < multi_look["max_price_rechecks"]
+                        and (expiry_ts - stamp).total_seconds() >= 3.0
+                        and (stamp + timedelta(seconds=2.5)) <= boundary + timedelta(seconds=18.5)
+                    )
+                    if not can_retry_depth:
+                        final_floor = _d(exec_cfg.get("final_look_min_executable_depth_usd", "8.0"))
+                        effective_min_depth = min(effective_min_depth, final_floor)
                 raw_capacity = capacity
                 if effective_min_depth > 0 and 0 < capacity < effective_min_depth:
                     capacity = Decimal(0)

@@ -341,6 +341,39 @@ class Account:
 
     heartbeat = set_runtime_status
 
+    def sync_initial_capital(self, target_initial_usd, now=None):
+        """Explicitly adjust initial_atoms and cash_atoms by the capital delta when scaling stages."""
+        target_atoms = _atoms(_d(target_initial_usd))
+        if target_atoms <= 0:
+            raise AccountRejected("positive initial capital required")
+        stamp = _now(now)
+        with self._connection() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT initial_atoms, cash_atoms, peak_realized_atoms FROM account WHERE id=1").fetchone()
+            if row is None or int(row["initial_atoms"]) == target_atoms:
+                return False
+            delta = target_atoms - int(row["initial_atoms"])
+            new_cash = int(row["cash_atoms"]) + delta
+            if new_cash < 0:
+                raise AccountRejected("capital reduction exceeds available cash")
+            new_peak = max(target_atoms, int(row["peak_realized_atoms"]) + delta)
+            con.execute(
+                "UPDATE account SET initial_atoms=?, cash_atoms=?, peak_realized_atoms=? WHERE id=1",
+                (target_atoms, new_cash, new_peak),
+            )
+            self._event(
+                con,
+                "CAPITAL_ADJUSTED",
+                {
+                    "previous_initial_capital_usd": _usd(int(row["initial_atoms"])),
+                    "new_initial_capital_usd": _usd(target_atoms),
+                    "delta_usd": _usd(delta),
+                },
+                stamp,
+            )
+            self._snapshot(con, stamp)
+            return True
+
     def cohort_state(self, cohort_id):
         cohort_id = _iso(_ts(cohort_id))
         with self._connection() as con:
@@ -740,7 +773,11 @@ class Account:
             min_limit = _d(receipt.get("min_buy_price", str(expected_min_buy)))
             positive_asks = [_d(a["price"]) for a in receipt.get("orderbook", {}).get("asks", []) if _d(a.get("size", 0)) > 0]
             below_min_buy = bool(positive_asks and min(positive_asks) < min_limit)
-            if (outcome == "PRICE_LIMIT_NOT_MET" and not below_min_buy
+            skip_limit = _d(receipt.get("limit_price", ".515"))
+            custom_low_cap_miss = bool(
+                skip_limit < Decimal(".500") and positive_asks and min(positive_asks) > skip_limit
+            )
+            if (outcome == "PRICE_LIMIT_NOT_MET" and not below_min_buy and not custom_low_cap_miss
                     and attempt < settings["max_price_rechecks"]
                     and (expiry-stamp).total_seconds() >= 3
                     and proposed <= _ts(key)+timedelta(seconds=18.5)):

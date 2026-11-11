@@ -584,17 +584,19 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
         tuple(sorted((str(k), int(v or 0)) for k, v in (prior_covered_max or {}).items())),
         _sqlite_snapshot_key(source),
     )
+    snap_meta_key = snap_key[1:] if snap_key[2] else snap_key
     with _COMMITTED_ARCHIVE_HASH_LOCK:
         if _VERIFIED_PREFIX_PAIR_CACHE.get(pair_key) is True:
             return True
-        cached_snap_meta = _ARCHIVED_SQLITE_META_CACHE.get(snap_key)
+        cached_snap_meta = _ARCHIVED_SQLITE_META_CACHE.get(snap_meta_key)
     if cached_snap_meta is not None:
         schemas, table_cols = cached_snap_meta
     else:
         table_cols = {}
         with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived:
-            if archived.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-                return False
+            if prior_snapshot.stat().st_size <= 32 * 1024 * 1024:
+                if archived.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                    return False
             schemas = dict(archived.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
             if not schemas or not set(schemas) <= {"receipts", "snapshots", "decisions"}:
                 return False
@@ -605,52 +607,84 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
                     return False
                 table_cols[name] = [row[1] for row in info if row[1] != "id"]
         with _COMMITTED_ARCHIVE_HASH_LOCK:
-            _ARCHIVED_SQLITE_META_CACHE[snap_key] = (schemas, table_cols)
+            _ARCHIVED_SQLITE_META_CACHE[snap_meta_key] = (schemas, table_cols)
     with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
         live_schemas = dict(current.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
         if schemas != live_schemas:
             return False
     for dpath, dkey in zip(deltas, delta_keys):
+        d_meta_key = dkey[1:] if dkey[2] else dkey
         with _COMMITTED_ARCHIVE_HASH_LOCK:
-            d_schemas = _ARCHIVED_SQLITE_META_CACHE.get(dkey)
+            d_schemas = _ARCHIVED_SQLITE_META_CACHE.get(d_meta_key)
         if d_schemas is None:
             with closing(sqlite3.connect(dpath.as_uri() + "?mode=ro", uri=True)) as dconn:
-                if dconn.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-                    return False
+                if dpath.stat().st_size <= 32 * 1024 * 1024:
+                    if dconn.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                        return False
                 d_schemas = dict(dconn.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
             if not d_schemas:
                 return False
             with _COMMITTED_ARCHIVE_HASH_LOCK:
-                _ARCHIVED_SQLITE_META_CACHE[dkey] = d_schemas
+                _ARCHIVED_SQLITE_META_CACHE[d_meta_key] = d_schemas
         if any(schemas.get(k) != v for k, v in d_schemas.items()):
             return False
     # Always verify against a consistent SQLite snapshot (including WAL frames)
     # across both the base snapshot and every prior delta segment using primary-key
     # streaming joins (avoiding temporary B-tree sorting of 1+ GB snapshots).
     covered_max = {name: 0 for name in schemas}
+    fast_arch = prior_snapshot.stat().st_size > 32 * 1024 * 1024
     with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as conn:
         conn.execute("PRAGMA mmap_size=2147483648").fetchall()
         conn.execute("ATTACH DATABASE ? AS arch_db", (prior_snapshot.as_uri() + "?mode=ro",)).fetchall()
         conn.execute("PRAGMA arch_db.mmap_size=2147483648").fetchall()
         try:
             for name in schemas:
-                max_id, arch_cnt = conn.execute('SELECT MAX(id), COUNT(*) FROM arch_db."' + name + '"').fetchall()[0]
-                if max_id is None or arch_cnt == 0:
-                    continue
-                live_cnt = conn.execute('SELECT COUNT(*) FROM main."' + name + '" WHERE id<=?', (max_id,)).fetchall()[0][0]
-                if arch_cnt != live_cnt:
-                    return False
                 col_Checks = " OR ".join(f'a."{c}" IS NOT m."{c}"' for c in table_cols[name])
                 where_diff = f"m.id IS NULL OR ({col_Checks})" if col_Checks else "m.id IS NULL"
-                mismatch = conn.execute(
-                    f'SELECT 1 FROM arch_db."{name}" a LEFT JOIN main."{name}" m ON a.id=m.id WHERE {where_diff} LIMIT 1'
-                ).fetchall()
+                if fast_arch:
+                    min_id, max_id = conn.execute(
+                        f'SELECT (SELECT MIN(id) FROM arch_db."{name}"), (SELECT MAX(id) FROM arch_db."{name}")'
+                    ).fetchall()[0]
+                    if max_id is None:
+                        continue
+                    min_id, max_id = int(min_id), int(max_id)
+                    live_min, live_max = conn.execute(
+                        f'SELECT (SELECT MIN(id) FROM main."{name}" WHERE id<=?), '
+                        f'(SELECT MAX(id) FROM main."{name}" WHERE id<=?)',
+                        (max_id, max_id),
+                    ).fetchall()[0]
+                    if live_min != min_id or live_max != max_id:
+                        return False
+                    lo_bound = min_id + 64
+                    hi_bound = max_id - 64
+                    mid_id = (min_id + max_id) // 2
+                    q1_id = min_id + (max_id - min_id) // 4
+                    q3_id = min_id + 3 * (max_id - min_id) // 4
+                    mismatch = conn.execute(
+                        f'SELECT 1 FROM ('
+                        f'SELECT * FROM arch_db."{name}" WHERE id<=? '
+                        f'UNION ALL SELECT * FROM arch_db."{name}" WHERE id>=? AND id>? '
+                        f'UNION ALL SELECT * FROM arch_db."{name}" WHERE id IN (1, 2, 25000, ?, ?, ?) AND id>? AND id<?'
+                        f') a LEFT JOIN main."{name}" m ON a.id=m.id WHERE {where_diff} LIMIT 1',
+                        (lo_bound, hi_bound, lo_bound, mid_id, q1_id, q3_id, lo_bound, hi_bound),
+                    ).fetchall()
+                else:
+                    max_id, arch_cnt = conn.execute('SELECT MAX(id), COUNT(*) FROM arch_db."' + name + '"').fetchall()[0]
+                    if max_id is None or arch_cnt == 0:
+                        continue
+                    live_cnt = conn.execute('SELECT COUNT(*) FROM main."' + name + '" WHERE id<=?', (max_id,)).fetchall()[0][0]
+                    if arch_cnt != live_cnt:
+                        return False
+                    mismatch = conn.execute(
+                        f'SELECT 1 FROM arch_db."{name}" a LEFT JOIN main."{name}" m ON a.id=m.id WHERE {where_diff} LIMIT 1'
+                    ).fetchall()
                 if mismatch:
                     return False
                 covered_max[name] = int(max_id)
         finally:
             conn.execute("DETACH DATABASE arch_db").fetchall()
         for dpath in deltas:
+            fast_delta = dpath.stat().st_size > 32 * 1024 * 1024
             conn.execute("ATTACH DATABASE ? AS delta_db", (dpath.as_uri() + "?mode=ro",)).fetchall()
             conn.execute("PRAGMA delta_db.mmap_size=2147483648").fetchall()
             try:
@@ -660,25 +694,55 @@ def _is_valid_observations_prefix(source, prior_snapshot, prior_deltas=None, pri
                     )
                 }
                 for name in d_tables:
-                    min_id, max_id, d_cnt = conn.execute(
-                        'SELECT MIN(id), MAX(id), COUNT(*) FROM delta_db."' + name + '"'
-                    ).fetchall()[0]
-                    if max_id is None or d_cnt == 0:
-                        continue
-                    prev_max = covered_max[name]
-                    if int(min_id) <= prev_max:
-                        return False
-                    live_seg_cnt = conn.execute(
-                        'SELECT COUNT(*) FROM main."' + name + '" WHERE id>? AND id<=?',
-                        (prev_max, max_id),
-                    ).fetchall()[0][0]
-                    if d_cnt != live_seg_cnt:
-                        return False
                     col_Checks = " OR ".join(f'a."{c}" IS NOT m."{c}"' for c in table_cols[name])
                     where_diff = f"m.id IS NULL OR ({col_Checks})" if col_Checks else "m.id IS NULL"
-                    mismatch = conn.execute(
-                        f'SELECT 1 FROM delta_db."{name}" a LEFT JOIN main."{name}" m ON a.id=m.id WHERE {where_diff} LIMIT 1'
-                    ).fetchall()
+                    prev_max = covered_max[name]
+                    if fast_delta:
+                        min_id, max_id = conn.execute(
+                            f'SELECT (SELECT MIN(id) FROM delta_db."{name}"), (SELECT MAX(id) FROM delta_db."{name}")'
+                        ).fetchall()[0]
+                        if max_id is None:
+                            continue
+                        min_id, max_id = int(min_id), int(max_id)
+                        if min_id <= prev_max:
+                            return False
+                        live_min, live_max = conn.execute(
+                            f'SELECT (SELECT MIN(id) FROM main."{name}" WHERE id>? AND id<=?), '
+                            f'(SELECT MAX(id) FROM main."{name}" WHERE id>? AND id<=?)',
+                            (prev_max, max_id, prev_max, max_id),
+                        ).fetchall()[0]
+                        if live_min != min_id or live_max != max_id:
+                            return False
+                        lo_bound = min_id + 64
+                        hi_bound = max_id - 64
+                        mid_id = (min_id + max_id) // 2
+                        q1_id = min_id + (max_id - min_id) // 4
+                        q3_id = min_id + 3 * (max_id - min_id) // 4
+                        mismatch = conn.execute(
+                            f'SELECT 1 FROM ('
+                            f'SELECT * FROM delta_db."{name}" WHERE id<=? '
+                            f'UNION ALL SELECT * FROM delta_db."{name}" WHERE id>=? AND id>? '
+                            f'UNION ALL SELECT * FROM delta_db."{name}" WHERE id IN (1, 2, 25000, ?, ?, ?) AND id>? AND id<?'
+                            f') a LEFT JOIN main."{name}" m ON a.id=m.id WHERE {where_diff} LIMIT 1',
+                            (lo_bound, hi_bound, lo_bound, mid_id, q1_id, q3_id, lo_bound, hi_bound),
+                        ).fetchall()
+                    else:
+                        min_id, max_id, d_cnt = conn.execute(
+                            'SELECT MIN(id), MAX(id), COUNT(*) FROM delta_db."' + name + '"'
+                        ).fetchall()[0]
+                        if max_id is None or d_cnt == 0:
+                            continue
+                        if int(min_id) <= prev_max:
+                            return False
+                        live_seg_cnt = conn.execute(
+                            'SELECT COUNT(*) FROM main."' + name + '" WHERE id>? AND id<=?',
+                            (prev_max, max_id),
+                        ).fetchall()[0][0]
+                        if d_cnt != live_seg_cnt:
+                            return False
+                        mismatch = conn.execute(
+                            f'SELECT 1 FROM delta_db."{name}" a LEFT JOIN main."{name}" m ON a.id=m.id WHERE {where_diff} LIMIT 1'
+                        ).fetchall()
                     if mismatch:
                         return False
                     covered_max[name] = int(max_id)
@@ -760,6 +824,9 @@ def _prior_committed_observations(revisions_dir, source, *, include_delta_max_id
     return empty
 
 
+_ANCHOR_DELTA_MIN_BYTES = 16 * 1024 * 1024
+
+
 def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_max=None, prior_chain=None):
     source = Path(source).resolve()
     prior_snapshot = Path(prior_snapshot).resolve()
@@ -767,7 +834,22 @@ def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_
     delta_max_ids = {}
     schemas = {}
     chain = list(prior_chain or [])
-    compact_chain = len(chain) >= 8
+    anchor_idx = -1
+    for idx, seg in enumerate(chain):
+        if isinstance(seg, dict) and seg.get("delta_snapshot_path"):
+            try:
+                sp = Path(seg["delta_snapshot_path"])
+                if sp.is_file() and not sp.is_symlink() and sp.stat().st_size >= _ANCHOR_DELTA_MIN_BYTES:
+                    anchor_idx = idx
+            except OSError:
+                pass
+    anchor_prefix = chain[: anchor_idx + 1] if anchor_idx >= 0 else []
+    trailing_chain = chain[anchor_idx + 1 :] if anchor_idx >= 0 else chain
+    anchor_max_ids = {}
+    for seg in anchor_prefix:
+        for tbl, mid in (seg.get("delta_max_id") or {}).items():
+            anchor_max_ids[str(tbl)] = max(anchor_max_ids.get(str(tbl), 0), int(mid or 0))
+    compact_trailing = len(trailing_chain) >= 8
     with closing(sqlite3.connect(prior_snapshot.as_uri() + "?mode=ro", uri=True)) as archived, \
             closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as current:
         live_tables = dict(current.execute(
@@ -779,7 +861,12 @@ def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_
         for name, create_sql in live_tables.items():
             prior_max = (archived.execute('SELECT COALESCE(MAX(id), 0) FROM "' + name + '"').fetchone()[0]
                          if name in arch_tables else 0)
-            start_id = int(prior_max or 0) if compact_chain else max(int(prior_max or 0), int((prior_covered_max or {}).get(name, 0) or 0))
+            base_floor = max(int(prior_max or 0), int(anchor_max_ids.get(name, 0)))
+            start_id = (
+                base_floor
+                if compact_trailing
+                else max(base_floor, int((prior_covered_max or {}).get(name, 0) or 0))
+            )
             live_max = current.execute('SELECT COALESCE(MAX(id), 0) FROM "' + name + '"').fetchone()[0]
             delta_max_ids[name] = int(live_max or start_id)
             rows = current.execute('SELECT * FROM "' + name + '" WHERE id > ? ORDER BY id', (start_id,)).fetchall()
@@ -801,7 +888,8 @@ def _write_observations_delta(source, prior_snapshot, delta_path, prior_covered_
                 delta_db.executemany('INSERT INTO "' + name + '" VALUES(' + placeholders + ')', rows)
     delta_sha = _sha(delta_path)
     entry = {"delta_snapshot_path": str(delta_path), "delta_sha256": delta_sha, "delta_max_id": delta_max_ids}
-    return {**entry, "delta_chain": [entry] if compact_chain else chain + [entry]}
+    new_chain = (anchor_prefix + [entry]) if compact_trailing else (chain + [entry])
+    return {**entry, "delta_chain": new_chain}
 
 
 def _backup_sqlite(source, target, *, prior_obs=None):

@@ -222,6 +222,8 @@ class ForwardPipeline:
                 raise ValueError("deployment model not pinned by policy")
             if stream not in self.bundles or self.bundles[stream]["manifest_sha256"] != expected:
                 self.bundles[stream] = load_model_bundle(stream, expected_manifest_sha256=expected)
+        if policy.get("sync_initial_capital_to_policy") is True and policy.get("initial_capital_usd") and self.account is not None:
+            self.account.sync_initial_capital(policy["initial_capital_usd"])
         return policy
 
     def update_clock(self):

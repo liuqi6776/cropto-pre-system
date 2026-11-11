@@ -1826,17 +1826,14 @@ def test_v14r13_tiered_delta_compaction_and_same_cohort_post_completion_clock_re
 
 
 def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path):
-    """v14r14:
+    """v14r14 -> v14r15:
     1. Optimization 1: ETH_15m included in us_open_blackout.skip_streams.
-    2. Optimization 2: compute_ex_ante_symbol_returns + own_asset_crash_guard blocks #3 SOL_5m UP
-       when SOL 1h return is -2.18% (<= -1.8%) and 15m return is -163.2 bps (<= -135 bps) even though
-       BTC 1h return is only -0.41% and BTC 4h return is -1.50%.
-    3. Optimization 3: min_executable_depth_usd ($25.00) rejects a $3.69 dust book on attempt=0
-       as WAITING_PRICE_RECHECK instead of eating $3.69 and marking FILLED_BUDGET, then fills
+    2. Production v14r15 policy disables confidence_tiered_max_buy_price (preventing reverse adverse selection)
+       and tunes own_asset_crash_guard to 631-day verified black-swan thresholds (BTC 3.0%/200bp, ETH 3.5%/220bp, SOL 4.0%/250bp),
+       while offline unit config still verifies tight waterfall & tiered-cap branches in apply_volatility_regime_guard.
+    3. Optimization 3: min_executable_depth_usd ($25.00) rejects a $3.57 dust book on attempt=0
+       as WAITING_PRICE_RECHECK instead of eating $3.57 and marking FILLED_BUDGET, then fills
        the full target budget on attempt=1 when depth replenishes.
-    4. Optimization 4: confidence_tiered_max_buy_price caps marginal signals (|z|-th < 0.15) at 0.490
-       and marginal signals against a 3-bar 15m streak (>= 45 bps) at 0.475 (blocking #5 ETH_5m DOWN
-       at ask=0.5042), while preserving 0.515 for strong signals (|z|-th >= 0.15, like #4 ETH_5m DOWN).
     """
     from copy import deepcopy
     from datetime import timedelta
@@ -1848,17 +1845,34 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
     vg = policy["volatility_regime_guard"]
     assert "ETH_15m" in vg["us_open_blackout"]["skip_streams"]
     assert vg["own_asset_crash_guard"]["enabled"] is True
-    assert vg["confidence_tiered_max_buy_price"]["enabled"] is True
+    assert vg["own_asset_crash_guard"]["max_own_1h_counter_return_pct"] == {
+        "BTC_15m": 3.0,
+        "BTC_5m": 3.0,
+        "ETH_15m": 3.5,
+        "ETH_5m": 3.5,
+        "SOL_15m": 4.0,
+        "SOL_5m": 4.0,
+    }
+    assert vg["own_asset_crash_guard"]["max_own_15m_counter_return_bps"] == {
+        "BTC_15m": 200.0,
+        "BTC_5m": 200.0,
+        "ETH_15m": 220.0,
+        "ETH_5m": 220.0,
+        "SOL_15m": 250.0,
+        "SOL_5m": 250.0,
+    }
+    assert vg["confidence_tiered_max_buy_price"]["enabled"] is False
     assert policy["execution"]["min_executable_depth_usd"] == pytest.approx(25.0)
+    assert policy["execution"]["final_look_min_executable_depth_usd"] == pytest.approx(8.0)
 
-    # 2. Replay #3 SOL_5m UP (15:40 UTC): SOL 1h = -2.18%, SOL 15m = -163.2 bps, BTC 1h = -0.41%, BTC 4h = -1.50%
     sol_pred = {
         "selected": True,
         "side": "UP",
         "z_v4": 1.5944,
         "threshold_frozen": 1.5204,
     }
-    res_sol_crash = model_v14.apply_volatility_regime_guard(
+    # Under production v14r15 black-swan thresholds, normal oversold bounce (-2.18% 1h / -163.2 bps 15m) is preserved
+    res_sol_prod = model_v14.apply_volatility_regime_guard(
         "SOL_5m",
         sol_pred,
         ex_ante_rv12_bps=18.2,
@@ -1870,15 +1884,51 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         own_ret_15m_bps=-163.2,
         own_streak_3bar=-3,
     )
-    assert res_sol_crash["selected"] is False
-    assert res_sol_crash["volatility_regime_reason"] == "OWN_ASSET_1H_WATERFALL_GUARD"
+    assert res_sol_prod["selected"] is True
+    assert "effective_max_buy_price" not in res_sol_prod
 
-    # Also verify 15m own waterfall guard when 1h is mild (-1.1%) but 15m is -145 bps (<= -135 bps)
-    res_sol_15m_crash = model_v14.apply_volatility_regime_guard(
+    # True black-swan liquidation waterfall on SOL (-4.25% 1h or -260 bps 15m) is blocked by production vg
+    res_sol_blackswan = model_v14.apply_volatility_regime_guard(
         "SOL_5m",
         sol_pred,
         ex_ante_rv12_bps=18.2,
         guard_config=vg,
+        cohort_time="2026-11-10T15:40:00+00:00",
+        btc_ret_1h_pct=-0.41,
+        btc_ret_4h_pct=-1.50,
+        own_ret_1h_pct=-4.25,
+        own_ret_15m_bps=-260.0,
+        own_streak_3bar=-3,
+    )
+    assert res_sol_blackswan["selected"] is False
+    assert res_sol_blackswan["volatility_regime_reason"] == "OWN_ASSET_1H_WATERFALL_GUARD"
+
+    # Explicit unit guard dictionary to test tight waterfall & confidence-tiered cap branches offline
+    vg_unit = deepcopy(vg)
+    vg_unit["own_asset_crash_guard"]["max_own_1h_counter_return_pct"]["SOL_5m"] = 1.8
+    vg_unit["own_asset_crash_guard"]["max_own_15m_counter_return_bps"]["SOL_5m"] = 135.0
+    vg_unit["confidence_tiered_max_buy_price"]["enabled"] = True
+
+    res_sol_crash = model_v14.apply_volatility_regime_guard(
+        "SOL_5m",
+        sol_pred,
+        ex_ante_rv12_bps=18.2,
+        guard_config=vg_unit,
+        cohort_time="2026-11-10T15:40:00+00:00",
+        btc_ret_1h_pct=-0.41,
+        btc_ret_4h_pct=-1.50,
+        own_ret_1h_pct=-2.18,
+        own_ret_15m_bps=-163.2,
+        own_streak_3bar=-3,
+    )
+    assert res_sol_crash["selected"] is False
+    assert res_sol_crash["volatility_regime_reason"] == "OWN_ASSET_1H_WATERFALL_GUARD"
+
+    res_sol_15m_crash = model_v14.apply_volatility_regime_guard(
+        "SOL_5m",
+        sol_pred,
+        ex_ante_rv12_bps=18.2,
+        guard_config=vg_unit,
         cohort_time="2026-11-10T15:40:00+00:00",
         btc_ret_1h_pct=-0.41,
         btc_ret_4h_pct=-1.50,
@@ -1899,7 +1949,6 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
     assert sym_rets["own_ret_1h_pct"] == pytest.approx(0.60)
     assert sym_rets["own_streak_3bar"] == 3
 
-    # 4. Replay #5 ETH_5m DOWN (17:55 UTC): |z|=1.8097, th=1.7207 (delta_z=0.089 < 0.12), own_ret_15m=+56.6 bps, streak=+3
     eth_marginal = {
         "selected": True,
         "side": "DOWN",
@@ -1910,7 +1959,7 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         "ETH_5m",
         eth_marginal,
         ex_ante_rv12_bps=12.4,
-        guard_config=vg,
+        guard_config=vg_unit,
         cohort_time="2026-11-10T17:55:00+00:00",
         btc_ret_1h_pct=0.25,
         btc_ret_4h_pct=0.40,
@@ -1922,7 +1971,6 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
     assert res_eth5_marginal["effective_max_buy_price"] == pytest.approx(0.475)
     assert res_eth5_marginal["price_tier_reason"] == "MARGINAL_AGAINST_15M_STREAK"
 
-    # Replay #4 ETH_5m DOWN (17:35 UTC): |z|=2.5071, th=1.7207 (delta_z=0.7864 >= 0.15 -> strong signal)
     eth_strong = {
         "selected": True,
         "side": "DOWN",
@@ -1933,7 +1981,7 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         "ETH_5m",
         eth_strong,
         ex_ante_rv12_bps=11.0,
-        guard_config=vg,
+        guard_config=vg_unit,
         cohort_time="2026-11-10T17:35:00+00:00",
         btc_ret_1h_pct=0.10,
         btc_ret_4h_pct=0.20,
@@ -2081,8 +2129,184 @@ def test_update_clock_recovers_fast_after_uncertainty_too_large_and_monitor_logs
         {"duration_seconds": 4.8},
     )
     streams_info = rec["details"]["streams"]
-    assert "THIN_BOOK_DEPTH_GUARD" in streams_info["BTC_15m"]["no_trade_reason"]
+    assert "INSUFFICIENT_EXECUTABLE_DEPTH" in streams_info["BTC_15m"]["no_trade_reason"]
     assert "CONFIDENCE_TIERED_PRICE_CAP" in streams_info["ETH_5m"]["no_trade_reason"]
+
+
+def test_v14r15_final_look_depth_fill_low_cap_no_starve_and_capital_sync(tmp_path):
+    """v14r15:
+    1. Final-look depth floor (`final_look_min_executable_depth_usd = 8.0`):
+       When no rechecks remain (`can_retry_depth == False`, e.g., at T+16.5s where T+16.5s + 2.5s > T+18.5s),
+       an $18.50 book (>= $8.00, < $25.00) fills profitably (`FILLED_BUDGET`) and unlocks remaining budget
+       for Rank 2 (`ETH_5m`), whereas a < $8.00 dust book ($3.57) still skips cleanly (`PRICE_LIMIT_NOT_MET`).
+    2. Custom low `limit_price` (< 0.500) facing normal `best_ask` (0.505 > 0.490) skips immediately on
+       Attempt 0 (`next_retry_at is None`) without starving Rank 2 (`ETH_5m`) for 7.5s.
+    3. `Account.sync_initial_capital` explicitly adjusts `initial_atoms` and `cash_atoms` with a
+       `CAPITAL_ADJUSTED` audit event while normal `Account(...)` restarts never reset capital.
+    """
+    from copy import deepcopy
+    from datetime import timedelta
+    from tools.argon4_forward.account import Account
+    from tools.argon4_forward.execution import PaperExecutor
+    from tools.argon4_forward.monitor_logger import MonitorAuditLogger
+    from test_argon4_forward_execution import BOUNDARY, ORDER, clock as make_clock, fixture_inputs, v5_policy
+
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    exec_policy = {
+        **v5_policy(),
+        "version": "v14r15-final-look-and-low-cap-test",
+        "single_stream_equity_fraction": policy["single_stream_equity_fraction"],
+        "tick_equity_fraction": policy["tick_equity_fraction"],
+        "min_buy_price": 0.415,
+        "stream_min_buy_price": policy["stream_min_buy_price"],
+        "stream_max_order_usd": policy["stream_max_order_usd"],
+        "engineering": {"profile": "argon4-latency-v12"},
+        "execution": deepcopy(policy["execution"]),
+    }
+
+    # --- 1A. Final look ($18.50 >= $8.00) fills Rank 1 AND unlocks Rank 2 in the same cohort ---
+    ledger_final = Account(tmp_path / "final_look.sqlite3", initial_capital=1269, started_at=BOUNDARY - timedelta(seconds=1))
+    executor_final = PaperExecutor(ledger_final, exec_policy)
+    decisions_a, markets_a = fixture_inputs(capacity=200, boundary=BOUNDARY)
+    for d_val in decisions_a.values():
+        if d_val.get("signal"):
+            d_val["signal"]["valid_until"] = (BOUNDARY + timedelta(seconds=20)).isoformat()
+
+    # T+16.5s => proposed = T+19.0s > T+18.5s => can_retry_depth is False (final look!)
+    now_a = BOUNDARY + timedelta(seconds=16.5)
+
+    def book_refresh_a(market, side):
+        nonlocal now_a
+        now_a += timedelta(seconds=0.05)
+        b = deepcopy(market["books"][side])
+        b.update(source_at=now_a.isoformat(), received_at=now_a.isoformat())
+        if market["market_id"] == markets_a[ORDER[0]]["market_id"]:
+            # 37 shares @ 0.50 = $18.50 (>= $8.00 final floor, < $25.00 initial floor)
+            b["asks"] = [{"price": 0.50, "size": 37}]
+        else:
+            b["asks"] = [{"price": 0.48, "size": 400}]
+        return b
+
+    res_final_fill = executor_final.process_cohort(
+        BOUNDARY, decisions_a, markets_a, now=lambda: now_a, clock=make_clock(BOUNDARY), book_refresh=book_refresh_a
+    )
+    assert res_final_fill["status"] == "PROCESSED"
+    assert res_final_fill["stream_results"][ORDER[0]]["status"] == "FILLED_BUDGET"
+    assert res_final_fill["stream_results"][ORDER[0]]["spent_usd"] == pytest.approx(18.50, abs=0.5)
+    # Remaining budget unlocked for Rank 2!
+    assert len(res_final_fill["fills"]) >= 2
+    assert res_final_fill["stream_results"][ORDER[1]]["status"] == "FILLED_BUDGET"
+    assert res_final_fill["fills"][0]["market_id"] == markets_a[ORDER[0]]["market_id"]
+    assert res_final_fill["fills"][1]["market_id"] == markets_a[ORDER[1]]["market_id"]
+
+    # --- 1B. Final look dust (< $8.00, e.g. $3.57) still skips cleanly and unlocks Rank 2 ---
+    b2 = BOUNDARY + timedelta(minutes=15)
+    decisions_b, markets_b = fixture_inputs(capacity=200, boundary=b2)
+    for d_val in decisions_b.values():
+        if d_val.get("signal"):
+            d_val["signal"]["valid_until"] = (b2 + timedelta(seconds=20)).isoformat()
+    now_b = b2 + timedelta(seconds=16.5)
+
+    def book_refresh_b(market, side):
+        nonlocal now_b
+        now_b += timedelta(seconds=0.05)
+        b = deepcopy(market["books"][side])
+        b.update(source_at=now_b.isoformat(), received_at=now_b.isoformat())
+        if market["market_id"] == markets_b[ORDER[0]]["market_id"]:
+            b["asks"] = [{"price": 0.51, "size": 7}]  # $3.57 < $8.00
+        else:
+            b["asks"] = [{"price": 0.48, "size": 400}]
+        return b
+
+    res_final_skip = executor_final.process_cohort(
+        b2, decisions_b, markets_b, now=lambda: now_b, clock=make_clock(b2), book_refresh=book_refresh_b
+    )
+    assert res_final_skip["status"] == "PROCESSED"
+    assert res_final_skip["stream_results"][ORDER[0]]["status"] == "PRICE_LIMIT_NOT_MET"
+    assert res_final_skip["stream_results"][ORDER[0]]["min_executable_depth_usd"] == pytest.approx(8.0)
+    assert len(res_final_skip["fills"]) >= 1
+    assert res_final_skip["stream_results"][ORDER[1]]["status"] == "FILLED_BUDGET"
+    assert res_final_skip["fills"][0]["market_id"] == markets_b[ORDER[1]]["market_id"]
+
+    # --- 2. Custom low cap (< 0.500) at ask=0.505 skips on Attempt 0 without starving Rank 2 ---
+    ledger_low_cap = Account(tmp_path / "low_cap.sqlite3", initial_capital=1269, started_at=BOUNDARY - timedelta(seconds=1))
+    executor_low_cap = PaperExecutor(ledger_low_cap, exec_policy)
+    b3 = BOUNDARY + timedelta(minutes=30)
+    decisions_c, markets_c = fixture_inputs(capacity=200, boundary=b3)
+    for d_val in decisions_c.values():
+        if d_val.get("signal"):
+            d_val["signal"]["valid_until"] = (b3 + timedelta(seconds=20)).isoformat()
+    decisions_c[ORDER[0]]["effective_max_buy_price"] = 0.490
+    now_c = b3 + timedelta(seconds=9.0)
+
+    def book_refresh_c(market, side):
+        nonlocal now_c
+        now_c += timedelta(seconds=0.05)
+        b = deepcopy(market["books"][side])
+        b.update(source_at=now_c.isoformat(), received_at=now_c.isoformat())
+        if market["market_id"] == markets_c[ORDER[0]]["market_id"]:
+            b["asks"] = [{"price": 0.505, "size": 400}]
+        else:
+            b["asks"] = [{"price": 0.48, "size": 400}]
+        return b
+
+    res_low_cap = executor_low_cap.process_cohort(
+        b3, decisions_c, markets_c, now=lambda: now_c, clock=make_clock(b3), book_refresh=book_refresh_c
+    )
+    assert res_low_cap["status"] == "PROCESSED"
+    assert res_low_cap["stream_results"][ORDER[0]]["status"] == "PRICE_LIMIT_NOT_MET"
+    assert len(res_low_cap["fills"]) >= 1
+    assert res_low_cap["stream_results"][ORDER[1]]["status"] == "FILLED_BUDGET"
+    assert res_low_cap["fills"][0]["market_id"] == markets_c[ORDER[1]]["market_id"]
+
+    # Verify WAITING_DEPTH_RECHECK log tag in MonitorAuditLogger
+    mlog = MonitorAuditLogger(tmp_path / "rt_v15")
+    rec_wait = mlog.log_cohort_execution(
+        b3.isoformat(),
+        {"order": ["BTC_15m"]},
+        {"BTC_15m": {"status": "SIGNAL", "outcome": "UP", "prediction": {"z_v4": 2.1, "threshold_frozen": 1.8, "side": "UP"}}},
+        {
+            "status": "WAITING_PRICE_RECHECK",
+            "fills": [],
+            "stream_results": {
+                "BTC_15m": {
+                    "status": "WAITING_PRICE_RECHECK",
+                    "attempt": 0,
+                    "best_ask": 0.49,
+                    "limit_price": 0.515,
+                    "min_buy_price": 0.415,
+                    "min_executable_depth_usd": 25.0,
+                    "observed_executable_depth_usd": 6.50,
+                    "next_retry_at": (b3 + timedelta(seconds=11.5)).isoformat(),
+                }
+            },
+        },
+        {"duration_seconds": 4.2},
+    )
+    assert "WAITING_DEPTH_RECHECK" in rec_wait["details"]["streams"]["BTC_15m"]["no_trade_reason"]
+
+    # --- 3. Account.sync_initial_capital scales capital cleanly while normal restart never resets ---
+    cap_db = tmp_path / "capital_sync.sqlite3"
+    acc1 = Account(cap_db, initial_capital=1269, started_at=BOUNDARY - timedelta(seconds=1))
+    assert acc1.overview(now=BOUNDARY)["initial_capital"] == pytest.approx(1269.0)
+    # Normal restart with different initial_capital parameter never overwrites persisted DB
+    acc_restart = Account(cap_db, initial_capital=1400, started_at=BOUNDARY)
+    assert acc_restart.overview(now=BOUNDARY)["initial_capital"] == pytest.approx(1269.0)
+    # Explicit sync_initial_capital adjusts initial_atoms & cash_atoms by +$131 and records CAPITAL_ADJUSTED
+    changed = acc_restart.sync_initial_capital(1400, now=BOUNDARY + timedelta(seconds=1))
+    assert changed is True
+    ov_after = acc_restart.overview(now=BOUNDARY + timedelta(seconds=1))
+    assert ov_after["initial_capital"] == pytest.approx(1400.0)
+    assert ov_after["cash"] == pytest.approx(1400.0)
+    # Idempotent when already at target
+    assert acc_restart.sync_initial_capital(1400, now=BOUNDARY + timedelta(seconds=2)) is False
+    with acc_restart._connection() as con:
+        ev = con.execute("SELECT event_type, payload FROM events WHERE event_type='CAPITAL_ADJUSTED'").fetchone()
+    assert ev is not None
+    ev_payload = json.loads(ev["payload"])
+    assert ev_payload["previous_initial_capital_usd"] == pytest.approx(1269.0)
+    assert ev_payload["new_initial_capital_usd"] == pytest.approx(1400.0)
+    assert ev_payload["delta_usd"] == pytest.approx(131.0)
 
 
 
