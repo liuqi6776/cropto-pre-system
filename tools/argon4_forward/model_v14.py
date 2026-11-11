@@ -214,6 +214,14 @@ def _resolve_cohort_utc(cohort_time=None, prediction=None):
     return None
 
 
+def _cohort_in_tz(cohort_dt, tz_name=None):
+    if cohort_dt is None:
+        return None
+    if not tz_name or str(tz_name).upper() == "UTC":
+        return cohort_dt
+    return cohort_dt.tz_convert(str(tz_name))
+
+
 def apply_volatility_regime_guard(
     stream,
     prediction,
@@ -229,7 +237,7 @@ def apply_volatility_regime_guard(
     own_ret_15m_bps=None,
     own_streak_3bar=None,
 ):
-    """Attach ex_ante_rv12_bps / macro returns and apply volatility, US-open blackout & macro trend guards."""
+    """Attach ex_ante_rv12_bps / macro returns and apply volatility, time-segmented blackouts & macro trend guards."""
     res = dict(prediction)
     if ex_ante_rv12_bps is not None:
         res["ex_ante_rv12_bps"] = float(ex_ante_rv12_bps)
@@ -251,11 +259,18 @@ def apply_volatility_regime_guard(
         return res
 
     action = str(guard_config.get("action", "SKIP_OR_HALF_STAKE")).upper()
+    cohort_dt = _resolve_cohort_utc(cohort_time=cohort_time, prediction=res)
+
     if ex_ante_rv12_bps is not None:
         limits = guard_config.get("max_rv12_bps")
         cap = limits.get(stream) if isinstance(limits, dict) else None
         min_limits = guard_config.get("min_rv12_bps")
         min_cap = min_limits.get(stream) if isinstance(min_limits, dict) else None
+        if cohort_dt is not None and cohort_dt.weekday() in (5, 6):
+            wknd_min_limits = guard_config.get("weekend_min_rv12_bps")
+            wknd_min = wknd_min_limits.get(stream) if isinstance(wknd_min_limits, dict) else None
+            if wknd_min is not None:
+                min_cap = max(float(min_cap), float(wknd_min)) if min_cap is not None else float(wknd_min)
         if cap is not None and float(ex_ante_rv12_bps) > float(cap):
             res["volatility_regime_guarded"] = True
             res["volatility_regime_max_rv12_bps"] = float(cap)
@@ -274,23 +289,68 @@ def apply_volatility_regime_guard(
             return res
 
     us_blackout = guard_config.get("us_open_blackout")
-    if isinstance(us_blackout, dict) and us_blackout.get("enabled") is True:
-        cohort_dt = _resolve_cohort_utc(cohort_time=cohort_time, prediction=res)
-        if cohort_dt is not None:
-            weekdays_only = bool(us_blackout.get("weekdays_only", True))
-            day_ok = (cohort_dt.weekday() < 5) if weekdays_only else True
-            minute_of_day = int(cohort_dt.hour) * 60 + int(cohort_dt.minute)
+    if isinstance(us_blackout, dict) and us_blackout.get("enabled") is True and cohort_dt is not None:
+        tz_name = us_blackout.get("timezone")
+        ref_dt = _cohort_in_tz(cohort_dt, tz_name)
+        weekdays_only = bool(us_blackout.get("weekdays_only", True))
+        day_ok = (ref_dt.weekday() < 5) if weekdays_only else True
+        minute_of_day = int(ref_dt.hour) * 60 + int(ref_dt.minute)
+        if tz_name and "local_start_minute" in us_blackout:
+            start_min = int(us_blackout["local_start_minute"])
+            end_min = int(us_blackout["local_end_minute"])
+        else:
             start_min = int(us_blackout.get("utc_start_minute", 870))
             end_min = int(us_blackout.get("utc_end_minute", 960))
-            skip_streams = us_blackout.get("skip_streams") or []
-            if day_ok and start_min <= minute_of_day < end_min and stream in skip_streams:
-                res["volatility_regime_guarded"] = True
-                res["volatility_regime_reason"] = "US_OPEN_BLACKOUT"
-                res["volatility_regime_action"] = action
-                res["us_open_blackout_minute_utc"] = minute_of_day
-                if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
-                    res["selected"] = False
-                return res
+        skip_streams = us_blackout.get("skip_streams") or []
+        if day_ok and start_min <= minute_of_day < end_min and stream in skip_streams:
+            res["volatility_regime_guarded"] = True
+            res["volatility_regime_reason"] = "US_OPEN_BLACKOUT"
+            res["volatility_regime_action"] = action
+            res["us_open_blackout_minute_utc"] = int(cohort_dt.hour) * 60 + int(cohort_dt.minute)
+            if tz_name:
+                res["us_open_blackout_minute_local"] = minute_of_day
+            if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                res["selected"] = False
+            return res
+
+    us_close = guard_config.get("us_close_blackout")
+    if isinstance(us_close, dict) and us_close.get("enabled") is True and cohort_dt is not None:
+        tz_name = us_close.get("timezone", "America/New_York")
+        local_dt = _cohort_in_tz(cohort_dt, tz_name)
+        weekdays_only = bool(us_close.get("weekdays_only", True))
+        day_ok = (local_dt.weekday() < 5) if weekdays_only else True
+        minute_of_day = int(local_dt.hour) * 60 + int(local_dt.minute)
+        start_min = int(us_close.get("local_start_minute", 900))
+        end_min = int(us_close.get("local_end_minute", 960))
+        skip_streams = us_close.get("skip_streams") or []
+        if day_ok and start_min <= minute_of_day < end_min and stream in skip_streams:
+            res["volatility_regime_guarded"] = True
+            res["volatility_regime_reason"] = "US_CLOSE_BLACKOUT"
+            res["volatility_regime_action"] = action
+            res["us_close_blackout_minute_local"] = minute_of_day
+            if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                res["selected"] = False
+            return res
+
+    sun_reopen = guard_config.get("sunday_reopen_blackout")
+    if isinstance(sun_reopen, dict) and sun_reopen.get("enabled") is True and cohort_dt is not None:
+        tz_name = sun_reopen.get("timezone", "America/New_York")
+        local_dt = _cohort_in_tz(cohort_dt, tz_name)
+        minute_of_day = int(local_dt.hour) * 60 + int(local_dt.minute)
+        windows = sun_reopen.get("windows_local_minutes") or []
+        skip_streams = sun_reopen.get("skip_streams") or []
+        in_window = any(
+            isinstance(w, (list, tuple)) and len(w) == 2 and int(w[0]) <= minute_of_day < int(w[1])
+            for w in windows
+        )
+        if local_dt.weekday() == 6 and in_window and stream in skip_streams:
+            res["volatility_regime_guarded"] = True
+            res["volatility_regime_reason"] = "SUNDAY_REOPEN_BLACKOUT"
+            res["volatility_regime_action"] = action
+            res["sunday_reopen_blackout_minute_local"] = minute_of_day
+            if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                res["selected"] = False
+            return res
 
     macro_guard = guard_config.get("macro_trend_guard")
     if isinstance(macro_guard, dict) and macro_guard.get("enabled") is True:

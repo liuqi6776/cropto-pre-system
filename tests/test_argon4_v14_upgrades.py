@@ -1445,8 +1445,9 @@ def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_p
     }
     vg = policy["volatility_regime_guard"]
     assert vg["us_open_blackout"]["enabled"] is True
-    assert vg["us_open_blackout"]["utc_start_minute"] == 870
-    assert vg["us_open_blackout"]["utc_end_minute"] == 960
+    assert vg["us_open_blackout"]["timezone"] == "America/New_York"
+    assert vg["us_open_blackout"]["local_start_minute"] == 570
+    assert vg["us_open_blackout"]["local_end_minute"] == 660
     assert vg["us_open_blackout"]["weekdays_only"] is True
     assert set(vg["us_open_blackout"]["skip_streams"]) == {"ETH_5m", "BTC_5m", "BTC_15m", "ETH_15m"}
     assert vg["macro_trend_guard"]["enabled"] is True
@@ -2307,6 +2308,129 @@ def test_v14r15_final_look_depth_fill_low_cap_no_starve_and_capital_sync(tmp_pat
     assert ev_payload["previous_initial_capital_usd"] == pytest.approx(1269.0)
     assert ev_payload["new_initial_capital_usd"] == pytest.approx(1400.0)
     assert ev_payload["delta_usd"] == pytest.approx(131.0)
+
+
+def test_v14r16_time_segmented_playbook_us_close_sunday_reopen_weekend_rv12_and_dst():
+    """Verify full 7x24h time-segmented trading playbook & Dec 6 23/5 US equity schedule:
+    1. America/New_York DST-aligned US Close MOC Blackout (`15:00-16:00 ET`, Mon-Fri) blocks all 6 streams
+       and immediately unlocks at `16:00 ET` (`05:00 BJT` EST / `04:00 BJT` EDT) golden hour.
+    2. America/New_York DST-aligned US Open Blackout (`09:30-11:00 ET`, Mon-Fri) works in both EST and EDT,
+       and legacy `utc_start_minute`/`utc_end_minute` configs remain backward-compatible.
+    3. Sunday Reopen Blackout (`Sunday 18:00-20:00 ET` CME Futures Open + `Sunday 21:00-22:00 ET` 23/5 Equity
+       Week Open) blocks all 6 streams across the UTC midnight rollover (`Mon 07:00-09:00 BJT` & `10:00-11:00 BJT`),
+       allows the `20:00-21:00 ET` (`09:00-10:00 BJT`) digestion hour, and allows Tue-Fri `21:00-22:00 ET` night sessions.
+    4. Weekend `weekend_min_rv12_bps` raises `5m` streams (`BTC_5m/ETH_5m/SOL_5m`) to `4.0 bps` on Saturday/Sunday
+       while keeping `15m` streams (`BTC_15m/ETH_15m/SOL_15m`) at `2.5/3.0 bps` and weekday `5m` at `3.0 bps`.
+    """
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    vg = policy["volatility_regime_guard"]
+    six_streams = ["BTC_15m", "ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m"]
+
+    assert vg["weekend_min_rv12_bps"] == {"BTC_5m": 4.0, "ETH_5m": 4.0, "SOL_5m": 4.0}
+    assert vg["us_close_blackout"]["enabled"] is True
+    assert vg["us_close_blackout"]["timezone"] == "America/New_York"
+    assert vg["us_close_blackout"]["local_start_minute"] == 900
+    assert vg["us_close_blackout"]["local_end_minute"] == 960
+    assert set(vg["us_close_blackout"]["skip_streams"]) == set(six_streams)
+    assert vg["sunday_reopen_blackout"]["enabled"] is True
+    assert vg["sunday_reopen_blackout"]["timezone"] == "America/New_York"
+    assert vg["sunday_reopen_blackout"]["windows_local_minutes"] == [[1080, 1200], [1260, 1320]]
+    assert set(vg["sunday_reopen_blackout"]["skip_streams"]) == set(six_streams)
+
+    pred = {"selected": True, "side": "DOWN", "z_v4": -2.05, "threshold_frozen": 1.72}
+
+    # --- 1. US Close MOC Blackout (15:00-16:00 ET) in Winter EST (20:00-21:00 UTC) & Summer EDT (19:00-20:00 UTC) ---
+    for st in six_streams:
+        r_est = model_v14.apply_volatility_regime_guard(
+            st, pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time="2026-11-11T20:15:00+00:00"
+        )
+        assert r_est["selected"] is False
+        assert r_est["volatility_regime_reason"] == "US_CLOSE_BLACKOUT"
+        assert r_est["us_close_blackout_minute_local"] == 915
+
+        r_edt = model_v14.apply_volatility_regime_guard(
+            st, pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time="2026-07-15T19:30:00+00:00"
+        )
+        assert r_edt["selected"] is False
+        assert r_edt["volatility_regime_reason"] == "US_CLOSE_BLACKOUT"
+
+    # 16:00 ET sharp (21:00 UTC in EST / 20:00 UTC in EDT) unlocks the 61.61% post-close golden hour!
+    r_unlock_est = model_v14.apply_volatility_regime_guard(
+        "BTC_15m", pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time="2026-11-11T21:00:00+00:00"
+    )
+    assert r_unlock_est["selected"] is True
+    r_unlock_edt = model_v14.apply_volatility_regime_guard(
+        "BTC_15m", pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time="2026-07-15T20:00:00+00:00"
+    )
+    assert r_unlock_edt["selected"] is True
+
+    # Weekend 15:15 ET (Sunday 2026-11-15T20:15:00Z) is NOT blocked by US_CLOSE_BLACKOUT
+    r_sun_afternoon = model_v14.apply_volatility_regime_guard(
+        "BTC_15m", pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time="2026-11-15T20:15:00+00:00"
+    )
+    assert r_sun_afternoon["selected"] is True
+
+    # --- 2. Summer EDT US Open Blackout (09:30-11:00 EDT = 13:30-15:00 UTC) + legacy UTC fallback ---
+    r_open_edt = model_v14.apply_volatility_regime_guard(
+        "ETH_5m", pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time="2026-07-15T13:45:00+00:00"
+    )
+    assert r_open_edt["selected"] is False
+    assert r_open_edt["volatility_regime_reason"] == "US_OPEN_BLACKOUT"
+    r_open_edt_sol = model_v14.apply_volatility_regime_guard(
+        "SOL_5m", pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time="2026-07-15T13:45:00+00:00"
+    )
+    assert r_open_edt_sol["selected"] is True
+    r_open_legacy = model_v14.apply_volatility_regime_guard(
+        "ETH_5m",
+        pred,
+        ex_ante_rv12_bps=12.0,
+        guard_config={"enabled": True, "us_open_blackout": {"enabled": True, "utc_start_minute": 870, "utc_end_minute": 960, "skip_streams": ["ETH_5m"]}},
+        cohort_time="2026-11-11T14:40:00+00:00",
+    )
+    assert r_open_legacy["selected"] is False
+    assert r_open_legacy["volatility_regime_reason"] == "US_OPEN_BLACKOUT"
+
+    # --- 3. Sunday Reopen Blackout (Sunday 18:00-20:00 ET & 21:00-22:00 ET) ---
+    # Window 1: Sunday 18:30 EST (2026-11-15T23:30:00Z = Mon 07:30 BJT) and Sunday 19:30 EST (2026-11-16T00:30:00Z = Mon 08:30 BJT)
+    for ts_reopen in ("2026-11-15T23:30:00+00:00", "2026-11-16T00:30:00+00:00", "2026-11-16T02:15:00+00:00"):
+        for st in six_streams:
+            r_sun = model_v14.apply_volatility_regime_guard(
+                st, pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time=ts_reopen
+            )
+            assert r_sun["selected"] is False
+            assert r_sun["volatility_regime_reason"] == "SUNDAY_REOPEN_BLACKOUT"
+
+    # Sunday 20:00-21:00 EST (2026-11-16T01:15:00Z = Mon 09:15 BJT) & Sunday 22:00 EST (Mon 11:00 BJT) are OPEN
+    for ts_open in ("2026-11-16T01:15:00+00:00", "2026-11-16T03:00:00+00:00", "2026-11-17T02:15:00+00:00"):
+        r_ok = model_v14.apply_volatility_regime_guard(
+            "BTC_15m", pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time=ts_open
+        )
+        assert r_ok["selected"] is True
+
+    # --- 4. Weekend 5m min_rv12_bps raised to 4.0 bps while 15m stays 2.5/3.0 bps ---
+    for st_5m in ("BTC_5m", "ETH_5m", "SOL_5m"):
+        r_wknd_dead = model_v14.apply_volatility_regime_guard(
+            st_5m, pred, ex_ante_rv12_bps=3.5, guard_config=vg, cohort_time="2026-11-14T12:00:00+00:00"
+        )
+        assert r_wknd_dead["selected"] is False
+        assert r_wknd_dead["volatility_regime_reason"] == "BELOW_MIN_RV12_BPS"
+        assert r_wknd_dead["volatility_regime_min_rv12_bps"] == pytest.approx(4.0)
+
+        r_wknd_ok = model_v14.apply_volatility_regime_guard(
+            st_5m, pred, ex_ante_rv12_bps=4.2, guard_config=vg, cohort_time="2026-11-14T12:00:00+00:00"
+        )
+        assert r_wknd_ok["selected"] is True
+
+        r_wkday_ok = model_v14.apply_volatility_regime_guard(
+            st_5m, pred, ex_ante_rv12_bps=3.5, guard_config=vg, cohort_time="2026-11-11T12:00:00+00:00"
+        )
+        assert r_wkday_ok["selected"] is True
+
+    for st_15m in ("BTC_15m", "ETH_15m", "SOL_15m"):
+        r_wknd_15m = model_v14.apply_volatility_regime_guard(
+            st_15m, pred, ex_ante_rv12_bps=3.5, guard_config=vg, cohort_time="2026-11-14T12:00:00+00:00"
+        )
+        assert r_wknd_15m["selected"] is True
 
 
 

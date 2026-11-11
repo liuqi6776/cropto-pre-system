@@ -310,16 +310,54 @@
       "ETH_5m": 3.0,
       "SOL_5m": 3.0
     },
+    "weekend_min_rv12_bps": {
+      "BTC_5m": 4.0,
+      "ETH_5m": 4.0,
+      "SOL_5m": 4.0
+    },
     "us_open_blackout": {
       "enabled": true,
-      "utc_start_minute": 870,
-      "utc_end_minute": 960,
+      "timezone": "America/New_York",
+      "local_start_minute": 570,
+      "local_end_minute": 660,
       "weekdays_only": true,
       "skip_streams": [
         "ETH_5m",
         "BTC_5m",
         "BTC_15m",
         "ETH_15m"
+      ]
+    },
+    "us_close_blackout": {
+      "enabled": true,
+      "timezone": "America/New_York",
+      "local_start_minute": 900,
+      "local_end_minute": 960,
+      "weekdays_only": true,
+      "skip_streams": [
+        "BTC_15m",
+        "ETH_5m",
+        "ETH_15m",
+        "BTC_5m",
+        "SOL_15m",
+        "SOL_5m"
+      ]
+    },
+    "sunday_reopen_blackout": {
+      "enabled": true,
+      "timezone": "America/New_York",
+      "windows_local_minutes": [
+        [1080, 1200],
+        [1260, 1320]
+      ],
+      "note": "Sunday 18:00-20:00 ET (CME Futures Open = Mon 07:00-09:00 BJT EST) + Sunday 21:00-22:00 ET (Dec 6+ Nasdaq/NYSE 23x5 Equity Week Open = Mon 10:00-11:00 BJT EST)",
+      "skip_streams": [
+        "BTC_15m",
+        "ETH_5m",
+        "ETH_15m",
+        "BTC_5m",
+        "SOL_15m",
+        "SOL_5m"
       ]
     },
     "macro_trend_guard": {
