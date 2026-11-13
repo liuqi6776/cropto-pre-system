@@ -2,6 +2,7 @@
 Description=ARGON-4 External Polymarket Executor (User-Managed Credentials)
 After=network-online.target argon4-forward.service
 Requires=argon4-forward.service
+RequiresMountsFor=/data
 
 [Service]
 Type=simple
