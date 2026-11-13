@@ -2822,6 +2822,67 @@ def test_v14r19_sub4s_latency_online_sha256_cache_transport_pool_and_live_config
     finally:
         inp.close()
 
+    # 4. StorageJanitor os.scandir hardlink dedup, TTL size cache, force invalidation, and per-window memoization
+    import os
+    from tools.argon4_forward import revisions as rev_mod, storage_janitor as sj_mod
+
+    rt_jan = tmp_path / "rt_janitor"
+    cold_jan = tmp_path / "cold_janitor"
+    (rt_jan / "features" / "revisions").mkdir(parents=True, exist_ok=True)
+    sample_file = rt_jan / "features" / "sample.bin"
+    sample_file.write_bytes(b"X" * 1024)
+    hardlink_file = rt_jan / "features" / "sample_link.bin"
+    try:
+        os.link(sample_file, hardlink_file)
+        assert sj_mod._dir_size_bytes(rt_jan) == 2048
+        assert sj_mod._physical_dir_size_bytes(rt_jan) == 1024
+    except OSError:
+        assert sj_mod._physical_dir_size_bytes(rt_jan) == 1024
+
+    monkeypatch.setattr(rev_mod, "ensure_view_committed", lambda *_a, **_kw: {"status": "COMMITTED"})
+    jan = sj_mod.StorageJanitor(
+        rt_jan,
+        cold_root=cold_jan,
+        policy_provider=lambda: {
+            "storage_maintenance": {
+                "enabled": True,
+                "scan_interval_days": 14,
+                "retain_hot_days": 14,
+                "max_hot_observations_mb": 15000,
+                "max_hot_total_gb": 35.0,
+                "allowed_window_seconds_Range": [95, 210],
+            }
+        },
+    )
+    scan_calls = []
+    orig_phys = sj_mod._physical_dir_size_bytes
+
+    def _counted_phys(root_path):
+        scan_calls.append(str(root_path))
+        return orig_phys(root_path)
+
+    monkeypatch.setattr(sj_mod, "_physical_dir_size_bytes", _counted_phys)
+    now_iso = "2026-11-13T10:42:00+00:00"
+    jan.status(now=now_iso)
+    first_count = len(scan_calls)
+    assert first_count >= 1
+    # Repeated status() polls within 120s TTL trigger 0 additional directory walks!
+    jan.status(now=now_iso)
+    jan.status(now=now_iso)
+    assert len(scan_calls) == first_count
+
+    # trigger_async_if_due memoizes NOT_DUE within the same 5m cohort bucket
+    idle1 = jan.trigger_async_if_due(now=now_iso, elapsed_in_window=120.0)
+    assert idle1["status"] == "NOT_DUE"
+    idle2 = jan.trigger_async_if_due(now="2026-11-13T10:42:30+00:00", elapsed_in_window=150.0)
+    assert idle2 == {"status": "NOT_DUE", "reason": "ALREADY_CHECKED_THIS_WINDOW"}
+    assert len(scan_calls) == first_count
+
+    # run_maintenance() forces exact fresh size recomputation (before & after) and clears idle memo
+    maint = jan.run_maintenance(now=now_iso)
+    assert maint["status"] == "COMPLETED"
+    assert len(scan_calls) > first_count
+    assert jan._last_idle_check_bucket is None
 
 
 

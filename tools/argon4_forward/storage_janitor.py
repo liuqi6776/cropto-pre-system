@@ -103,38 +103,49 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def _dir_size_bytes(root: Path) -> int:
+def _walk_dir_size_bytes(root: Path, *, dedup_inodes: bool) -> int:
+    """Iteratively sum file bytes under root via os.scandir with optional hardlink dedup."""
     if not root.exists():
         return 0
     total = 0
-    for p in root.rglob("*"):
+    seen_inodes: set[tuple[int, int]] | None = set() if dedup_inodes else None
+    stack: list[str] = [os.fspath(root)]
+    while stack:
+        current = stack.pop()
         try:
-            if p.is_file() and not p.is_symlink():
-                total += p.stat().st_size
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            st = entry.stat(follow_symlinks=False)
+                            if seen_inodes is not None:
+                                if not st.st_ino:
+                                    # Windows DirEntry.stat() leaves st_ino=0; fall back to os.stat for hardlink IDs.
+                                    st = os.stat(entry.path, follow_symlinks=False)
+                                if st.st_ino:
+                                    key = (st.st_dev, st.st_ino)
+                                    if key in seen_inodes:
+                                        continue
+                                    seen_inodes.add(key)
+                            total += st.st_size
+                    except OSError:
+                        pass
         except OSError:
             pass
     return total
+
+
+def _dir_size_bytes(root: Path) -> int:
+    return _walk_dir_size_bytes(root, dedup_inodes=False)
 
 
 def _physical_dir_size_bytes(root: Path) -> int:
     """Count physical disk bytes once per unique (st_dev, st_ino) hardlink group."""
-    if not root.exists():
-        return 0
-    total = 0
-    seen_inodes: set[tuple[int, int]] = set()
-    for p in root.rglob("*"):
-        try:
-            if p.is_file() and not p.is_symlink():
-                st = p.stat()
-                if st.st_ino:
-                    key = (st.st_dev, st.st_ino)
-                    if key in seen_inodes:
-                        continue
-                    seen_inodes.add(key)
-                total += st.st_size
-        except OSError:
-            pass
-    return total
+    return _walk_dir_size_bytes(root, dedup_inodes=True)
 
 
 def _is_sensitive_filename(name: str) -> bool:
@@ -266,9 +277,41 @@ class StorageJanitor:
         self.monitor_log = monitor_log
         self._lock = threading.Lock()
         self._async_lock = threading.Lock()
+        self._size_cache_lock = threading.Lock()
+        self._size_cache: dict[str, tuple[float, int]] = {}
+        self._last_idle_check_bucket: int | None = None
         self._worker_thread: threading.Thread | None = None
         self._tls = threading.local()
         self._last_async_result: dict[str, Any] | None = None
+
+    def _cached_physical_bytes(
+        self,
+        root: Path,
+        *,
+        ttl_seconds: float = 120.0,
+        force: bool = False,
+    ) -> int:
+        key = os.fspath(root)
+        now_mono = time.monotonic()
+        cached = self._size_cache.get(key)
+        if not force and cached is not None and (now_mono - cached[0]) < ttl_seconds:
+            return cached[1]
+        if not force and cached is not None:
+            acquired = self._size_cache_lock.acquire(blocking=False)
+            if not acquired:
+                return cached[1]
+        else:
+            self._size_cache_lock.acquire()
+        try:
+            cached_inner = self._size_cache.get(key)
+            now_inner = time.monotonic()
+            if not force and cached_inner is not None and (now_inner - cached_inner[0]) < ttl_seconds:
+                return cached_inner[1]
+            val = _physical_dir_size_bytes(root) if root.exists() else 0
+            self._size_cache[key] = (time.monotonic(), val)
+            return val
+        finally:
+            self._size_cache_lock.release()
 
     def _yield_for_trading_window(
         self,
@@ -383,8 +426,8 @@ class StorageJanitor:
                     pass
         return round(total / (1024 * 1024), 3)
 
-    def _hot_physical_gb(self) -> float:
-        return round(_physical_dir_size_bytes(self.runtime) / (1024 ** 3), 3)
+    def _hot_physical_gb(self, *, force: bool = False) -> float:
+        return round(self._cached_physical_bytes(self.runtime, force=force) / (1024 ** 3), 3)
 
     def should_run(self, now: Any = None, *, elapsed_in_window: float | None = None) -> tuple[bool, str]:
         cfg = self._config()
@@ -1287,7 +1330,7 @@ class StorageJanitor:
             cfg = self._config()
             now_dt = _utc(now)
             cutoff_dt = now_dt - timedelta(days=cfg["retain_hot_days"])
-            hot_gb_before = self._hot_physical_gb()
+            hot_gb_before = self._hot_physical_gb(force=True)
             # When physical disk exceeds max_hot_total_gb, compact unpinned revisions older than 6h immediately
             rev_cutoff_dt = (
                 max(cutoff_dt, now_dt - timedelta(hours=6))
@@ -1357,7 +1400,7 @@ class StorageJanitor:
                 "cold_archive_root": str(cold_root),
                 "fallback_used": fallback_used,
                 "hot_physical_gb_before": hot_gb_before,
-                "hot_physical_gb_after": self._hot_physical_gb(),
+                "hot_physical_gb_after": self._hot_physical_gb(force=True),
                 "pinned_revisions": sorted(pinned),
                 "permanent_core": perm_result,
                 "revisions": rev_result,
@@ -1386,6 +1429,9 @@ class StorageJanitor:
                     "history": history,
                 }
             )
+            self._last_idle_check_bucket = None
+            with self._size_cache_lock:
+                self._size_cache.pop(os.fspath(cold_root), None)
             if self.monitor_log is not None:
                 try:
                     self.monitor_log.record(
@@ -1426,8 +1472,15 @@ class StorageJanitor:
         with self._async_lock:
             if self._worker_thread is not None and self._worker_thread.is_alive():
                 return {"status": "ALREADY_RUNNING_ASYNC"}
+            cur_bucket: int | None = None
+            if elapsed_in_window is not None:
+                cur_bucket = int(_utc(now).timestamp() // 300)
+                if self._last_idle_check_bucket == cur_bucket:
+                    return {"status": "NOT_DUE", "reason": "ALREADY_CHECKED_THIS_WINDOW"}
             due, reason = self.should_run(now=now, elapsed_in_window=elapsed_in_window)
             if not due:
+                if cur_bucket is not None and reason != "OUTSIDE_IDLE_WINDOW":
+                    self._last_idle_check_bucket = cur_bucket
                 return {"status": "NOT_DUE", "reason": reason}
             if inputs is not None:
                 outstanding = getattr(inputs, "_outstanding", ())
@@ -1482,7 +1535,7 @@ class StorageJanitor:
         except OSError:
             hot_free_gb = None
         cold_total_mb = (
-            round(_physical_dir_size_bytes(cold_root) / (1024 * 1024), 3) if cold_root.exists() else 0.0
+            round(self._cached_physical_bytes(cold_root) / (1024 * 1024), 3) if cold_root.exists() else 0.0
         )
         due, due_reason = self.should_run(now=now_dt)
         worker_alive = bool(self._worker_thread is not None and self._worker_thread.is_alive())
