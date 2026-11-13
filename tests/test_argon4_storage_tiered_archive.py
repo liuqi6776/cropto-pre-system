@@ -161,3 +161,40 @@ def test_tiered_storage_strip_sqlite_keyframes_compression_and_cold_cap(runtime,
     # 4. Active revision remains 100% COMMITTED
     assert revisions.ensure_view_committed(runtime)["status"] == "COMMITTED"
     assert _physical_dir_size_bytes(perm_dir) > 0
+
+
+def test_archive_sync_systemd_no_janitor_and_order_weak_wants_dependency(tmp_path, monkeypatch):
+    """[v14r21] Verify systemd hardening & `--no-janitor` decoupling:
+    1. argon4-archive-sync.service uses `--no-janitor`, Nice=19, IOSchedulingClass=idle;
+    2. argon4-order.service uses Wants= (never Requires=) on argon4-forward.service;
+    3. sync_archive_gdrive.main(..., '--no-janitor') never constructs/invokes StorageJanitor.run_maintenance().
+    """
+    from scripts import sync_archive_gdrive
+
+    repo_root = Path(__file__).resolve().parents[1]
+    archive_unit = (repo_root / "deploy" / "systemd" / "argon4-archive-sync.service").read_text(encoding="utf-8")
+    order_unit = (repo_root / "deploy" / "systemd" / "argon4-order.service").read_text(encoding="utf-8")
+
+    assert "Nice=19" in archive_unit
+    assert "IOSchedulingClass=idle" in archive_unit
+    assert "sync_archive_gdrive.py --no-janitor" in archive_unit
+
+    assert "After=network-online.target argon4-forward.service" in order_unit
+    assert "Wants=argon4-forward.service" in order_unit
+    assert "Requires=argon4-forward.service" not in order_unit
+
+    def _forbid_janitor(*args, **kwargs):
+        raise AssertionError("StorageJanitor.run_maintenance must NOT run under --no-janitor")
+
+    monkeypatch.setattr(sync_archive_gdrive.StorageJanitor, "run_maintenance", _forbid_janitor)
+    monkeypatch.setattr(sync_archive_gdrive.shutil, "which", lambda _name: None)
+
+    rt_dir = tmp_path / "runtime"
+    arch_dir = tmp_path / "archive"
+    rt_dir.mkdir(parents=True)
+    arch_dir.mkdir(parents=True)
+    rc = sync_archive_gdrive.main(
+        ["--runtime", str(rt_dir), "--archive-dir", str(arch_dir), "--no-janitor"]
+    )
+    assert rc == 0
+

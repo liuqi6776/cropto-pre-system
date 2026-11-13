@@ -6332,6 +6332,177 @@ def test_audit_p1_4_void_and_fractional_payout_settlement_verified_and_idempoten
     observer.close()
 
 
+def test_polygon_rpc_session_pooling_and_429_failover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[v14r21] Verify Polygon RPC session pooling, HTTP 429/JSON-RPC error failover,
+    short-circuit on unmined HTTP 200 `{result: null}` receipt, and `.env` POLYGON_RPC_URL priority.
+    """
+    from argon4_live.safety import assert_safe_write_path as _unused  # noqa: F401
+    import requests as _requests
+
+    pk = "0x" + ("91" * 32)
+    cands = derive_polymarket_candidate_wallets(pk)
+    primary_url = "https://rpc-primary.invalid"
+    fallback_url = "https://rpc-fallback.invalid"
+
+    class _FakeResp:
+        def __init__(self, status_code: int, body: dict[str, Any]) -> None:
+            self.status_code = status_code
+            self._body = body
+
+        def json(self) -> dict[str, Any]:
+            return self._body
+
+    # Forbid unpooled bare requests.post so `_rpc_session.post` path is genuinely exercised
+    def _forbid_bare_post(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Expected persistent `_rpc_session.post`, not bare `requests.post`")
+
+    _forbid_bare_post.__module__ = "requests.api"
+    monkeypatch.setattr(_requests, "post", _forbid_bare_post)
+
+    clob = ClobExecutor(
+        mode="shadow",
+        private_key=pk,
+        signature_type=3,
+        funder_address=cands["beacon_deposit_wallet"],
+        polygon_rpc_url=primary_url,
+        polygon_rpc_fallback_urls=[fallback_url],
+        auto_derive_l2_creds=False,
+    )
+    clob_calls: list[tuple[str, str]] = []
+
+    def _clob_session_post(url: str, *, json: dict[str, Any], timeout: float) -> _FakeResp:
+        clob_calls.append((url, str(json.get("method"))))
+        if url == primary_url:
+            return _FakeResp(429, {"error": {"code": 429, "message": "rate limited"}})
+        # Return 125.500000 pUSD (`125_500_000` in 64-char ABI uint256 hex)
+        return _FakeResp(200, {"jsonrpc": "2.0", "id": 1, "result": "0x" + f"{125_500_000:064x}"})
+
+    monkeypatch.setattr(clob._rpc_session, "post", _clob_session_post)
+    bal = clob._query_onchain_erc20_balance(cands["beacon_deposit_wallet"], OFFICIAL_POLYGON_PUSD_ADDRESS)
+    assert bal == Decimal("125.500000")
+    assert clob_calls == [(primary_url, "eth_call"), (fallback_url, "eth_call")]
+
+    redeemer = AutoRedeemer(
+        mode="shadow",
+        withdrawal_permission=False,
+        private_key=pk,
+        funder_address=cands["beacon_deposit_wallet"],
+        signature_type=3,
+        polygon_rpc_url=primary_url,
+        polygon_rpc_fallback_urls=[fallback_url],
+    )
+    red_calls: list[tuple[str, str]] = []
+    receipt_mode = "rate_limit_fallback"
+
+    def _red_session_post(url: str, *, json: dict[str, Any], timeout: float) -> _FakeResp:
+        method = str(json.get("method"))
+        red_calls.append((url, method))
+        if method == "eth_getTransactionReceipt":
+            if receipt_mode == "unmined":
+                return _FakeResp(200, {"jsonrpc": "2.0", "id": 1, "result": None})
+            if url == primary_url:
+                return _FakeResp(429, {"error": "rate_limited"})
+            return _FakeResp(200, {"jsonrpc": "2.0", "id": 1, "result": {"blockNumber": "0x10", "status": "0x1"}})
+        # payoutDenominator -> primary returns JSON-RPC error, fallback succeeds; payoutNumerators -> 50/50 split
+        if url == primary_url:
+            return _FakeResp(200, {"jsonrpc": "2.0", "id": 1, "error": {"code": -32005, "message": "limit exceeded"}})
+        return _FakeResp(200, {"jsonrpc": "2.0", "id": 1, "result": "0x" + f"{100:064x}"})
+
+    monkeypatch.setattr(redeemer._rpc_session, "post", _red_session_post)
+    assert redeemer._verify_onchain_receipt_status("0x" + ("ab" * 32)) == (True, 16)
+    assert red_calls == [(primary_url, "eth_getTransactionReceipt"), (fallback_url, "eth_getTransactionReceipt")]
+
+    # Unmined receipt `{result: null}` on HTTP 200 must short-circuit without probing fallback RPCs
+    red_calls.clear()
+    receipt_mode = "unmined"
+    assert redeemer._verify_onchain_receipt_status("0x" + ("ab" * 32)) == (None, None)
+    assert red_calls == [(primary_url, "eth_getTransactionReceipt")]
+
+    # Multi-call payout ratio lookup fails over cleanly on primary JSON-RPC error
+    red_calls.clear()
+    ratios = redeemer.fetch_onchain_ctf_payout_ratios("0x" + ("cd" * 32))
+    assert ratios == {"UP": 1.0, "DOWN": 1.0}
+    assert any(u == fallback_url for u, _ in red_calls)
+
+    # Verify LiveExecutionEngine.from_config_and_env places .env POLYGON_RPC_URL ahead of live_config URLs
+    local_root = tmp_path / "Order"
+    upstream_root = tmp_path / "crypto-predict_system"
+    _write_json(upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json", {})
+    _write_json(
+        upstream_root / "config/argon4_forward_policy.json",
+        {
+            "initial_capital_usd": 1269.0,
+            "max_order_usd": 240.0,
+            "max_tick_budget_usd": 380.0,
+            "max_active_window_risk_usd": 450.0,
+            "max_open_risk_usd": 650.0,
+            "max_underlying_active_risk_usd": 300.0,
+            "max_underlying_open_risk_usd": 450.0,
+            "max_buy_price": 0.515,
+            "min_buy_price": 0.37,
+            "daily_loss_fraction": 0.15,
+        },
+    )
+    cfg_path = local_root / "config/live_config.json"
+    env_path = local_root / ".env"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    rt_dir = local_root / "runtime"
+    _write_json(
+        cfg_path,
+        {
+            "chain_id": 137,
+            "polygon_rpc_url": "https://polygon.drpc.org",
+            "polygon_rpc_fallback_urls": [
+                "https://polygon-bor-rpc.publicnode.com",
+                "https://polygon-rpc.com",
+            ],
+            "upstream": {
+                "repo_root": str(upstream_root),
+                "pipeline_state_path": str(upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"),
+                "policy_path": str(upstream_root / "config/argon4_forward_policy.json"),
+                "http_base_url": "http://127.0.0.1:9",
+                "required_host_header": "127.0.0.1:9",
+            },
+            "capital_and_scaling": {"live_scale_factor": 1.0},
+            "order_execution": {"order_type": "FAK"},
+            "redemption": {"withdrawal_permission": False, "require_onchain_receipt": True},
+            "audit": {
+                "runtime_dir": str(rt_dir),
+                "sqlite_db": str(rt_dir / "audit.sqlite3"),
+                "orders_jsonl": str(rt_dir / "orders.jsonl"),
+                "quota_snapshots_jsonl": str(rt_dir / "quota.jsonl"),
+                "settlements_jsonl": str(rt_dir / "settlements.jsonl"),
+            },
+        },
+    )
+    env_path.write_text(
+        f"ARGON4_EXECUTION_MODE=shadow\nPOLY_PRIVATE_KEY={pk}\nPOLYGON_RPC_URL=https://alchemy.example/v2/key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("POLYGON_RPC_URL", raising=False)
+    monkeypatch.delenv("POLYGON_RPC_FALLBACK_URLS", raising=False)
+    monkeypatch.delenv("POLY_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("ARGON4_EXECUTION_MODE", raising=False)
+
+    eng = LiveExecutionEngine.from_config_and_env(config_path=cfg_path, env_path=env_path, acquire_instance_lock=True)
+    try:
+        expected_urls = (
+            "https://alchemy.example/v2/key",
+            "https://polygon.drpc.org",
+            "https://polygon-bor-rpc.publicnode.com",
+            "https://polygon-rpc.com",
+        )
+        assert eng.clob.polygon_rpc_urls == expected_urls
+        assert eng.redeemer.polygon_rpc_urls == expected_urls
+    finally:
+        eng.close()
+        clob.close()
+        redeemer.close()
+
+
+
 
 
 

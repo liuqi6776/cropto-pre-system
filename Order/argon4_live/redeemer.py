@@ -27,7 +27,7 @@ import hashlib
 import math
 import re
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import requests
 
 from eth_abi import encode as abi_encode
@@ -55,6 +55,8 @@ from .clob_executor import (
     derive_polymarket_candidate_wallets,
     is_valid_eth_address,
     is_valid_private_key,
+    normalize_rpc_endpoints,
+    post_polygon_json_rpc,
 )
 from .math_utils import USD_MICRO, to_decimal
 from .safety import (
@@ -700,6 +702,7 @@ class AutoRedeemer:
         builder_secret: str | None = None,
         builder_passphrase: str | None = None,
         polygon_rpc_url: str = "https://polygon-rpc.com",
+        polygon_rpc_fallback_urls: Sequence[str] | None = None,
         ctf_address: str = OFFICIAL_CTF_COLLATERAL_ADAPTER_ADDRESS,
         ctf_contract_address: str = OFFICIAL_POLYGON_CTF_ADDRESS,
         neg_risk_adapter_address: str = OFFICIAL_NEG_RISK_COLLATERAL_ADAPTER_ADDRESS,
@@ -716,6 +719,10 @@ class AutoRedeemer:
         self.chain_id = int(chain_id)
         self.signature_type = int(signature_type if signature_type is not None else 2)
         self.polygon_rpc_url = polygon_rpc_url
+        self.polygon_rpc_urls: tuple[str, ...] = normalize_rpc_endpoints(
+            polygon_rpc_url, polygon_rpc_fallback_urls
+        )
+        self._rpc_session = requests.Session()
         self.ctf_address = ctf_address
         self.ctf_contract_address = ctf_contract_address or OFFICIAL_POLYGON_CTF_ADDRESS
         self.neg_risk_adapter_address = neg_risk_adapter_address
@@ -772,6 +779,21 @@ class AutoRedeemer:
                 relayer_api_secret=secret_clean if has_relayer_secret else "",
             )
 
+    def close(self) -> None:
+        """Close persistent HTTP sessions held by AutoRedeemer."""
+        try:
+            self._rpc_session.close()
+        except Exception:
+            pass
+
+    def _post_polygon_rpc(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        timeout: float = 2.0,
+    ) -> Mapping[str, Any] | None:
+        return post_polygon_json_rpc(self._rpc_session, self.polygon_rpc_urls, payload, timeout=timeout)
+
     def _verify_onchain_receipt_status(self, tx_hash: str) -> tuple[bool | None, int | None]:
         """Check Polygon RPC `eth_getTransactionReceipt`.
 
@@ -783,15 +805,12 @@ class AutoRedeemer:
         if not tx_hash or not str(tx_hash).startswith("0x"):
             return None, None
         try:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "eth_getTransactionReceipt",
-                "params": [str(tx_hash)],
-            }
-            resp = requests.post(self.polygon_rpc_url, json=payload, timeout=2.0)
-            if resp.status_code == 200:
-                res = resp.json().get("result")
+            body = self._post_polygon_rpc(
+                {"jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionReceipt", "params": [str(tx_hash)]},
+                timeout=2.0,
+            )
+            if body is not None:
+                res = body.get("result")
                 if isinstance(res, Mapping) and res.get("blockNumber"):
                     blk = int(str(res["blockNumber"]), 16)
                     st = res.get("status")
@@ -1107,7 +1126,7 @@ class AutoRedeemer:
     ) -> dict[str, float] | None:
         """Query Polygon CTF `payoutDenominator` and `payoutNumerators` via `eth_call` (fail-closed -> None)."""
         cond_clean = str(condition_id or "").strip()
-        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", cond_clean) or not self.polygon_rpc_url:
+        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", cond_clean) or not self.polygon_rpc_urls:
             return None
         try:
             denom_sel = "0x" + keccak(b"payoutDenominator(bytes32)").hex()[:8]
@@ -1115,9 +1134,8 @@ class AutoRedeemer:
             cond_arg = bytes.fromhex(cond_clean[2:])
 
             def _eth_call_uint(data_hex: str) -> int | None:
-                resp = requests.post(
-                    self.polygon_rpc_url,
-                    json={
+                body = self._post_polygon_rpc(
+                    {
                         "jsonrpc": "2.0",
                         "id": 1,
                         "method": "eth_call",
@@ -1125,9 +1143,9 @@ class AutoRedeemer:
                     },
                     timeout=3.0,
                 )
-                if resp.status_code != 200:
+                if body is None:
                     return None
-                raw_res = str((resp.json() or {}).get("result") or "")
+                raw_res = str(body.get("result") or "")
                 if not raw_res.startswith("0x") or len(raw_res) < 3:
                     return None
                 return int(raw_res, 16)

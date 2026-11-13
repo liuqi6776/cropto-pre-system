@@ -27,7 +27,7 @@ import json
 import logging
 from pathlib import Path
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 import requests
 
 from eth_account import Account as EthAccount
@@ -155,6 +155,52 @@ def _parse_base_unit_collateral(raw_val: Any) -> Decimal | None:
     return dec.quantize(USD_MICRO, rounding=ROUND_DOWN)
 
 
+def normalize_rpc_endpoints(
+    primary_url: str | None,
+    fallback_urls: Sequence[str] | None = None,
+) -> tuple[str, ...]:
+    """Return deduplicated non-empty RPC endpoints ordered with `primary_url` first."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw in [primary_url, *(fallback_urls or ())]:
+        u = str(raw or "").strip()
+        if u and u not in seen:
+            seen.add(u)
+            ordered.append(u)
+    return tuple(ordered)
+
+
+def post_polygon_json_rpc(
+    session: requests.Session,
+    rpc_urls: Sequence[str],
+    payload: Mapping[str, Any],
+    *,
+    timeout: float = 2.0,
+) -> Mapping[str, Any] | None:
+    """Execute JSON-RPC POST via persistent keep-alive session (unless `requests.post` is monkeypatched)
+    with automatic failover across `rpc_urls` on HTTP 429/5xx, timeout, or JSON-RPC error.
+    """
+    if not rpc_urls:
+        return None
+    post_fn = (
+        session.post
+        if getattr(requests.post, "__module__", "").startswith("requests")
+        else requests.post
+    )
+    req_body = dict(payload)
+    for rpc_url in rpc_urls:
+        try:
+            resp = post_fn(rpc_url, json=req_body, timeout=timeout)
+            if resp.status_code != 200:
+                continue
+            body = resp.json()
+            if isinstance(body, Mapping) and not body.get("error"):
+                return body
+        except Exception:
+            continue
+    return None
+
+
 class ClobExecutor:
     """Persistent Polymarket CLOB V2 client with zero-GET local signing and FAK execution."""
 
@@ -171,6 +217,7 @@ class ClobExecutor:
         signature_type: int | None = None,
         funder_address: str | None = None,
         polygon_rpc_url: str = "https://polygon-rpc.com",
+        polygon_rpc_fallback_urls: Sequence[str] | None = None,
         pusd_collateral_address: str = OFFICIAL_POLYGON_PUSD_ADDRESS,
         default_tick_size: str = "0.01",
         default_clob_fee_rate_bps: int = 1000,
@@ -190,6 +237,9 @@ class ClobExecutor:
         self.relayer_host = relayer_host.rstrip("/")
         self.chain_id = int(chain_id)
         self.polygon_rpc_url = polygon_rpc_url
+        self.polygon_rpc_urls: tuple[str, ...] = normalize_rpc_endpoints(
+            polygon_rpc_url, polygon_rpc_fallback_urls
+        )
         self.pusd_collateral_address = pusd_collateral_address
         self.default_tick_size = str(default_tick_size)
         self.default_clob_fee_rate_bps = int(default_clob_fee_rate_bps)
@@ -318,6 +368,21 @@ class ClobExecutor:
                     "Ensure your Polymarket wallet is deployed or set POLY_FUNDER_ADDRESS and POLY_SIGNATURE_TYPE in .env."
                 )
 
+    def close(self) -> None:
+        """Close persistent HTTP sessions held by the CLOB executor."""
+        try:
+            self._rpc_session.close()
+        except Exception:
+            pass
+
+    def _post_polygon_rpc(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        timeout: float = 2.0,
+    ) -> Mapping[str, Any] | None:
+        return post_polygon_json_rpc(self._rpc_session, self.polygon_rpc_urls, payload, timeout=timeout)
+
     def _resolve_and_verify_wallet(
         self,
         explicit_funder: str,
@@ -410,20 +475,12 @@ class ClobExecutor:
         except Exception:
             pass
         try:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "eth_getCode",
-                "params": [address, "latest"],
-            }
-            post_fn = (
-                self._rpc_session.post
-                if getattr(requests.post, "__module__", "").startswith("requests")
-                else requests.post
+            body = self._post_polygon_rpc(
+                {"jsonrpc": "2.0", "id": 1, "method": "eth_getCode", "params": [address, "latest"]},
+                timeout=1.2,
             )
-            resp = post_fn(self.polygon_rpc_url, json=payload, timeout=1.2)
-            if resp.status_code == 200:
-                code = resp.json().get("result")
+            if body is not None:
+                code = body.get("result")
                 if isinstance(code, str) and code.startswith("0x") and len(code) > 2 and int(code, 16) != 0:
                     return True
         except Exception:
@@ -436,15 +493,17 @@ class ClobExecutor:
         try:
             padded_addr = holder[2:].lower().rjust(64, "0")
             data_hex = "0x70a08231" + padded_addr
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "eth_call",
-                "params": [{"to": token_address, "data": data_hex}, "latest"],
-            }
-            resp = requests.post(self.polygon_rpc_url, json=payload, timeout=2.0)
-            if resp.status_code == 200:
-                hex_val = resp.json().get("result")
+            body = self._post_polygon_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_call",
+                    "params": [{"to": token_address, "data": data_hex}, "latest"],
+                },
+                timeout=2.0,
+            )
+            if body is not None:
+                hex_val = body.get("result")
                 if isinstance(hex_val, str) and hex_val.startswith("0x") and len(hex_val) > 2:
                     atoms = int(hex_val, 16)
                     return (Decimal(atoms) / Decimal("1000000")).quantize(USD_MICRO, rounding=ROUND_DOWN)
@@ -1834,20 +1893,12 @@ class ClobExecutor:
         if not tx_hash or not str(tx_hash).startswith("0x"):
             return False, None
         try:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "eth_getTransactionReceipt",
-                "params": [str(tx_hash)],
-            }
-            post_fn = (
-                self._rpc_session.post
-                if getattr(requests.post, "__module__", "").startswith("requests")
-                else requests.post
+            body = self._post_polygon_rpc(
+                {"jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionReceipt", "params": [str(tx_hash)]},
+                timeout=1.2,
             )
-            resp = post_fn(self.polygon_rpc_url, json=payload, timeout=1.2)
-            if resp.status_code == 200:
-                res = resp.json().get("result")
+            if body is not None:
+                res = body.get("result")
                 if isinstance(res, Mapping) and res.get("blockNumber"):
                     block_num = int(str(res["blockNumber"]), 16)
                     raw_status = res.get("status")

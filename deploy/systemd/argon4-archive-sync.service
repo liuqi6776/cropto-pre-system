@@ -7,4 +7,6 @@ Type=oneshot
 User=liuqi
 Group=liuqi
 WorkingDirectory=/data/crypto-predict_system
-ExecStart=/data/crypto-predict_system/.venv/bin/python -B /data/crypto-predict_system/scripts/sync_archive_gdrive.py
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/data/crypto-predict_system/.venv/bin/python -B /data/crypto-predict_system/scripts/sync_archive_gdrive.py --no-janitor

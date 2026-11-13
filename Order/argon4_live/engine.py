@@ -211,7 +211,18 @@ class LiveExecutionEngine:
             funder_address = os.getenv("POLY_FUNDER_ADDRESS", "")
             raw_sig_env = os.getenv("POLY_SIGNATURE_TYPE", "").strip()
             sig_type: int | None = int(raw_sig_env) if raw_sig_env else None
-            rpc_url = os.getenv("POLYGON_RPC_URL", cfg.get("polygon_rpc_url", "https://polygon-rpc.com"))
+            cfg_rpc_url = str(cfg.get("polygon_rpc_url") or "https://polygon-rpc.com").strip()
+            env_rpc_url = os.getenv("POLYGON_RPC_URL", "").strip()
+            rpc_url = env_rpc_url or cfg_rpc_url
+            raw_env_fallbacks = os.getenv("POLYGON_RPC_FALLBACK_URLS", "").strip()
+            cfg_fallbacks = cfg.get("polygon_rpc_fallback_urls")
+            rpc_fallbacks: list[str] = []
+            if raw_env_fallbacks:
+                rpc_fallbacks.extend(x.strip() for x in raw_env_fallbacks.split(",") if x.strip())
+            elif isinstance(cfg_fallbacks, (list, tuple)):
+                rpc_fallbacks.extend(str(x).strip() for x in cfg_fallbacks if str(x).strip())
+            if env_rpc_url and cfg_rpc_url and cfg_rpc_url != env_rpc_url:
+                rpc_fallbacks.insert(0, cfg_rpc_url)
             creds_cache_path = Path(mode_paths["runtime_dir"]) / ".derived_clob_creds.json"
             pusd_addr = red_cfg.get("pusd_collateral_address", OFFICIAL_POLYGON_PUSD_ADDRESS)
 
@@ -227,6 +238,7 @@ class LiveExecutionEngine:
                 signature_type=sig_type,
                 funder_address=funder_address,
                 polygon_rpc_url=rpc_url,
+                polygon_rpc_fallback_urls=rpc_fallbacks,
                 pusd_collateral_address=pusd_addr,
                 default_tick_size=str(exec_cfg.get("default_tick_size", "0.01")),
                 default_clob_fee_rate_bps=int(exec_cfg.get("default_clob_fee_rate_bps", 1000)),
@@ -251,6 +263,7 @@ class LiveExecutionEngine:
                 builder_secret=os.getenv("POLY_BUILDER_SECRET", ""),
                 builder_passphrase=os.getenv("POLY_BUILDER_PASSPHRASE", ""),
                 polygon_rpc_url=rpc_url,
+                polygon_rpc_fallback_urls=rpc_fallbacks,
                 ctf_address=red_cfg.get("ctf_collateral_adapter_address", OFFICIAL_CTF_COLLATERAL_ADAPTER_ADDRESS),
                 ctf_contract_address=red_cfg.get("ctf_contract_address", OFFICIAL_POLYGON_CTF_ADDRESS),
                 neg_risk_adapter_address=red_cfg.get(
@@ -277,6 +290,13 @@ class LiveExecutionEngine:
 
     def close(self) -> None:
         self.observer.close()
+        for client in (self.clob, self.redeemer):
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
         if self.instance_lock is not None:
             self.instance_lock.release()
 

@@ -8,6 +8,11 @@
   "gamma_host": "https://gamma-api.polymarket.com",
   "data_host": "https://data-api.polymarket.com",
   "polygon_rpc_url": "https://polygon.drpc.org",
+  "polygon_rpc_fallback_urls": [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://1rpc.io/matic",
+    "https://polygon-rpc.com"
+  ],
   "upstream": {
     "repo_root": "/data/crypto-predict_system",
     "runtime_dir": "/data/crypto-predict_system/paper_runtime/argon4_forward_20261105",
