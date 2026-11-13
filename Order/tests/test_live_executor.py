@@ -5048,6 +5048,36 @@ def test_policy_hot_reload_and_dynamic_daily_loss_cap(tmp_path: Path) -> None:
     assert caps_new["max_open_risk_usd"] == 650.0
     loss_cap_new, _, _ = engine._live_loss_limits(Decimal("1.0"))
     assert loss_cap_new == Decimal("190.350000")
+
+    # Verify compounding equity scaling: after +$1,131.00 realized profit on prior UTC day ($1,269 -> $2,400),
+    # today's daily_loss_cap scales dynamically to $2,400 * 0.15 = $360.00!
+    with audit._connection() as con:
+        con.execute(
+            """
+            INSERT INTO live_settlements (
+                market_id, condition_id, official_outcome, paper_payout_usd,
+                live_expected_payout_usdc, redeem_status, redeemed_usdc_amount,
+                live_cost_usdc, live_realized_pnl_usdc, settled_at_utc, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "mkt-prior-win",
+                "0x" + ("ab" * 32),
+                "UP",
+                2131.0,
+                2131.0,
+                "REDEEMED",
+                2131.0,
+                1000.0,
+                1131.0,
+                "2026-11-12T18:00:00+00:00",
+                "{}",
+            ),
+        )
+    loss_cap_compounded, _, _ = engine._live_loss_limits(
+        Decimal("1.0"), now_utc=datetime(2026, 11, 13, 2, 0, tzinfo=timezone.utc)
+    )
+    assert loss_cap_compounded == Decimal("360.000000")
     observer.close()
 
 

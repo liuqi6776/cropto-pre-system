@@ -296,7 +296,7 @@ class LiveExecutionEngine:
             "max_buy_price": float(policy.get("max_buy_price", 0.515)),
         }
 
-    def _live_loss_limits(self, scale_dec: Decimal) -> tuple[Decimal, int, float]:
+    def _live_loss_limits(self, scale_dec: Decimal, now_utc: datetime | None = None) -> tuple[Decimal, int, float]:
         if self.max_daily_loss_usd_override is not None:
             daily_loss_cap = to_decimal(self.max_daily_loss_usd_override, "max_daily_realized_loss_usd")
         else:
@@ -304,12 +304,21 @@ class LiveExecutionEngine:
             init_cap = policy.get("initial_capital_usd")
             loss_frac = policy.get("daily_loss_fraction")
             if init_cap is not None and loss_frac is not None:
-                paper_daily_loss = to_decimal(init_cap, "initial_capital_usd") * to_decimal(loss_frac, "daily_loss_fraction")
+                base_live_cap = scale_dec * to_decimal(init_cap, "initial_capital_usd")
+                prior_live_pnl = (
+                    self.audit.get_prior_days_realized_pnl_usdc(now_utc)
+                    if hasattr(self.audit, "get_prior_days_realized_pnl_usdc")
+                    else Decimal("0")
+                )
+                day_start_live_equity = max(Decimal("0"), base_live_cap + prior_live_pnl)
+                daily_loss_cap = (
+                    day_start_live_equity * to_decimal(loss_frac, "daily_loss_fraction")
+                ).quantize(USD_MICRO, rounding=ROUND_DOWN)
             else:
                 paper_daily_loss = to_decimal(self.paper_max_daily_loss_usd)
-            daily_loss_cap = (scale_dec * paper_daily_loss).quantize(
-                USD_MICRO, rounding=ROUND_DOWN
-            )
+                daily_loss_cap = (scale_dec * paper_daily_loss).quantize(
+                    USD_MICRO, rounding=ROUND_DOWN
+                )
         return daily_loss_cap, self.max_consecutive_losses, self.cooldown_minutes_after_consecutive_losses
 
     def _wait_retry_interval(self, seconds: float) -> bool:
@@ -353,7 +362,7 @@ class LiveExecutionEngine:
         has_multiple_candidates = len(candidates) > 1
         paper_caps = self._paper_risk_caps()
         scale_dec = to_decimal(self.live_scale_factor, "live_scale_factor")
-        daily_loss_cap, max_consec_losses, cooldown_mins = self._live_loss_limits(scale_dec)
+        daily_loss_cap, max_consec_losses, cooldown_mins = self._live_loss_limits(scale_dec, now_utc=detected_local)
         min_buy_price = paper_caps.get("min_buy_price", 0.37)
         max_buy_price = paper_caps.get("max_buy_price", 0.515)
 

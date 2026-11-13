@@ -172,7 +172,6 @@
     "SOL_5m": "4e1bae288125d21a220d853b9122c0b3062ebd04f11c9b207368ad03c7290379",
     "BNB_15m": "90f90df773353bf4d7f1bc196f617847a1d358f157dd1e6a42f988c6fdcc085e"
   },
-  "min_decision_delay_seconds": 3.8,
   "input_revision_policy": {
     "scope": "OBSERVED_FUTURES_5M_1H_AND_MARK_1H_VIEWS_ONLY",
     "confirming_receipts": 2,
@@ -311,7 +310,9 @@
       "BTC_15m": 28.0,
       "BTC_5m": 28.0,
       "ETH_5m": 35.0,
-      "ETH_15m": 35.0
+      "ETH_15m": 35.0,
+      "SOL_15m": 42.0,
+      "SOL_5m": 42.0
     },
     "min_rv12_bps": {
       "BTC_15m": 2.5,
@@ -326,6 +327,45 @@
       "ETH_5m": 4.0,
       "SOL_5m": 4.0
     },
+    "us_holiday_use_weekend_min_rv12": true,
+    "us_macro_830_blackout": {
+      "enabled": true,
+      "timezone": "America/New_York",
+      "local_start_minute": 505,
+      "local_end_minute": 545,
+      "weekdays_only": true,
+      "mode": "SHOCK_TRIGGERED",
+      "min_btc_vol_surge_24": 2.8,
+      "min_btc_bar1_range_bps": 25.0,
+      "note": "08:25-09:05 ET Mon-Fri: blocks CPI/NFP/PPI/PCE/Jobless violent macro shock prints while keeping quiet mornings open",
+      "skip_streams": [
+        "BTC_15m",
+        "ETH_5m",
+        "ETH_15m",
+        "BTC_5m",
+        "SOL_15m",
+        "SOL_5m"
+      ]
+    },
+    "weekend_dead_zone_blackout": {
+      "enabled": true,
+      "timezone": "Asia/Shanghai",
+      "weekdays_local": [
+        5,
+        6
+      ],
+      "local_start_minute": 240,
+      "local_end_minute": 300,
+      "note": "Sat & Sun 04:00-05:00 BJT (Fri/Sat 20:00-21:00 UTC): blocks CME Friday close final hour & Sunday global liquidity dead trough",
+      "skip_streams": [
+        "BTC_15m",
+        "ETH_5m",
+        "ETH_15m",
+        "BTC_5m",
+        "SOL_15m",
+        "SOL_5m"
+      ]
+    },
     "us_open_blackout": {
       "enabled": true,
       "timezone": "America/New_York",
@@ -333,10 +373,12 @@
       "local_end_minute": 660,
       "weekdays_only": true,
       "skip_streams": [
-        "ETH_5m",
-        "BTC_5m",
         "BTC_15m",
-        "ETH_15m"
+        "ETH_5m",
+        "ETH_15m",
+        "BTC_5m",
+        "SOL_15m",
+        "SOL_5m"
       ]
     },
     "us_close_blackout": {
@@ -432,9 +474,14 @@
     "enabled": true,
     "scan_interval_days": 14,
     "retain_hot_days": 14,
-    "cold_archive_root": "D:/argon4_cold_archive",
+    "cold_archive_root": "/data/archive",
     "max_hot_observations_mb": 15000,
     "max_hot_total_gb": 35.0,
+    "max_cold_total_gb": 88.0,
+    "strip_revision_sqlite": true,
+    "compress_cold_files": true,
+    "extract_trade_keyframes": true,
+    "external_order_runtime": "/data/Order/runtime",
     "allowed_window_seconds_Range": [
       95,
       210

@@ -1449,14 +1449,21 @@ def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_p
     assert vg["us_open_blackout"]["local_start_minute"] == 570
     assert vg["us_open_blackout"]["local_end_minute"] == 660
     assert vg["us_open_blackout"]["weekdays_only"] is True
-    assert set(vg["us_open_blackout"]["skip_streams"]) == {"ETH_5m", "BTC_5m", "BTC_15m", "ETH_15m"}
+    assert set(vg["us_open_blackout"]["skip_streams"]) == {
+        "BTC_15m",
+        "ETH_5m",
+        "ETH_15m",
+        "BTC_5m",
+        "SOL_15m",
+        "SOL_5m",
+    }
     assert vg["macro_trend_guard"]["enabled"] is True
     assert vg["macro_trend_guard"]["max_btc_4h_abs_return_pct"] == pytest.approx(2.0)
     assert vg["macro_trend_guard"]["skip_1h_momentum_chase_above_pct"] == pytest.approx(0.3)
 
     base_pred = {"selected": True, "side": "DOWN", "z_v4": -0.52}
 
-    # 1. Weekday 15:10 UTC (Monday 2026-11-09 15:10:00Z, minute=910): ETH_5m & BTC_5m skipped, SOL_5m allowed!
+    # 1. Weekday 15:10 UTC (Monday 2026-11-09 15:10:00Z, minute=910): all 6 streams including SOL_5m skipped!
     res_eth_open = model_v14.apply_volatility_regime_guard(
         "ETH_5m",
         base_pred,
@@ -1487,10 +1494,11 @@ def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_p
         ex_ante_rv12_bps=10.0,
         guard_config=vg,
         cohort_time="2026-11-09T15:10:00+00:00",
-        btc_ret_1h_pct=0.45,  # BTC +0.45% and buying DOWN = mean reversion (not momentum chase)
+        btc_ret_1h_pct=0.45,
         btc_ret_4h_pct=0.80,
     )
-    assert res_sol_open["selected"] is True
+    assert res_sol_open["selected"] is False
+    assert res_sol_open["volatility_regime_reason"] == "US_OPEN_BLACKOUT"
 
     # Weekend 15:10 UTC (Sunday 2026-11-08 15:10:00Z): ETH_5m is NOT blocked by US_OPEN_BLACKOUT
     res_eth_sun = model_v14.apply_volatility_regime_guard(
@@ -1875,13 +1883,13 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         "z_v4": 1.5944,
         "threshold_frozen": 1.5204,
     }
-    # Under production v14r15 black-swan thresholds, normal oversold bounce (-2.18% 1h / -163.2 bps 15m) is preserved
+    # Under production v14r15 black-swan thresholds, normal oversold bounce (-2.18% 1h / -163.2 bps 15m) outside US Open is preserved
     res_sol_prod = model_v14.apply_volatility_regime_guard(
         "SOL_5m",
         sol_pred,
         ex_ante_rv12_bps=18.2,
         guard_config=vg,
-        cohort_time="2026-11-10T15:40:00+00:00",
+        cohort_time="2026-11-10T16:40:00+00:00",
         btc_ret_1h_pct=-0.41,
         btc_ret_4h_pct=-1.50,
         own_ret_1h_pct=-2.18,
@@ -1897,7 +1905,7 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         sol_pred,
         ex_ante_rv12_bps=18.2,
         guard_config=vg,
-        cohort_time="2026-11-10T15:40:00+00:00",
+        cohort_time="2026-11-10T16:40:00+00:00",
         btc_ret_1h_pct=-0.41,
         btc_ret_4h_pct=-1.50,
         own_ret_1h_pct=-4.25,
@@ -1918,7 +1926,7 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         sol_pred,
         ex_ante_rv12_bps=18.2,
         guard_config=vg_unit,
-        cohort_time="2026-11-10T15:40:00+00:00",
+        cohort_time="2026-11-10T16:40:00+00:00",
         btc_ret_1h_pct=-0.41,
         btc_ret_4h_pct=-1.50,
         own_ret_1h_pct=-2.18,
@@ -1933,7 +1941,7 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         sol_pred,
         ex_ante_rv12_bps=18.2,
         guard_config=vg_unit,
-        cohort_time="2026-11-10T15:40:00+00:00",
+        cohort_time="2026-11-10T16:40:00+00:00",
         btc_ret_1h_pct=-0.41,
         btc_ret_4h_pct=-1.50,
         own_ret_1h_pct=-1.10,
@@ -2382,7 +2390,8 @@ def test_v14r16_time_segmented_playbook_us_close_sunday_reopen_weekend_rv12_and_
     r_open_edt_sol = model_v14.apply_volatility_regime_guard(
         "SOL_5m", pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time="2026-07-15T13:45:00+00:00"
     )
-    assert r_open_edt_sol["selected"] is True
+    assert r_open_edt_sol["selected"] is False
+    assert r_open_edt_sol["volatility_regime_reason"] == "US_OPEN_BLACKOUT"
     r_open_legacy = model_v14.apply_volatility_regime_guard(
         "ETH_5m",
         pred,
@@ -2652,6 +2661,101 @@ def test_v14r17_hourly_fastpath_and_skewed_clock_retry_budget(tmp_path, monkeypa
         assert calls[-1]["retry_borderline"] is True
     finally:
         p.close()
+
+
+def test_v14r18_precision_guards_nyse_holiday_and_policy_hygiene():
+    """Verify v14r18 optimizations:
+    1. No duplicate keys in config/argon4_forward_policy.json.
+    2. US Macro 08:30 ET shock guard (08:25-09:05 ET) blocks >=2.8x & >=25bp CPI shock while allowing quiet mornings.
+    3. SOL_5m & SOL_15m capped at 42.0 bps max_rv12_bps and blocked during US Open (09:30-11:00 ET).
+    4. Weekend 04:00-05:00 BJT dead-zone blackout blocks Sat & Sun 04:00-04:55 BJT and allows 05:00 BJT.
+    5. Algorithmic NYSE holiday detector applies weekend_min_rv12_bps (4.0 bps) on Thanksgiving & Christmas.
+    """
+    raw_policy_text = Path("config/argon4_forward_policy.json").read_text(encoding="utf-8")
+
+    def _reject_dup_keys(pairs):
+        seen = {}
+        for k, v in pairs:
+            if k in seen:
+                raise ValueError(f"duplicate JSON key: {k}")
+            seen[k] = v
+        return seen
+
+    policy = json.loads(raw_policy_text, object_pairs_hook=_reject_dup_keys)
+    assert policy["min_decision_delay_seconds"] == pytest.approx(1.8)
+    vg = policy["volatility_regime_guard"]
+    assert vg["max_rv12_bps"]["SOL_15m"] == pytest.approx(42.0)
+    assert vg["max_rv12_bps"]["SOL_5m"] == pytest.approx(42.0)
+    assert vg["us_holiday_use_weekend_min_rv12"] is True
+
+    base_pred = {"selected": True, "side": "UP", "z_v4": 2.05, "threshold_frozen": 1.65}
+
+    # 1. Quiet 08:35 EST morning (13:35 UTC on Fri 2026-11-13) passes; CPI shock (3.4x vol & 32bp range) blocks
+    quiet_830 = model_v14.apply_volatility_regime_guard(
+        "BTC_5m",
+        base_pred,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-13T13:35:00+00:00",
+        btc_vol_surge_24=1.4,
+        btc_bar1_range_bps=12.0,
+    )
+    assert quiet_830["selected"] is True
+
+    cpi_830 = model_v14.apply_volatility_regime_guard(
+        "BTC_5m",
+        base_pred,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-13T13:35:00+00:00",
+        btc_vol_surge_24=3.4,
+        btc_bar1_range_bps=32.0,
+    )
+    assert cpi_830["selected"] is False
+    assert cpi_830["volatility_regime_reason"] == "US_MACRO_830_BLACKOUT"
+
+    # 2. SOL > 42.0 bps rv12 blocked by ABOVE_MAX_RV12_BPS
+    sol_spike = model_v14.apply_volatility_regime_guard(
+        "SOL_5m", base_pred, ex_ante_rv12_bps=44.5, guard_config=vg, cohort_time="2026-11-13T06:15:00+00:00"
+    )
+    assert sol_spike["selected"] is False
+    assert sol_spike["volatility_regime_reason"] == "ABOVE_MAX_RV12_BPS"
+
+    # 3. Weekend 04:00-05:00 BJT (Fri/Sat 20:00-20:55 UTC) blocked, 05:00 BJT (21:00 UTC) allowed
+    sat_0415_bjt = model_v14.apply_volatility_regime_guard(
+        "ETH_5m", base_pred, ex_ante_rv12_bps=9.0, guard_config=vg, cohort_time="2026-11-13T20:15:00+00:00"
+    )
+    assert sat_0415_bjt["selected"] is False
+    assert sat_0415_bjt["volatility_regime_reason"] == "WEEKEND_DEAD_ZONE_BLACKOUT"
+
+    sun_0445_bjt = model_v14.apply_volatility_regime_guard(
+        "BTC_15m", base_pred, ex_ante_rv12_bps=9.0, guard_config=vg, cohort_time="2026-11-14T20:45:00+00:00"
+    )
+    assert sun_0445_bjt["selected"] is False
+    assert sun_0445_bjt["volatility_regime_reason"] == "WEEKEND_DEAD_ZONE_BLACKOUT"
+
+    sat_0505_bjt = model_v14.apply_volatility_regime_guard(
+        "ETH_5m", base_pred, ex_ante_rv12_bps=9.0, guard_config=vg, cohort_time="2026-11-13T21:05:00+00:00"
+    )
+    assert sat_0505_bjt["selected"] is True
+
+    # 4. NYSE Holidays: Thanksgiving (Thu 2026-11-26) & Christmas (Fri 2026-12-25) enforce weekend_min_rv12_bps=4.0 on 5m!
+    assert model_v14.is_nyse_market_holiday(pd.Timestamp("2026-11-26T18:00:00Z")) is True
+    assert model_v14.is_nyse_market_holiday(pd.Timestamp("2026-12-25T18:00:00Z")) is True
+    assert model_v14.is_nyse_market_holiday(pd.Timestamp("2026-11-24T18:00:00Z")) is False
+
+    thx_dead_5m = model_v14.apply_volatility_regime_guard(
+        "BTC_5m", base_pred, ex_ante_rv12_bps=3.5, guard_config=vg, cohort_time="2026-11-26T18:05:00+00:00"
+    )
+    assert thx_dead_5m["selected"] is False
+    assert thx_dead_5m["volatility_regime_reason"] == "BELOW_MIN_RV12_BPS"
+    assert thx_dead_5m["volatility_regime_min_rv12_bps"] == pytest.approx(4.0)
+
+    norm_tue_5m = model_v14.apply_volatility_regime_guard(
+        "BTC_5m", base_pred, ex_ante_rv12_bps=3.5, guard_config=vg, cohort_time="2026-11-24T18:05:00+00:00"
+    )
+    assert norm_tue_5m["selected"] is True
+
 
 
 

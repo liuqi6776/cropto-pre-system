@@ -26,7 +26,12 @@ APPEND_PROOF_FILE = "mark_append_baseline_proofs.json"
 
 def _sha(path):
     with Path(path).open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+        if hasattr(hashlib, "file_digest"):
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+        return digest.hexdigest()
 
 
 def _digest(value):

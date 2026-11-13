@@ -713,6 +713,9 @@ class ForwardPipeline:
                         for sym in due_symbols:
                             frames[sym], self._decision_timing["features_seconds"][sym] = fut_map[sym].result()
                 self._decision_timing["features_parallel_wall_seconds"] = time.perf_counter() - wall_t0
+        staged = []
+        for stream in policy["order"]:
+            decisions.setdefault(stream, None)
         for stream in policy["order"]:
             if stream in profile["disabled_streams"]:
                 decisions[stream] = disabled_decision(profile)
@@ -748,13 +751,13 @@ class ForwardPipeline:
             score_kwargs = {"bundle": self.bundles[stream]}
             if threshold_override is not None:
                 score_kwargs["threshold_override"] = threshold_override
-            score = predict_stream(stream, f["base"], f["expert"], calibrated_now(self.clock), **score_kwargs)
+            raw_score = predict_stream(stream, f["base"], f["expert"], calibrated_now(self.clock), **score_kwargs)
+            score = raw_score
             if rv12_cache[symbol] is not None or vol_guard is not None:
                 own_rets = own_rets_cache.get(symbol) or {}
-                cached_s1 = spot_1m_cache.get(symbol) if isinstance(spot_1m_cache.get(symbol), dict) else None
                 score = apply_volatility_regime_guard(
                     stream,
-                    score,
+                    raw_score,
                     ex_ante_rv12_bps=rv12_cache[symbol],
                     guard_config=vol_guard,
                     cohort_time=cohort,
@@ -762,57 +765,80 @@ class ForwardPipeline:
                     btc_ret_2h_pct=btc_macro_rets.get("btc_ret_2h_pct"),
                     btc_ret_4h_pct=btc_macro_rets.get("btc_ret_4h_pct"),
                     btc_ema_gap_bps=btc_macro_rets.get("btc_ema_gap_bps"),
+                    btc_vol_surge_24=btc_macro_rets.get("btc_vol_surge_24"),
+                    btc_bar1_range_bps=btc_macro_rets.get("btc_bar1_range_bps"),
                     own_ret_1h_pct=own_rets.get("own_ret_1h_pct"),
                     own_ret_15m_bps=own_rets.get("own_ret_15m_bps"),
                     own_streak_3bar=own_rets.get("own_streak_3bar"),
-                    spot_twap60_t=cached_s1.get("twap60") if cached_s1 and cached_s1.get("status") == "OBSERVED" else None,
-                    spot_close_t=cached_s1.get("spot_close") if cached_s1 and cached_s1.get("status") == "OBSERVED" else None,
                 )
-                if (hcap_guard_enabled and score.get("selected") is True
-                        and symbol not in spot_1m_cache
-                        and hasattr(self.inputs, "capture_spot_1m_twap60")):
-                    rem_win = (cohort + timedelta(seconds=18.5) - calibrated_now(self.clock)).total_seconds()
-                    timeout_s = float(hcap_guard_cfg.get("timeout_seconds", 1.2))
-                    if rem_win > 0.15:
-                        dl_mono = time.monotonic() + min(timeout_s, rem_win)
-                        try:
-                            s1_obs = self.inputs.capture_spot_1m_twap60(
-                                symbol, cohort, cohort_id=cohort.isoformat(), deadline_monotonic=dl_mono
-                            )
-                        except Exception as exc:
-                            s1_obs = {"status": "ERROR", "symbol": symbol, "cohort_id": cohort.isoformat(),
-                                      "error": f"{type(exc).__name__}:{str(exc)[:120]}"}
-                    else:
-                        s1_obs = {"status": "DEADLINE_SKIPPED", "symbol": symbol, "cohort_id": cohort.isoformat()}
-                    spot_1m_cache[symbol] = s1_obs
-                    if s1_obs.get("status") == "OBSERVED":
-                        score = apply_volatility_regime_guard(
-                            stream,
-                            score,
-                            ex_ante_rv12_bps=rv12_cache[symbol],
-                            guard_config=vol_guard,
-                            cohort_time=cohort,
-                            btc_ret_1h_pct=btc_macro_rets.get("btc_ret_1h_pct"),
-                            btc_ret_2h_pct=btc_macro_rets.get("btc_ret_2h_pct"),
-                            btc_ret_4h_pct=btc_macro_rets.get("btc_ret_4h_pct"),
-                            btc_ema_gap_bps=btc_macro_rets.get("btc_ema_gap_bps"),
-                            own_ret_1h_pct=own_rets.get("own_ret_1h_pct"),
-                            own_ret_15m_bps=own_rets.get("own_ret_15m_bps"),
-                            own_streak_3bar=own_rets.get("own_streak_3bar"),
-                            spot_twap60_t=s1_obs["twap60"],
-                            spot_close_t=s1_obs["spot_close"],
-                        )
-                        score["spot_1m_receipt_sha256"] = s1_obs.get("receipt_sha256")
-                    elif str(hcap_guard_cfg.get("on_unavailable", "PASS_WITH_WARNING")).upper() == "SKIP":
-                        score = {
-                            **score,
-                            "volatility_regime_guarded": True,
-                            "volatility_regime_reason": "TWAP60_SPOT_1M_UNAVAILABLE",
-                            "selected": False,
-                        }
-                elif cached_s1 and cached_s1.get("status") == "OBSERVED":
-                    score["spot_1m_receipt_sha256"] = cached_s1.get("receipt_sha256")
             self._decision_timing["inference_seconds"][stream] = time.perf_counter()-started
+            staged.append((stream, underlying, duration, symbol, raw_score, score))
+
+        if hcap_guard_enabled and hasattr(self.inputs, "capture_spot_1m_twap60"):
+            needed_s1_syms = []
+            for _st, _und, _dur, sym, _raw_sc, sc in staged:
+                if sc.get("selected") is True and sym not in needed_s1_syms and sym not in spot_1m_cache:
+                    needed_s1_syms.append(sym)
+            if needed_s1_syms:
+                timeout_s = float(hcap_guard_cfg.get("timeout_seconds", 1.2))
+
+                def _capture_one_s1(sym):
+                    rem_win = (cohort + timedelta(seconds=18.5) - calibrated_now(self.clock)).total_seconds()
+                    if rem_win <= 0.15:
+                        return {"status": "DEADLINE_SKIPPED", "symbol": sym, "cohort_id": cohort.isoformat()}
+                    dl_mono = time.monotonic() + min(timeout_s, rem_win)
+                    try:
+                        return self.inputs.capture_spot_1m_twap60(
+                            sym, cohort, cohort_id=cohort.isoformat(), deadline_monotonic=dl_mono
+                        )
+                    except Exception as exc:
+                        return {"status": "ERROR", "symbol": sym, "cohort_id": cohort.isoformat(),
+                                "error": f"{type(exc).__name__}:{str(exc)[:120]}"}
+
+                if len(needed_s1_syms) == 1:
+                    spot_1m_cache[needed_s1_syms[0]] = _capture_one_s1(needed_s1_syms[0])
+                else:
+                    from concurrent.futures import ThreadPoolExecutor
+                    s1_t0 = time.perf_counter()
+                    with ThreadPoolExecutor(max_workers=min(3, len(needed_s1_syms)), thread_name_prefix="argon4-s1") as pool:
+                        s1_futs = {sym: pool.submit(_capture_one_s1, sym) for sym in needed_s1_syms}
+                        for sym in needed_s1_syms:
+                            spot_1m_cache[sym] = s1_futs[sym].result()
+                    self._decision_timing["spot_1m_parallel_wall_seconds"] = time.perf_counter() - s1_t0
+
+        for stream, underlying, duration, symbol, raw_score, score in staged:
+            if hcap_guard_enabled and score.get("selected") is True and symbol in spot_1m_cache:
+                s1_obs = spot_1m_cache[symbol]
+                own_rets = own_rets_cache.get(symbol) or {}
+                if s1_obs.get("status") == "OBSERVED":
+                    t_re = time.perf_counter()
+                    score = apply_volatility_regime_guard(
+                        stream,
+                        raw_score,
+                        ex_ante_rv12_bps=rv12_cache[symbol],
+                        guard_config=vol_guard,
+                        cohort_time=cohort,
+                        btc_ret_1h_pct=btc_macro_rets.get("btc_ret_1h_pct"),
+                        btc_ret_2h_pct=btc_macro_rets.get("btc_ret_2h_pct"),
+                        btc_ret_4h_pct=btc_macro_rets.get("btc_ret_4h_pct"),
+                        btc_ema_gap_bps=btc_macro_rets.get("btc_ema_gap_bps"),
+                        btc_vol_surge_24=btc_macro_rets.get("btc_vol_surge_24"),
+                        btc_bar1_range_bps=btc_macro_rets.get("btc_bar1_range_bps"),
+                        own_ret_1h_pct=own_rets.get("own_ret_1h_pct"),
+                        own_ret_15m_bps=own_rets.get("own_ret_15m_bps"),
+                        own_streak_3bar=own_rets.get("own_streak_3bar"),
+                        spot_twap60_t=s1_obs["twap60"],
+                        spot_close_t=s1_obs["spot_close"],
+                    )
+                    score["spot_1m_receipt_sha256"] = s1_obs.get("receipt_sha256")
+                    self._decision_timing["inference_seconds"][stream] += time.perf_counter() - t_re
+                elif str(hcap_guard_cfg.get("on_unavailable", "PASS_WITH_WARNING")).upper() == "SKIP":
+                    score = {
+                        **score,
+                        "volatility_regime_guarded": True,
+                        "volatility_regime_reason": "TWAP60_SPOT_1M_UNAVAILABLE",
+                        "selected": False,
+                    }
             if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
                 raise ValueError("missed feature decision window")
             decisions[stream] = {"status": "NO_SIGNAL", "prediction": score, "outcome": score["side"]}

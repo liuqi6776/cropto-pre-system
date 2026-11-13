@@ -523,6 +523,43 @@ class AuditStore:
             "last_loss_settled_at_utc": last_loss_settled_at,
         }
 
+    def get_prior_days_realized_pnl_usdc(self, now_utc: datetime | None = None) -> Decimal:
+        """Return cumulative realized PnL in USDC from settlements strictly prior to today UTC (`day_prefix`).
+
+        Mirrors upstream `account.py` `day_start_equity = initial_capital + realized_pnl - today_pnl`
+        so that daily loss limits scale dynamically as live account equity compounds.
+        """
+        stamp = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        day_prefix = stamp.strftime("%Y-%m-%d")
+        if not self.sqlite_path.is_file():
+            return Decimal("0")
+        prior_sum = Decimal("0")
+        with self._connection() as con:
+            rows = con.execute(
+                "SELECT live_realized_pnl_usdc, settled_at_utc, payload_json FROM live_settlements"
+            ).fetchall()
+        for s_row in rows:
+            used_history = False
+            raw_pj = s_row["payload_json"]
+            if isinstance(raw_pj, str) and raw_pj.strip():
+                try:
+                    loaded = json.loads(raw_pj)
+                    hist = loaded.get("pnl_history") if isinstance(loaded, dict) else None
+                    if isinstance(hist, list) and hist:
+                        used_history = True
+                        for entry in hist:
+                            if isinstance(entry, Mapping):
+                                c_at = str(entry.get("confirmed_at_utc") or "")
+                                if c_at and c_at[:10] < day_prefix:
+                                    prior_sum += to_decimal(entry.get("pnl_delta_usdc") or 0.0, "pnl_delta_usdc")
+                except Exception:
+                    used_history = False
+            if not used_history:
+                s_at = str(s_row["settled_at_utc"] or "")
+                if s_at and s_at[:10] < day_prefix:
+                    prior_sum += to_decimal(s_row["live_realized_pnl_usdc"] or 0.0, "live_realized_pnl_usdc")
+        return prior_sum.quantize(USD_MICRO, rounding=ROUND_DOWN)
+
     def claim_and_reserve_signal(
         self,
         *,

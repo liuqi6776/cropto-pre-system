@@ -137,12 +137,14 @@ def compute_ex_ante_rv12_bps(data_root=None, symbol="BTCUSDT", *, as_of=None, sn
 
 
 def compute_ex_ante_btc_macro_returns_pct(data_root=None, symbol="BTCUSDT", *, as_of=None, snapshot=None, raw_frame=None):
-    """Compute causal 1h (12 bars), 2h (24 bars), 4h (48 bars) BTC returns and EMA12-EMA36 gap (bps)."""
+    """Compute causal 1h/2h/4h BTC returns, EMA12-EMA36 gap (bps), and last-bar macro shock metrics."""
     out = {
         "btc_ret_1h_pct": None,
         "btc_ret_2h_pct": None,
         "btc_ret_4h_pct": None,
         "btc_ema_gap_bps": None,
+        "btc_bar1_range_bps": None,
+        "btc_vol_surge_24": None,
     }
     frame = _resolve_5m_frame(data_root, symbol, as_of=as_of, snapshot=snapshot, raw_frame=raw_frame, min_rows=12)
     if frame is None or len(frame) < 12 or not ({"open", "close"} <= set(frame.columns)):
@@ -171,6 +173,28 @@ def compute_ex_ante_btc_macro_returns_pct(data_root=None, symbol="BTCUSDT", *, a
             ema36 = float(tail_ema.ewm(span=36, adjust=False).mean().iloc[-1])
             if ema36 > 0:
                 out["btc_ema_gap_bps"] = float((ema12 / ema36 - 1.0) * 10000.0)
+
+    last = frame.iloc[-1]
+    o_last = float(last["open"])
+    if np.isfinite(o_last) and o_last > 0 and {"high", "low"} <= set(frame.columns):
+        h_last = float(last["high"])
+        l_last = float(last["low"])
+        if np.isfinite(h_last) and np.isfinite(l_last) and h_last >= l_last and l_last > 0:
+            out["btc_bar1_range_bps"] = float((h_last - l_last) / o_last * 10000.0)
+    vol_col = "quote_volume" if "quote_volume" in frame.columns else ("volume" if "volume" in frame.columns else None)
+    if vol_col is not None and len(frame) >= 25:
+        tail25 = frame.tail(25)
+        contiguous = not (
+            isinstance(tail25.index, pd.DatetimeIndex)
+            and len(tail25.index) == 25
+            and not np.all(np.diff(tail25.index.asi8) == pd.Timedelta(minutes=5).value)
+        )
+        if contiguous:
+            vols = tail25[vol_col].to_numpy(dtype=float)
+            if np.isfinite(vols).all() and (vols >= 0).all():
+                med_prev24 = float(np.median(vols[:-1]))
+                if med_prev24 > 0:
+                    out["btc_vol_surge_24"] = float(vols[-1] / med_prev24)
     return out
 
 
@@ -235,6 +259,74 @@ def _cohort_in_tz(cohort_dt, tz_name=None):
     return cohort_dt.tz_convert(str(tz_name))
 
 
+_NYSE_HOLIDAY_CACHE: dict[int, set[str]] = {}
+
+
+def is_nyse_market_holiday(cohort_dt) -> bool:
+    """Return True if cohort_dt falls on an NYSE market holiday or illiquid half-day (Black Friday / Dec 24)."""
+    if cohort_dt is None:
+        return False
+    from datetime import date, timedelta
+
+    ny_dt = _cohort_in_tz(cohort_dt, "America/New_York")
+    y = int(ny_dt.year)
+    holidays = _NYSE_HOLIDAY_CACHE.get(y)
+    if holidays is None:
+        a = y % 19
+        b = y // 100
+        c = y % 100
+        d = b // 4
+        e = b % 4
+        f = (b + 8) // 25
+        g = (b - f + 1) // 3
+        h = (19 * a + b - d - g + 15) % 30
+        i = c // 4
+        k = c % 4
+        l = (32 + 2 * e + 2 * i - h - k) % 7
+        m = (a + 11 * h + 22 * l) // 451
+        easter = date(y, (h + l - 7 * m + 114) // 31, ((h + l - 7 * m + 114) % 31) + 1)
+
+        def _obs(dt_val: date) -> date:
+            if dt_val.weekday() == 5:
+                return dt_val - timedelta(days=1)
+            if dt_val.weekday() == 6:
+                return dt_val + timedelta(days=1)
+            return dt_val
+
+        def _nth_wd(yr: int, mo: int, wd: int, n: int) -> date:
+            cur = date(yr, mo, 1)
+            while cur.weekday() != wd:
+                cur += timedelta(days=1)
+            return cur + timedelta(days=7 * (n - 1))
+
+        def _last_wd(yr: int, mo: int, wd: int) -> date:
+            cur = date(yr, mo + 1, 1) - timedelta(days=1) if mo < 12 else date(yr, 12, 31)
+            while cur.weekday() != wd:
+                cur -= timedelta(days=1)
+            return cur
+
+        thx = _nth_wd(y, 11, 3, 4)
+        holidays = {
+            dt_item.isoformat()
+            for dt_item in {
+                _obs(date(y, 1, 1)),
+                _nth_wd(y, 1, 0, 3),
+                _nth_wd(y, 2, 0, 3),
+                easter - timedelta(days=2),
+                _last_wd(y, 5, 0),
+                _obs(date(y, 6, 19)),
+                _obs(date(y, 7, 4)),
+                _nth_wd(y, 9, 0, 1),
+                thx,
+                thx + timedelta(days=1),
+                date(y, 12, 24),
+                _obs(date(y, 12, 25)),
+            }
+        }
+        _NYSE_HOLIDAY_CACHE[y] = holidays
+    return ny_dt.strftime("%Y-%m-%d") in holidays
+
+
 def apply_volatility_regime_guard(
     stream,
     prediction,
@@ -246,6 +338,8 @@ def apply_volatility_regime_guard(
     btc_ret_2h_pct=None,
     btc_ret_4h_pct=None,
     btc_ema_gap_bps=None,
+    btc_vol_surge_24=None,
+    btc_bar1_range_bps=None,
     own_ret_1h_pct=None,
     own_ret_15m_bps=None,
     own_streak_3bar=None,
@@ -265,6 +359,10 @@ def apply_volatility_regime_guard(
         res["ex_ante_btc_ret_4h_pct"] = float(btc_ret_4h_pct)
     if btc_ema_gap_bps is not None:
         res["ex_ante_btc_ema_gap_bps"] = float(btc_ema_gap_bps)
+    if btc_vol_surge_24 is not None:
+        res["ex_ante_btc_vol_surge_24"] = round(float(btc_vol_surge_24), 4)
+    if btc_bar1_range_bps is not None:
+        res["ex_ante_btc_bar1_range_bps"] = round(float(btc_bar1_range_bps), 4)
     if own_ret_1h_pct is not None:
         res["ex_ante_own_ret_1h_pct"] = float(own_ret_1h_pct)
     if own_ret_15m_bps is not None:
@@ -290,7 +388,11 @@ def apply_volatility_regime_guard(
         cap = limits.get(stream) if isinstance(limits, dict) else None
         min_limits = guard_config.get("min_rv12_bps")
         min_cap = min_limits.get(stream) if isinstance(min_limits, dict) else None
-        if cohort_dt is not None and cohort_dt.weekday() in (5, 6):
+        is_wknd_or_hol = cohort_dt is not None and (
+            cohort_dt.weekday() in (5, 6)
+            or (bool(guard_config.get("us_holiday_use_weekend_min_rv12", False)) and is_nyse_market_holiday(cohort_dt))
+        )
+        if is_wknd_or_hol:
             wknd_min_limits = guard_config.get("weekend_min_rv12_bps")
             wknd_min = wknd_min_limits.get(stream) if isinstance(wknd_min_limits, dict) else None
             if wknd_min is not None:
@@ -308,6 +410,53 @@ def apply_volatility_regime_guard(
             res["volatility_regime_min_rv12_bps"] = float(min_cap)
             res["volatility_regime_reason"] = "BELOW_MIN_RV12_BPS"
             res["volatility_regime_action"] = action
+            if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                res["selected"] = False
+            return res
+
+    macro_830 = guard_config.get("us_macro_830_blackout")
+    if isinstance(macro_830, dict) and macro_830.get("enabled") is True and cohort_dt is not None:
+        tz_name = macro_830.get("timezone", "America/New_York")
+        local_dt = _cohort_in_tz(cohort_dt, tz_name)
+        weekdays_only = bool(macro_830.get("weekdays_only", True))
+        day_ok = (local_dt.weekday() < 5) if weekdays_only else True
+        minute_of_day = int(local_dt.hour) * 60 + int(local_dt.minute)
+        start_min = int(macro_830.get("local_start_minute", 505))
+        end_min = int(macro_830.get("local_end_minute", 545))
+        skip_streams = macro_830.get("skip_streams") or []
+        mode = str(macro_830.get("mode", "SHOCK_TRIGGERED")).upper()
+        if day_ok and start_min <= minute_of_day < end_min and stream in skip_streams:
+            min_vs = float(macro_830.get("min_btc_vol_surge_24", 2.8))
+            min_rng = float(macro_830.get("min_btc_bar1_range_bps", 25.0))
+            shock_hit = mode == "UNCONDITIONAL" or (
+                btc_vol_surge_24 is not None
+                and btc_bar1_range_bps is not None
+                and float(btc_vol_surge_24) >= min_vs
+                and float(btc_bar1_range_bps) >= min_rng
+            )
+            if shock_hit:
+                res["volatility_regime_guarded"] = True
+                res["volatility_regime_reason"] = "US_MACRO_830_BLACKOUT"
+                res["volatility_regime_action"] = action
+                res["us_macro_830_blackout_minute_local"] = minute_of_day
+                if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                    res["selected"] = False
+                return res
+
+    wknd_dead = guard_config.get("weekend_dead_zone_blackout")
+    if isinstance(wknd_dead, dict) and wknd_dead.get("enabled") is True and cohort_dt is not None:
+        tz_name = wknd_dead.get("timezone", "Asia/Shanghai")
+        local_dt = _cohort_in_tz(cohort_dt, tz_name)
+        minute_of_day = int(local_dt.hour) * 60 + int(local_dt.minute)
+        start_min = int(wknd_dead.get("local_start_minute", 240))
+        end_min = int(wknd_dead.get("local_end_minute", 300))
+        days_local = wknd_dead.get("weekdays_local") or [5, 6]
+        skip_streams = wknd_dead.get("skip_streams") or []
+        if local_dt.weekday() in days_local and start_min <= minute_of_day < end_min and stream in skip_streams:
+            res["volatility_regime_guarded"] = True
+            res["volatility_regime_reason"] = "WEEKEND_DEAD_ZONE_BLACKOUT"
+            res["volatility_regime_action"] = action
+            res["weekend_dead_zone_minute_local"] = minute_of_day
             if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
                 res["selected"] = False
             return res
@@ -535,6 +684,8 @@ def predict_stream_v14(
     btc_ret_2h_pct=None,
     btc_ret_4h_pct=None,
     btc_ema_gap_bps=None,
+    btc_vol_surge_24=None,
+    btc_bar1_range_bps=None,
     own_ret_1h_pct=None,
     own_ret_15m_bps=None,
     own_streak_3bar=None,
@@ -570,6 +721,8 @@ def predict_stream_v14(
             btc_ret_2h_pct,
             btc_ret_4h_pct,
             btc_ema_gap_bps,
+            btc_vol_surge_24,
+            btc_bar1_range_bps,
             own_ret_1h_pct,
             own_ret_15m_bps,
             own_streak_3bar,
@@ -588,6 +741,8 @@ def predict_stream_v14(
             btc_ret_2h_pct=btc_ret_2h_pct,
             btc_ret_4h_pct=btc_ret_4h_pct,
             btc_ema_gap_bps=btc_ema_gap_bps,
+            btc_vol_surge_24=btc_vol_surge_24,
+            btc_bar1_range_bps=btc_bar1_range_bps,
             own_ret_1h_pct=own_ret_1h_pct,
             own_ret_15m_bps=own_ret_15m_bps,
             own_streak_3bar=own_streak_3bar,
