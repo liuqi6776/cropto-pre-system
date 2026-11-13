@@ -1170,18 +1170,30 @@ class ForwardPipeline:
 
     def execute_prepared(self, policy, inputs, models, cohort, decisions, clock, prior_fills=None, prefetched_markets=None):
         """Reuse the exact score and clock within one live cohort; never rescore."""
+        from .account import multi_look_settings
         from .execution import PaperExecutor
         started = time.perf_counter()
         markets_snap = self.observations.latest("polymarket")
         if prefetched_markets:
             base_streams = dict((markets_snap or {}).get("streams") or {}) if isinstance(markets_snap, dict) else {}
             for st_key, mkt_val in prefetched_markets.items():
-                base_streams[st_key] = {"status": "VERIFIED_MARKET", "current": mkt_val, "next": None, "errors": []}
+                prev_entry = base_streams.get(st_key)
+                base_streams[st_key] = {
+                    "status": "WAITING_MODEL",
+                    "market_status": "PARTIAL",
+                    "current": mkt_val,
+                    "next": prev_entry.get("next") if isinstance(prev_entry, dict) else None,
+                    "errors": [],
+                }
             markets_snap = {**(markets_snap if isinstance(markets_snap, dict) else {}), "streams": base_streams}
 
         prefetched_books = {}
         is_v5 = policy.get("waterfall_semantics") == "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1"
-        if is_v5 and not prior_fills and isinstance(markets_snap, dict):
+        # Under multi_look_ioc, Account.begin_book_look records requested_at per rank
+        # inside PaperExecutor and rejects any book received_at < requested_at
+        # ("book look response precedes its request"). Only single-look cohorts may
+        # pre-fetch books ahead of PaperExecutor.process_cohort.
+        if is_v5 and multi_look_settings(policy) is None and not prior_fills and isinstance(markets_snap, dict):
             sig_book_jobs = []
             for st_name in policy.get("order", ()):
                 dec_obj = decisions.get(st_name)

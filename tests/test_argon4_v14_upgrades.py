@@ -1613,9 +1613,9 @@ def test_v14r12_audit_remediations_bleed_cap_stream_max_order_1h_retry_and_fast_
     eng = engineering_profile(policy)
     assert eng["enabled"] is True
     assert policy["input_http_min_spacing_seconds"] == pytest.approx(0.05)
-    assert policy["min_decision_delay_seconds"] == pytest.approx(1.1)
+    assert policy["min_decision_delay_seconds"] == pytest.approx(2.3)
     assert eng["window_poll_interval_seconds"] == pytest.approx(0.1)
-    assert eng["minimum_decision_delay_seconds"] == pytest.approx(1.1)
+    assert eng["minimum_decision_delay_seconds"] == pytest.approx(2.3)
     assert eng["input_deadline_after_boundary_seconds"] == pytest.approx(16.5)
     assert eng["input_ready_retry_interval_seconds"] == pytest.approx(0.15)
     assert eng["prefetch_lead_seconds"] == pytest.approx(9.5)
@@ -2682,7 +2682,7 @@ def test_v14r18_precision_guards_nyse_holiday_and_policy_hygiene():
         return seen
 
     policy = json.loads(raw_policy_text, object_pairs_hook=_reject_dup_keys)
-    assert policy["min_decision_delay_seconds"] == pytest.approx(1.1)
+    assert policy["min_decision_delay_seconds"] == pytest.approx(2.3)
     vg = policy["volatility_regime_guard"]
     assert vg["max_rv12_bps"]["SOL_15m"] == pytest.approx(42.0)
     assert vg["max_rv12_bps"]["SOL_5m"] == pytest.approx(42.0)
@@ -2883,6 +2883,276 @@ def test_v14r19_sub4s_latency_online_sha256_cache_transport_pool_and_live_config
     assert maint["status"] == "COMPLETED"
     assert len(scan_calls) > first_count
     assert jan._last_idle_check_bucket is None
+
+
+def test_v14r19_multi_signal_multi_look_never_blocks_with_response_precedes_request(tmp_path, monkeypatch):
+    """Regression test: when >=2 streams fire SIGNAL in the same cohort under multi_look_ioc=True,
+    ForwardPipeline.execute_prepared must NOT pre-fetch books before Account.begin_book_look records
+    requested_at (which previously caused BLOCKED: ['book look response precedes its request'] on real clocks).
+    """
+    from datetime import datetime, timedelta, timezone
+    import hashlib
+    from types import SimpleNamespace
+    from tools.argon4_forward import pipeline as pipe_mod
+
+    cohort = datetime(2026, 11, 13, 12, 50, 0, tzinfo=timezone.utc)
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    assert policy["execution"]["multi_look_ioc"] is True
+
+    # Real advancing clock: every read advances by +15ms, and each network book GET advances by +120ms!
+    cur_utc = {"t": cohort + timedelta(seconds=6.5)}
+
+    def _advancing_now(clock_obj=None, upper=True):
+        cur_utc["t"] = cur_utc["t"] + timedelta(milliseconds=15)
+        return cur_utc["t"] if upper else (cur_utc["t"] - timedelta(milliseconds=200))
+
+    monkeypatch.setattr(pipe_mod, "calibrated_now", _advancing_now)
+
+    rt = tmp_path / "rt_multilook_2sig"
+    rt.mkdir(parents=True, exist_ok=True)
+    acc = account.Account(
+        rt / "account.sqlite3",
+        initial_capital=policy["initial_capital_usd"],
+        started_at=cohort - timedelta(minutes=5),
+    )
+    obs_data = {}
+    obs = SimpleNamespace(
+        save=lambda k, v: obs_data.__setitem__(k, v),
+        latest=lambda k: obs_data.get(k),
+        path=str(rt / "observations.sqlite3"),
+    )
+    p = pipe_mod.ForwardPipeline(acc, rt, obs)
+    try:
+        clock = {
+            "status": "CALIBRATED",
+            "source": "POLYMARKET_CLOB_SERVER_TIME",
+            "observed_at": (cohort + timedelta(seconds=1.0)).isoformat(),
+            "calibrated_at_local": (cohort + timedelta(seconds=1.0)).isoformat(),
+            "calibrated_monotonic": 100.0,
+            "server_minus_local_seconds": 0.0,
+            "uncertainty_seconds": 0.1,
+            "receipt_sha256": "e" * 64,
+        }
+        p.clock = clock
+
+        streams_snap = {}
+        decisions = {}
+        models = {}
+        dec_at = cohort + timedelta(seconds=5.5)
+        avail_at = cohort + timedelta(seconds=3.1)
+
+        for idx, st_name in enumerate(policy["order"], 1):
+            und, tf = st_name.split("_")
+            dur = int(tf[:-1]) * 60
+            pin = policy["deployment_manifest_sha256"][st_name]
+            m_sha = hashlib.sha256(st_name.encode()).hexdigest()
+            models[st_name] = {"version": f"v14-{st_name}", "sha256": m_sha}
+            w_start = datetime.fromtimestamp(int(cohort.timestamp()) // dur * dur, timezone.utc)
+            mkt = {
+                "status": "VERIFIED_MARKET",
+                "market_id": str(7000 + idx),
+                "condition_id": "0x" + f"{idx:064x}",
+                "protocol": "v2",
+                "asset": und,
+                "duration_seconds": dur,
+                "window_start": w_start.isoformat(),
+                "window_end": (w_start + timedelta(seconds=dur)).isoformat(),
+                "active": True,
+                "closed": False,
+                "accepting_orders": True,
+                "outcome_ids": {"UP": str(idx * 100 + 1), "DOWN": str(idx * 100 + 2)},
+                "metadata_received_at": (cohort - timedelta(seconds=15)).isoformat(),
+                "metadata_sha256": "f" * 64,
+                "resolution": {"source": f"https://data.chain.link/streams/{und.lower()}-usd-twap-60s-streams"},
+                "fee": {"status": "KNOWN_DISABLED", "fees_enabled": False},
+                "books": {},
+            }
+            streams_snap[st_name] = {
+                "status": "WAITING_MODEL",
+                "market_status": "PARTIAL",
+                "current": mkt,
+                "next": None,
+                "errors": [],
+            }
+
+            if st_name == "BNB_15m":
+                decisions[st_name] = {"status": "DISABLED_BY_STAGE"}
+            elif dur == 900:
+                # 12:50:00Z is not on a 15m boundary -> NOT_DUE
+                decisions[st_name] = {"status": "NOT_DUE"}
+            elif st_name == "ETH_5m":
+                decisions[st_name] = {
+                    "status": "NO_SIGNAL",
+                    "outcome": "UP",
+                    "prediction": {
+                        "stream": st_name,
+                        "selected": False,
+                        "side": "UP",
+                        "z_v4": 0.42,
+                        "threshold_frozen": 1.65,
+                        "model_version": f"v14-{st_name}",
+                        "model_sha256": m_sha,
+                        "manifest_sha256": pin,
+                        "decision_time": dec_at.isoformat(),
+                        "feature_bar_open": (cohort - timedelta(minutes=5)).isoformat(),
+                    },
+                }
+            elif st_name in ("BTC_5m", "SOL_5m"):
+                sig_id = hashlib.sha256(f"{m_sha}:{st_name}:{cohort.isoformat()}".encode()).hexdigest()
+                decisions[st_name] = {
+                    "status": "SIGNAL",
+                    "outcome": "DOWN",
+                    "prediction": {
+                        "stream": st_name,
+                        "selected": True,
+                        "side": "DOWN",
+                        "z_v4": -2.15,
+                        "threshold_frozen": 1.65,
+                        "model_version": f"v14-{st_name}",
+                        "model_sha256": m_sha,
+                        "manifest_sha256": pin,
+                        "decision_time": dec_at.isoformat(),
+                        "feature_bar_open": (cohort - timedelta(minutes=5)).isoformat(),
+                    },
+                    "signal": {
+                        "signal_id": sig_id,
+                        "stream": st_name,
+                        "underlying": und,
+                        "outcome": "DOWN",
+                        "model_id": f"v14-{st_name}",
+                        "model_sha256": m_sha,
+                        "validation_status": "INPUTS_VALIDATED",
+                        "feature_available_at": avail_at.isoformat(),
+                        "decision_at": dec_at.isoformat(),
+                        "valid_until": (cohort + timedelta(seconds=20)).isoformat(),
+                        "window_start": cohort.isoformat(),
+                        "window_end": (cohort + timedelta(seconds=dur)).isoformat(),
+                    },
+                }
+
+        obs.save("polymarket", {"streams": streams_snap})
+
+        ask_price = {"p": 0.50}
+
+        def _fake_refresh_book(market, outcome):
+            # Simulate real 120ms London RTT AFTER begin_book_look was recorded
+            cur_utc["t"] = cur_utc["t"] + timedelta(milliseconds=120)
+            rcv_local = cur_utc["t"] - timedelta(milliseconds=100)  # +100ms uncertainty => received_upper == cur_utc["t"]
+            src_at = cur_utc["t"] - timedelta(milliseconds=150)
+            return {
+                "status": "OBSERVED",
+                "asset_id": market["outcome_ids"][outcome],
+                "condition_id": market["condition_id"],
+                "source_at": src_at.isoformat(),
+                "received_at": rcv_local.isoformat(),
+                "received_at_local": rcv_local.isoformat(),
+                "asks": [{"price": ask_price["p"], "size": 500.0}],
+                "bids": [{"price": round(ask_price["p"] - 0.01, 2), "size": 500.0}],
+            }
+
+        monkeypatch.setattr(p, "refresh_book", _fake_refresh_book)
+        p._pending_timing = {"cohort": cohort.isoformat(), "started_monotonic": time.perf_counter()}
+        p.execute_prepared(policy, {"status": "READY"}, models, cohort, decisions, dict(clock))
+
+        exec_state = p.status()["execution"]
+        assert exec_state["blocked"] == [], f"Unexpected block: {exec_state['blocked']}"
+        assert exec_state["status"] == "PROCESSED"
+        assert len(exec_state["fills"]) == 2
+        assert {f["underlying"] for f in exec_state["fills"]} == {"BTC", "SOL"}
+
+        # Cohort 2: ask = 0.54 (> max_entry_price 0.515) on 2 signals + prefetched_markets wrapper -> WAITING_PRICE_RECHECK
+        cohort2 = cohort + timedelta(minutes=5)
+        cur_utc["t"] = cohort2 + timedelta(seconds=6.5)
+        clock2 = {
+            **clock,
+            "observed_at": (cohort2 + timedelta(seconds=1.0)).isoformat(),
+            "calibrated_at_local": (cohort2 + timedelta(seconds=1.0)).isoformat(),
+        }
+        p.clock = clock2
+        ask_price["p"] = 0.54
+        prefetched_mkts2 = {}
+        decisions2 = {}
+        dec_at2 = cohort2 + timedelta(seconds=5.5)
+        avail_at2 = cohort2 + timedelta(seconds=3.1)
+        for idx, st_name in enumerate(policy["order"], 1):
+            und, tf = st_name.split("_")
+            dur = int(tf[:-1]) * 60
+            pin = policy["deployment_manifest_sha256"][st_name]
+            m_sha = models[st_name]["sha256"]
+            w_start2 = datetime.fromtimestamp(int(cohort2.timestamp()) // dur * dur, timezone.utc)
+            mkt2 = dict(streams_snap[st_name]["current"])
+            mkt2["window_start"] = w_start2.isoformat()
+            mkt2["window_end"] = (w_start2 + timedelta(seconds=dur)).isoformat()
+            mkt2["metadata_received_at"] = (cohort2 - timedelta(seconds=15)).isoformat()
+            mkt2["books"] = {}
+            if st_name in ("BTC_5m", "SOL_5m"):
+                prefetched_mkts2[st_name] = mkt2
+            if st_name == "BNB_15m":
+                decisions2[st_name] = {"status": "DISABLED_BY_STAGE"}
+            elif dur == 900:
+                decisions2[st_name] = {"status": "NOT_DUE"}
+            elif st_name == "ETH_5m":
+                decisions2[st_name] = {
+                    "status": "NO_SIGNAL",
+                    "outcome": "UP",
+                    "prediction": {
+                        "stream": st_name,
+                        "selected": False,
+                        "side": "UP",
+                        "z_v4": 0.31,
+                        "threshold_frozen": 1.65,
+                        "model_version": f"v14-{st_name}",
+                        "model_sha256": m_sha,
+                        "manifest_sha256": pin,
+                        "decision_time": dec_at2.isoformat(),
+                        "feature_bar_open": (cohort2 - timedelta(minutes=5)).isoformat(),
+                    },
+                }
+            elif st_name in ("BTC_5m", "SOL_5m"):
+                sig_id2 = hashlib.sha256(f"{m_sha}:{st_name}:{cohort2.isoformat()}".encode()).hexdigest()
+                decisions2[st_name] = {
+                    "status": "SIGNAL",
+                    "outcome": "DOWN",
+                    "prediction": {
+                        "stream": st_name,
+                        "selected": True,
+                        "side": "DOWN",
+                        "z_v4": -2.22,
+                        "threshold_frozen": 1.65,
+                        "model_version": f"v14-{st_name}",
+                        "model_sha256": m_sha,
+                        "manifest_sha256": pin,
+                        "decision_time": dec_at2.isoformat(),
+                        "feature_bar_open": (cohort2 - timedelta(minutes=5)).isoformat(),
+                    },
+                    "signal": {
+                        "signal_id": sig_id2,
+                        "stream": st_name,
+                        "underlying": und,
+                        "outcome": "DOWN",
+                        "model_id": f"v14-{st_name}",
+                        "model_sha256": m_sha,
+                        "validation_status": "INPUTS_VALIDATED",
+                        "feature_available_at": avail_at2.isoformat(),
+                        "decision_at": dec_at2.isoformat(),
+                        "valid_until": (cohort2 + timedelta(seconds=20)).isoformat(),
+                        "window_start": cohort2.isoformat(),
+                        "window_end": (cohort2 + timedelta(seconds=dur)).isoformat(),
+                    },
+                }
+        obs.save("polymarket", {"streams": {}})
+        p._pending_timing = {"cohort": cohort2.isoformat(), "started_monotonic": time.perf_counter()}
+        p.execute_prepared(
+            policy, {"status": "READY"}, models, cohort2, decisions2, dict(clock2),
+            prefetched_markets=prefetched_mkts2,
+        )
+        exec_state2 = p.status()["execution"]
+        assert exec_state2["blocked"] == [], f"Unexpected block on cohort2: {exec_state2['blocked']}"
+        assert exec_state2["status"] == "WAITING_PRICE_RECHECK"
+    finally:
+        p.close()
+
+
 
 
 

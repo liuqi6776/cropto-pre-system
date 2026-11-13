@@ -266,13 +266,13 @@
       }
     ]
   },
-  "min_decision_delay_seconds": 1.1,
+  "min_decision_delay_seconds": 2.3,
   "input_http_min_spacing_seconds": 0.05,
   "engineering": {
     "enabled": true,
     "profile": "argon4-latency-v12",
     "window_poll_interval_seconds": 0.1,
-    "minimum_decision_delay_seconds": 1.1,
+    "minimum_decision_delay_seconds": 2.3,
     "input_deadline_after_boundary_seconds": 16.5,
     "input_ready_retry_interval_seconds": 0.15,
     "auxiliary_prefetch": true,
