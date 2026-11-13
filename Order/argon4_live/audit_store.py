@@ -23,7 +23,15 @@ import sqlite3
 import threading
 from typing import Any, Iterator, Mapping
 
-from .math_utils import USD_MICRO, format_utc_iso, parse_utc_timestamp, to_decimal
+from .math_utils import (
+    HARD_WINDOW_DEADLINE_SECONDS,
+    USD_MICRO,
+    check_hard_deadline,
+    format_utc_iso,
+    parse_utc_timestamp,
+    to_decimal,
+)
+from .redeemer import _norm_outcome_key, resolve_verified_payout_ratios
 from .safety import assert_safe_write_path
 
 # Statuses that lock capital and risk quota until resolved or reconciled
@@ -294,9 +302,15 @@ class AuditStore:
         cohort_single_order_cap_usd: float | Decimal | None = None,
     ) -> dict[str, Any]:
         scale = to_decimal(live_scale_factor, "live_scale_factor")
+        max_active_window_risk = (scale * to_decimal(paper_caps.get("max_active_window_risk_usd", 450.0))).quantize(
+            USD_MICRO, rounding=ROUND_DOWN
+        )
         max_open_risk = (scale * to_decimal(paper_caps.get("max_open_risk_usd", 1000.0))).quantize(
             USD_MICRO, rounding=ROUND_DOWN
         )
+        max_underlying_active_risk = (
+            scale * to_decimal(paper_caps.get("max_underlying_active_risk_usd", 300.0))
+        ).quantize(USD_MICRO, rounding=ROUND_DOWN)
         max_underlying_risk = (scale * to_decimal(paper_caps.get("max_underlying_open_risk_usd", 500.0))).quantize(
             USD_MICRO, rounding=ROUND_DOWN
         )
@@ -327,16 +341,24 @@ class AuditStore:
             "SOL": Decimal("0"),
             "BNB": Decimal("0"),
         }
+        underlying_active_locked: dict[str, Decimal] = {
+            "BTC": Decimal("0"),
+            "ETH": Decimal("0"),
+            "SOL": Decimal("0"),
+            "BNB": Decimal("0"),
+        }
 
         for row in rows:
             spent = to_decimal(row["total_spent_usdc"] or 0.0, "total_spent_usdc")
             coin = str(row["underlying"] or "").upper()
             pos_status = str(row["position_status"] or "OPEN")
+            row_counts_active = False
             if pos_status == "WON_UNREDEEMED":
                 unredeemed_winning += spent
             elif pos_status in IN_FLIGHT_POSITION_STATUSES:
                 in_flight_reserved += spent
                 active_locked += spent
+                row_counts_active = True
             else:
                 w_end_raw = row["window_end"]
                 is_active = True
@@ -347,16 +369,21 @@ class AuditStore:
                         is_active = True
                 if is_active:
                     active_locked += spent
+                    row_counts_active = True
                 else:
                     expired_awaiting += spent
             if coin in underlying_locked:
                 underlying_locked[coin] += spent
             elif coin:
                 underlying_locked[coin] = underlying_locked.get(coin, Decimal("0")) + spent
+            if row_counts_active and coin:
+                underlying_active_locked[coin] = underlying_active_locked.get(coin, Decimal("0")) + spent
 
         total_locked = (active_locked + expired_awaiting + unredeemed_winning).quantize(USD_MICRO, rounding=ROUND_DOWN)
         rem_total_open = max(Decimal("0"), (max_open_risk - total_locked).quantize(USD_MICRO, rounding=ROUND_DOWN))
-        rem_active_window = max(Decimal("0"), (max_open_risk - active_locked).quantize(USD_MICRO, rounding=ROUND_DOWN))
+        rem_active_window = max(
+            Decimal("0"), (max_active_window_risk - active_locked).quantize(USD_MICRO, rounding=ROUND_DOWN)
+        )
 
         if cohort_id:
             c_row = con.execute(
@@ -376,6 +403,12 @@ class AuditStore:
         rem_underlying = {
             coin: float(max(Decimal("0"), (max_underlying_risk - locked).quantize(USD_MICRO, rounding=ROUND_DOWN)))
             for coin, locked in underlying_locked.items()
+        }
+        rem_underlying_active = {
+            coin: float(
+                max(Decimal("0"), (max_underlying_active_risk - act_locked).quantize(USD_MICRO, rounding=ROUND_DOWN))
+            )
+            for coin, act_locked in underlying_active_locked.items()
         }
 
         free_bal_dec = max(
@@ -402,6 +435,7 @@ class AuditStore:
             "remaining_active_window_quota_usd": float(rem_active_window),
             "remaining_cohort_budget_quota_usd": float(rem_cohort_budget),
             "remaining_underlying_quota_usd": rem_underlying,
+            "remaining_underlying_active_quota_usd": rem_underlying_active,
         }
 
     def _compute_loss_guard_in_tx(
@@ -593,6 +627,9 @@ class AuditStore:
         timing: Mapping[str, Any] | None = None,
         paper_benchmark: Mapping[str, Any] | None = None,
         fee_rate: float = 0.0,
+        valid_until: str | datetime | None = None,
+        hard_deadline_seconds: float = HARD_WINDOW_DEADLINE_SECONDS,
+        calibrated_now_fn: Any | None = None,
     ) -> dict[str, Any]:
         """Atomically claim `signal_id`, check all risk & balance caps, and reserve budget (`[P1-6]`).
 
@@ -632,8 +669,45 @@ class AuditStore:
 
                 self._claimed_signals.add(sig)
 
+                lock_now_dt = parse_utc_timestamp(calibrated_now_fn()) if callable(calibrated_now_fn) else now_dt
+                lock_now_iso = format_utc_iso(lock_now_dt)
+
+                if valid_until is not None:
+                    try:
+                        valid_dt = parse_utc_timestamp(valid_until)
+                        cap_s = float(hard_deadline_seconds)
+                        if not (0.0 < cap_s <= HARD_WINDOW_DEADLINE_SECONDS):
+                            raise ValueError(f"hard_deadline_seconds={cap_s} out of bounds")
+                        if window_start is not None and str(window_start).strip():
+                            w_start_dt = parse_utc_timestamp(window_start)
+                            if not (w_start_dt < valid_dt <= (w_start_dt + timedelta(seconds=cap_s))):
+                                raise ValueError(
+                                    f"valid_until={format_utc_iso(valid_dt)} outside (window_start={format_utc_iso(w_start_dt)}, +{cap_s}s]"
+                                )
+                    except (ValueError, TypeError) as dl_exc:
+                        return {
+                            "claimed": True,
+                            "aborted": True,
+                            "abort_status": "ABORTED_INVALID_DEADLINE",
+                            "abort_error": f"INVALID_DEADLINE_AT_RESERVE:{dl_exc}",
+                            "quota_cap_usd": Decimal("0"),
+                            "reserved_stake_usd": Decimal("0"),
+                        }
+                    within_deadline, _ = check_hard_deadline(lock_now_dt, valid_dt)
+                    if not within_deadline:
+                        return {
+                            "claimed": True,
+                            "aborted": True,
+                            "abort_status": "ABORTED_PAST_VALID_UNTIL",
+                            "abort_error": (
+                                f"HARD_DEADLINE_EXCEEDED_AT_RESERVE:now={lock_now_iso}>=valid_until={format_utc_iso(valid_dt)}"
+                            ),
+                            "quota_cap_usd": Decimal("0"),
+                            "reserved_stake_usd": Decimal("0"),
+                        }
+
                 # 1. Check independent live daily loss stop & consecutive loss cooldown (Design Gap #1)
-                loss_stats = self._compute_loss_guard_in_tx(con, now_dt)
+                loss_stats = self._compute_loss_guard_in_tx(con, lock_now_dt)
                 if max_daily_realized_loss_usd is not None:
                     daily_loss_cap = to_decimal(max_daily_realized_loss_usd, "max_daily_realized_loss_usd")
                     if daily_loss_cap > 0 and loss_stats["daily_realized_pnl_dec"] <= -daily_loss_cap:
@@ -654,7 +728,7 @@ class AuditStore:
                     last_loss_dt = loss_stats["last_loss_settled_at_utc"]
                     if cooldown_minutes_after_consecutive_losses <= 0 or (
                         last_loss_dt is not None
-                        and now_dt < (last_loss_dt + timedelta(minutes=float(cooldown_minutes_after_consecutive_losses)))
+                        and lock_now_dt < (last_loss_dt + timedelta(minutes=float(cooldown_minutes_after_consecutive_losses)))
                     ):
                         return {
                             "claimed": True,
@@ -684,7 +758,7 @@ class AuditStore:
                 # 3. Compute live quotas including any in-flight RESERVED / ORDER_STATE_UNKNOWN / DELAYED orders
                 quotas = self._compute_quotas_in_tx(
                     con=con,
-                    now_utc=now_dt,
+                    now_utc=lock_now_dt,
                     cohort_id=cohort_id,
                     live_scale_factor=scale_dec,
                     paper_caps=paper_caps,
@@ -693,8 +767,22 @@ class AuditStore:
                     clob_allowance_usdc=clob_allowance_usdc,
                     cohort_single_order_cap_usd=cohort_single_order_cap_usd,
                 )
+                rem_active_window = to_decimal(quotas["remaining_active_window_quota_usd"])
                 rem_underlying = to_decimal(
-                    quotas["remaining_underlying_quota_usd"].get(coin, paper_caps.get("max_underlying_open_risk_usd", 500.0))
+                    quotas["remaining_underlying_quota_usd"].get(
+                        coin,
+                        (scale_dec * to_decimal(paper_caps.get("max_underlying_open_risk_usd", 500.0))).quantize(
+                            USD_MICRO, rounding=ROUND_DOWN
+                        ),
+                    )
+                )
+                rem_underlying_active = to_decimal(
+                    quotas["remaining_underlying_active_quota_usd"].get(
+                        coin,
+                        (scale_dec * to_decimal(paper_caps.get("max_underlying_active_risk_usd", 300.0))).quantize(
+                            USD_MICRO, rounding=ROUND_DOWN
+                        ),
+                    )
                 )
                 in_flight_dec = to_decimal(quotas["in_flight_reserved_usdc"])
                 avail_free_usdc = max(
@@ -709,7 +797,9 @@ class AuditStore:
                 quota_cap = min(
                     live_max_order,
                     to_decimal(quotas["remaining_total_open_risk_quota_usd"]),
+                    rem_active_window,
                     rem_underlying,
+                    rem_underlying_active,
                     to_decimal(quotas["remaining_cohort_budget_quota_usd"]),
                     avail_free_usdc,
                     avail_allowance_usdc,
@@ -740,7 +830,7 @@ class AuditStore:
                             "neg_risk": neg_flag,
                             "status": "RESERVED",
                             "reserved_stake_usd": float(reserved_stake),
-                            "reserved_at_utc": now_iso,
+                            "reserved_at_utc": lock_now_iso,
                             "free_usdc_at_reserve": float(onchain_free_usdc_balance),
                             "live_scale_factor": float(scale_dec),
                             "fee_rate": float(fee_rate),
@@ -1407,6 +1497,8 @@ class AuditStore:
                 prior_last_loss_at: str | None = None
                 prior_pnl_history: list[dict[str, Any]] = []
                 prior_redeemed_keys: set[str] = set()
+                prior_processed_batches: set[str] = set()
+                prior_payout_ratios: Mapping[str, Any] | None = None
 
                 if existing_settle is not None:
                     prior_redeemed_amount = float(existing_settle["redeemed_usdc_amount"] or 0.0)
@@ -1429,6 +1521,11 @@ class AuditStore:
                                 for k in parsed_pj.get("redeemed_order_keys") or []:
                                     if k is not None:
                                         prior_redeemed_keys.add(str(k))
+                                for b in parsed_pj.get("processed_redemption_batches") or []:
+                                    if b is not None:
+                                        prior_processed_batches.add(str(b))
+                                if isinstance(parsed_pj.get("payout_ratios"), Mapping):
+                                    prior_payout_ratios = dict(parsed_pj["payout_ratios"])
                                 if parsed_pj.get("redeem_tx_id"):
                                     prior_tx_id = str(parsed_pj["redeem_tx_id"])
                                 if not prior_tx_hash and parsed_pj.get("redeem_tx_hash"):
@@ -1482,6 +1579,81 @@ class AuditStore:
                     if not prior_last_loss_at and prior_first_loss_at:
                         prior_last_loss_at = prior_first_loss_at
 
+                orders = con.execute(
+                    "SELECT signal_id, clob_order_id, paper_order_id, outcome, position_status, filled_quantity, total_spent_usdc FROM live_orders WHERE market_id=? ORDER BY rank ASC",
+                    (market_id,),
+                ).fetchall()
+
+                ratio_map = resolve_verified_payout_ratios(
+                    official_outcome,
+                    settlement_record.get("payout_ratios") or prior_payout_ratios,
+                )
+                if redeem_status == "AWAITING_OFFICIAL_PAYOUT_VECTOR" or ratio_map is None:
+                    live_cost_float = round(
+                        float(
+                            sum(
+                                (
+                                    to_decimal(o["total_spent_usdc"] or 0.0, "total_spent_usdc")
+                                    for o in orders
+                                    if str(o["position_status"]) not in ("NO_FILL", *IN_FLIGHT_POSITION_STATUSES)
+                                ),
+                                Decimal("0"),
+                            )
+                        ),
+                        6,
+                    )
+                    cumulative_redeemed_amount = round(prior_redeemed_amount, 6)
+                    live_realized_pnl = round(prior_pnl, 6)
+                    settled_at = prior_settled_at or incoming_ts
+                    rec_to_save = dict(settlement_record)
+                    rec_to_save["timestamp_utc"] = settled_at
+                    rec_to_save["first_settled_at_utc"] = prior_first_settled_at or settled_at
+                    rec_to_save["first_loss_confirmed_at_utc"] = prior_first_loss_at
+                    rec_to_save["last_loss_confirmed_at_utc"] = prior_last_loss_at
+                    rec_to_save["pnl_history"] = list(prior_pnl_history)
+                    rec_to_save["redeem_status"] = "AWAITING_OFFICIAL_PAYOUT_VECTOR"
+                    rec_to_save["redeemed_usdc_amount"] = cumulative_redeemed_amount
+                    rec_to_save["live_cost_usdc"] = live_cost_float
+                    rec_to_save["live_realized_pnl_usdc"] = live_realized_pnl
+                    rec_to_save["payout_ratios"] = prior_payout_ratios
+                    rec_to_save["redeemed_order_keys"] = sorted(prior_redeemed_keys)
+                    rec_to_save["processed_redemption_batches"] = sorted(prior_processed_batches)
+                    payload_text = json.dumps(rec_to_save, ensure_ascii=False, allow_nan=False)
+                    con.execute(
+                        """
+                        INSERT OR REPLACE INTO live_settlements(
+                            market_id, condition_id, official_outcome, paper_payout_usd,
+                            live_expected_payout_usdc, redeem_tx_hash, redeem_status,
+                            redeemed_usdc_amount, live_cost_usdc, live_realized_pnl_usdc,
+                            redeem_latency_seconds, settled_at_utc, payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            market_id,
+                            str(settlement_record.get("condition_id") or ""),
+                            official_outcome,
+                            float(settlement_record.get("paper_payout_usd") or 0.0),
+                            float(settlement_record.get("live_expected_payout_usdc") or 0.0),
+                            None,
+                            "AWAITING_OFFICIAL_PAYOUT_VECTOR",
+                            cumulative_redeemed_amount,
+                            live_cost_float,
+                            live_realized_pnl,
+                            (
+                                float(settlement_record["redeem_latency_seconds"])
+                                if settlement_record.get("redeem_latency_seconds") is not None
+                                else None
+                            ),
+                            settled_at,
+                            payload_text,
+                        ),
+                    )
+                    self._settled_markets.discard(market_id)
+                    if append_jsonl:
+                        self._append_jsonl(self.settlements_jsonl_path, rec_to_save)
+                    return
+
+                float_ratios = {k: float(v) for k, v in ratio_map.items()}
                 explicit_redeemed_keys_list = settlement_record.get("redeemed_order_keys")
                 explicit_new_keys_list = settlement_record.get("newly_redeemed_order_keys")
                 has_explicit_batch_keys = (
@@ -1490,33 +1662,53 @@ class AuditStore:
                 redeemed_order_keys: set[str] = set(prior_redeemed_keys)
                 if isinstance(explicit_redeemed_keys_list, list):
                     redeemed_order_keys.update(str(k) for k in explicit_redeemed_keys_list if k is not None)
-                if isinstance(explicit_new_keys_list, list):
-                    redeemed_order_keys.update(str(k) for k in explicit_new_keys_list if k is not None)
+                batch_new_keys = (
+                    [str(k) for k in explicit_new_keys_list if k is not None]
+                    if isinstance(explicit_new_keys_list, list)
+                    else []
+                )
+                redeemed_order_keys.update(batch_new_keys)
 
-                if newly_redeemed_raw is not None:
+                processed_batches: set[str] = set(prior_processed_batches)
+                batch_id = str(
+                    settlement_record.get("redeem_tx_hash")
+                    or settlement_record.get("redeem_tx_id")
+                    or (f"keys:{','.join(sorted(batch_new_keys))}:{batch_redeemed_amount:.6f}" if batch_new_keys else "")
+                )
+                is_duplicate_batch = (
+                    (bool(batch_new_keys) and set(batch_new_keys) <= prior_redeemed_keys)
+                    or (bool(batch_id) and batch_id in prior_processed_batches)
+                )
+
+                if is_duplicate_batch:
+                    cumulative_redeemed_amount = round(prior_redeemed_amount, 6)
+                elif newly_redeemed_raw is not None:
                     cumulative_redeemed_amount = round(prior_redeemed_amount + float(newly_redeemed_raw or 0.0), 6)
                 elif redeem_status in ("REDEEMED", "SHADOW_REDEEMED"):
                     cumulative_redeemed_amount = round(max(prior_redeemed_amount, batch_redeemed_amount), 6)
                 else:
                     cumulative_redeemed_amount = round(prior_redeemed_amount, 6)
 
-                orders = con.execute(
-                    "SELECT signal_id, clob_order_id, paper_order_id, outcome, position_status, filled_quantity, total_spent_usdc FROM live_orders WHERE market_id=? ORDER BY rank ASC",
-                    (market_id,),
-                ).fetchall()
+                if not is_duplicate_batch and batch_id and redeem_status in ("REDEEMED", "SHADOW_REDEEMED"):
+                    processed_batches.add(batch_id)
+
                 has_in_flight = any(str(o["position_status"]) in IN_FLIGHT_POSITION_STATUSES for o in orders)
                 if has_in_flight and redeem_status in ("LOST_NO_REDEEM", "NO_LIVE_POSITION"):
                     redeem_status = "AWAITING_ORDER_RECONCILIATION"
 
                 # [P2-R4-6]: When `has_explicit_batch_keys` is False, only allow implicit attribution
-                # if there are no in-flight orders AND the unredeemed winning share total in the market
+                # if there are no in-flight orders AND the unredeemed expected payout total in the market
                 # exactly matches `batch_redeemed_amount`!
-                unredeemed_winning_shares_total = Decimal("0")
+                unredeemed_expected_payout_total = Decimal("0")
                 for idx, order in enumerate(orders):
                     pos_stat = str(order["position_status"])
                     if pos_stat in ("NO_FILL", *IN_FLIGHT_POSITION_STATUSES):
                         continue
-                    if str(order["outcome"]).upper() == official_outcome:
+                    ord_out = _norm_outcome_key(order["outcome"])
+                    ord_ratio = ratio_map.get(ord_out, Decimal("0"))
+                    qty_dec = to_decimal(order["filled_quantity"] or "0", "filled_quantity")
+                    ord_expected_payout = (qty_dec * ord_ratio).quantize(USD_MICRO, rounding=ROUND_DOWN)
+                    if ord_ratio > Decimal("0") and ord_expected_payout > Decimal("0"):
                         sig_id = str(order["signal_id"])
                         c_keys = {
                             sig_id,
@@ -1525,14 +1717,12 @@ class AuditStore:
                             f"idx:{idx}:{str(order['outcome']).upper()}:{order['filled_quantity']}",
                         } - {""}
                         if pos_stat != "WON_REDEEMED" and not bool(c_keys & prior_redeemed_keys):
-                            unredeemed_winning_shares_total += to_decimal(
-                                order["filled_quantity"] or "0", "filled_quantity"
-                            )
+                            unredeemed_expected_payout_total += ord_expected_payout
                 allow_implicit_all_redeemed = (
                     not has_explicit_batch_keys
                     and not has_in_flight
                     and batch_redeemed_amount > 0
-                    and (unredeemed_winning_shares_total * Decimal("1.0")).quantize(USD_MICRO, rounding=ROUND_DOWN)
+                    and unredeemed_expected_payout_total.quantize(USD_MICRO, rounding=ROUND_DOWN)
                     == to_decimal(batch_redeemed_amount, "batch_redeemed_amount").quantize(USD_MICRO, rounding=ROUND_DOWN)
                 )
 
@@ -1554,7 +1744,12 @@ class AuditStore:
                         f"idx:{idx}:{str(order['outcome']).upper()}:{order['filled_quantity']}",
                     } - {""}
 
-                    if str(order["outcome"]).upper() == official_outcome:
+                    ord_out = _norm_outcome_key(order["outcome"])
+                    ord_ratio = ratio_map.get(ord_out, Decimal("0"))
+                    qty_dec = to_decimal(order["filled_quantity"] or "0", "filled_quantity")
+                    ord_expected_payout = (qty_dec * ord_ratio).quantize(USD_MICRO, rounding=ROUND_DOWN)
+
+                    if ord_ratio > Decimal("0") and ord_expected_payout > Decimal("0"):
                         if pos_stat == "WON_REDEEMED" or bool(candidate_keys & redeemed_order_keys):
                             new_status = "WON_REDEEMED"
                             redeemed_order_keys.add(sig_id)
@@ -1652,7 +1847,9 @@ class AuditStore:
                 rec_to_save["redeemed_usdc_amount"] = cumulative_redeemed_amount
                 rec_to_save["live_cost_usdc"] = live_cost_float
                 rec_to_save["live_realized_pnl_usdc"] = live_realized_pnl
+                rec_to_save["payout_ratios"] = float_ratios
                 rec_to_save["redeemed_order_keys"] = sorted(redeemed_order_keys)
+                rec_to_save["processed_redemption_batches"] = sorted(processed_batches)
 
                 if clear_pending_tx_for_next_batch:
                     rec_to_save["redeem_tx_id"] = None

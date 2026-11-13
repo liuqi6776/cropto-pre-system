@@ -13,7 +13,9 @@ Implements Section 2 (2.1, 2.2, 2.3) & Section 3 of the ARGON4 External Live Exe
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -22,6 +24,216 @@ import requests
 
 from .math_utils import parse_utc_timestamp
 from .safety import assert_safe_read_path
+
+
+REQUIRED_POLICY_FIELDS: tuple[str, ...] = (
+    "initial_capital_usd",
+    "max_tick_budget_usd",
+    "max_order_usd",
+    "max_active_window_risk_usd",
+    "max_open_risk_usd",
+    "max_underlying_active_risk_usd",
+    "max_underlying_open_risk_usd",
+    "max_buy_price",
+    "min_buy_price",
+    "daily_loss_fraction",
+)
+
+
+class PolicyVerificationError(RuntimeError):
+    """Fail-closed error raised whenever active trading policy cannot be verified."""
+
+    def __init__(self, reason_code: str, message: str | None = None) -> None:
+        self.reason_code = str(reason_code or "POLICY_UNVERIFIED")
+        super().__init__(message or self.reason_code)
+
+
+def _as_finite_float(val: Any, field_name: str) -> float:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise PolicyVerificationError("POLICY_INVALID_VALUE", f"Policy field {field_name} must be numeric, got {val!r}")
+    num = float(val)
+    if not math.isfinite(num):
+        raise PolicyVerificationError("POLICY_NON_FINITE_VALUE", f"Policy field {field_name} must be finite, got {val!r}")
+    return num
+
+
+def validate_policy_dict(payload: Any) -> dict[str, Any]:
+    """Strictly validate all required risk caps and price bounds in `argon4_forward_policy.json`."""
+    if not isinstance(payload, Mapping):
+        raise PolicyVerificationError("POLICY_INVALID_TYPE", "Policy JSON root must be an object")
+    missing = [k for k in REQUIRED_POLICY_FIELDS if k not in payload or payload.get(k) is None]
+    if missing:
+        raise PolicyVerificationError(
+            "POLICY_MISSING_FIELDS",
+            f"Missing required policy fields: {', '.join(missing)}",
+        )
+    out = dict(payload)
+    nums: dict[str, float] = {}
+    for k in REQUIRED_POLICY_FIELDS:
+        nums[k] = _as_finite_float(payload.get(k), k)
+
+    for pos_key in (
+        "initial_capital_usd",
+        "max_tick_budget_usd",
+        "max_order_usd",
+        "max_active_window_risk_usd",
+        "max_open_risk_usd",
+        "max_underlying_active_risk_usd",
+        "max_underlying_open_risk_usd",
+    ):
+        if nums[pos_key] <= 0.0:
+            raise PolicyVerificationError("POLICY_INVALID_BOUND", f"Policy field {pos_key} must be > 0, got {nums[pos_key]}")
+
+    if nums["max_active_window_risk_usd"] > nums["max_open_risk_usd"]:
+        raise PolicyVerificationError(
+            "POLICY_INVALID_BOUND",
+            f"max_active_window_risk_usd ({nums['max_active_window_risk_usd']}) exceeds max_open_risk_usd ({nums['max_open_risk_usd']})",
+        )
+    if nums["max_underlying_active_risk_usd"] > nums["max_underlying_open_risk_usd"]:
+        raise PolicyVerificationError(
+            "POLICY_INVALID_BOUND",
+            f"max_underlying_active_risk_usd ({nums['max_underlying_active_risk_usd']}) exceeds max_underlying_open_risk_usd ({nums['max_underlying_open_risk_usd']})",
+        )
+    if not (0.0 < nums["min_buy_price"] <= nums["max_buy_price"] < 1.0):
+        raise PolicyVerificationError(
+            "POLICY_INVALID_BOUND",
+            f"Invalid buy price bounds: min={nums['min_buy_price']}, max={nums['max_buy_price']}",
+        )
+    if not (0.0 < nums["daily_loss_fraction"] <= 1.0):
+        raise PolicyVerificationError(
+            "POLICY_INVALID_BOUND",
+            f"daily_loss_fraction must be in (0, 1], got {nums['daily_loss_fraction']}",
+        )
+
+    for map_key in ("stream_max_order_usd", "stream_min_buy_price"):
+        if map_key in payload and payload.get(map_key) is not None:
+            sub = payload.get(map_key)
+            if not isinstance(sub, Mapping):
+                raise PolicyVerificationError("POLICY_INVALID_VALUE", f"Policy field {map_key} must be a mapping")
+            for s_name, s_val in sub.items():
+                f_val = _as_finite_float(s_val, f"{map_key}.{s_name}")
+                if map_key == "stream_max_order_usd" and f_val <= 0.0:
+                    raise PolicyVerificationError("POLICY_INVALID_BOUND", f"{map_key}.{s_name} must be > 0")
+                if map_key == "stream_min_buy_price" and not (0.0 < f_val <= nums["max_buy_price"]):
+                    raise PolicyVerificationError("POLICY_INVALID_BOUND", f"{map_key}.{s_name} out of bounds")
+    return out
+
+
+def _normalize_outcome_key(raw_label: Any) -> str:
+    txt = str(raw_label or "").upper().strip()
+    if txt in ("UP", "YES", "0"):
+        return "UP"
+    if txt in ("DOWN", "NO", "1"):
+        return "DOWN"
+    return txt
+
+
+def extract_payout_ratios_from_payload(payload: Mapping[str, Any] | None) -> dict[str, float] | None:
+    """Extract verified per-outcome settlement payout ratios in `[0.0, 1.0]` from Polymarket/status payloads."""
+    if not isinstance(payload, Mapping):
+        return None
+
+    direct = payload.get("payout_ratios") or payload.get("payoutRatios")
+    if isinstance(direct, Mapping) and direct:
+        cleaned: dict[str, float] = {}
+        for k, v in direct.items():
+            if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+                cleaned = {}
+                break
+            try:
+                num = float(v)
+            except (ValueError, TypeError):
+                cleaned = {}
+                break
+            if not math.isfinite(num) or not (0.0 <= num <= 1.0):
+                cleaned = {}
+                break
+            cleaned[_normalize_outcome_key(k)] = num
+        if cleaned and ("UP" in cleaned or "DOWN" in cleaned) and 0.0 < sum(cleaned.values()) <= 1.000001:
+            return cleaned
+
+    raw_outcomes = payload.get("outcomes")
+    outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+    if not isinstance(outcomes, list) or len(outcomes) < 2:
+        # Also inspect CLOB `tokens` list when explicit token payout fields exist
+        tokens = payload.get("tokens")
+        if isinstance(tokens, list) and len(tokens) >= 2:
+            tok_ratios: dict[str, float] = {}
+            for tok in tokens:
+                if not isinstance(tok, Mapping):
+                    tok_ratios = {}
+                    break
+                key = _normalize_outcome_key(tok.get("outcome"))
+                pr = tok.get("payout_ratio")
+                if pr is None:
+                    pr = tok.get("payout")
+                if pr is None:
+                    tok_ratios = {}
+                    break
+                try:
+                    num = float(pr)
+                except (ValueError, TypeError):
+                    tok_ratios = {}
+                    break
+                if not math.isfinite(num) or not (0.0 <= num <= 1.0):
+                    tok_ratios = {}
+                    break
+                tok_ratios[key] = num
+            if tok_ratios and 0.0 < sum(tok_ratios.values()) <= 1.000001:
+                return tok_ratios
+        return None
+
+    raw_nums = (
+        payload.get("payoutNumerators")
+        if payload.get("payoutNumerators") is not None
+        else payload.get("payout_numerators")
+    )
+    if raw_nums is not None:
+        nums = json.loads(raw_nums) if isinstance(raw_nums, str) else raw_nums
+        denom_raw = payload.get("payoutDenominator") or payload.get("payout_denominator")
+        if isinstance(nums, list) and len(nums) == len(outcomes):
+            try:
+                floats = [float(x) for x in nums]
+            except (ValueError, TypeError):
+                floats = []
+            if floats and all(math.isfinite(x) and x >= 0.0 for x in floats):
+                if denom_raw is not None:
+                    try:
+                        denom = float(denom_raw)
+                    except (ValueError, TypeError):
+                        denom = 0.0
+                else:
+                    total = sum(floats)
+                    denom = total if total > 1.0 else 1.0
+                if denom > 0.0:
+                    ratios = {
+                        _normalize_outcome_key(lbl): round(val / denom, 8)
+                        for lbl, val in zip(outcomes, floats)
+                    }
+                    if (
+                        all(0.0 <= r <= 1.0 for r in ratios.values())
+                        and 0.0 < sum(ratios.values()) <= 1.000001
+                    ):
+                        return ratios
+
+    raw_prices = payload.get("outcomePrices")
+    prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+    if isinstance(prices, list) and len(prices) == len(outcomes):
+        parsed: dict[str, float] = {}
+        for out_label, pr_val in zip(outcomes, prices):
+            try:
+                num = float(pr_val)
+            except (ValueError, TypeError):
+                parsed = {}
+                break
+            if not math.isfinite(num) or not (0.0 <= num <= 1.0):
+                parsed = {}
+                break
+            parsed[_normalize_outcome_key(out_label)] = num
+        if parsed and 0.0 < sum(parsed.values()) <= 1.000001:
+            return parsed
+
+    return None
 
 
 class UpstreamObserver:
@@ -52,6 +264,9 @@ class UpstreamObserver:
         self._last_policy_mtime_ns: int | None = None
         self._last_policy_size: int | None = None
         self._cached_policy: dict[str, Any] | None = None
+        self._cached_policy_sha256: str | None = None
+        self._last_policy_error: str | None = None
+        self._last_policy_verified_at: str | None = None
 
         self._session = requests.Session()
         self._session.trust_env = False
@@ -70,39 +285,55 @@ class UpstreamObserver:
         elapsed = dt.timestamp() % 300.0
         return elapsed <= 21.0 or elapsed >= 298.0
 
+    def get_diagnostic_policy_state(self) -> dict[str, Any]:
+        """Return diagnostic-only policy status & last known policy (NEVER authorizes new orders)."""
+        return {
+            "verified": self._last_policy_error is None and self._cached_policy is not None,
+            "error": self._last_policy_error,
+            "last_verified_at": self._last_policy_verified_at,
+            "sha256": self._cached_policy_sha256,
+            "diagnostic_cached_policy": dict(self._cached_policy) if self._cached_policy is not None else None,
+        }
+
     def read_policy(self, force: bool = False) -> dict[str, Any]:
-        """Read `config/argon4_forward_policy.json` (read-only JSON file, hot-reloads on mtime/size change)."""
+        """Read and strictly validate `config/argon4_forward_policy.json` (fail-closed on any error)."""
         assert_safe_read_path(self.policy_path, self.upstream_root)
         if not self.policy_path.is_file():
-            if self._cached_policy is not None and not force:
-                return self._cached_policy
-            return {
-                "initial_capital_usd": 1269.0,
-                "max_tick_budget_usd": 380.0,
-                "max_order_usd": 240.0,
-                "max_open_risk_usd": 650.0,
-                "max_underlying_open_risk_usd": 450.0,
-                "max_buy_price": 0.515,
-                "min_buy_price": 0.37,
-            }
+            self._last_policy_mtime_ns = None
+            self._last_policy_size = None
+            self._last_policy_error = f"POLICY_FILE_MISSING:{self.policy_path}"
+            raise PolicyVerificationError("POLICY_FILE_MISSING", f"Policy file not found: {self.policy_path}")
         try:
             st = os.stat(self.policy_path)
             if (
                 not force
+                and self._last_policy_error is None
                 and self._cached_policy is not None
                 and st.st_mtime_ns == self._last_policy_mtime_ns
                 and st.st_size == self._last_policy_size
             ):
-                return self._cached_policy
-            raw = self.policy_path.read_text(encoding="utf-8")
-            self._cached_policy = json.loads(raw)
+                return dict(self._cached_policy)
+            raw_bytes = self.policy_path.read_bytes()
+            sha256_hex = hashlib.sha256(raw_bytes).hexdigest()
+            parsed = json.loads(raw_bytes.decode("utf-8"))
+            validated = validate_policy_dict(parsed)
+            self._cached_policy = validated
+            self._cached_policy_sha256 = sha256_hex
             self._last_policy_mtime_ns = st.st_mtime_ns
             self._last_policy_size = st.st_size
-            return self._cached_policy
-        except (OSError, json.JSONDecodeError):
-            if self._cached_policy is not None:
-                return self._cached_policy
+            self._last_policy_error = None
+            self._last_policy_verified_at = datetime.now(timezone.utc).isoformat()
+            return dict(validated)
+        except PolicyVerificationError as exc:
+            self._last_policy_mtime_ns = None
+            self._last_policy_size = None
+            self._last_policy_error = f"{exc.reason_code}:{exc}"
             raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            self._last_policy_mtime_ns = None
+            self._last_policy_size = None
+            self._last_policy_error = f"POLICY_READ_FAILED:{type(exc).__name__}:{exc}"
+            raise PolicyVerificationError("POLICY_READ_FAILED", f"Failed to verify policy {self.policy_path}: {exc}") from exc
 
     def poll_pipeline_state(self, force: bool = False) -> tuple[bool, dict[str, Any] | None, datetime]:
         """Check `pipeline_state.json` via `os.stat().st_mtime_ns`.
@@ -206,10 +437,21 @@ class UpstreamObserver:
                                 or ""
                             ).upper().strip()
                             if out in ("UP", "DOWN", "VOID"):
+                                ratios = extract_payout_ratios_from_payload(item)
+                                if ratios is None and isinstance(item.get("resolution"), Mapping):
+                                    ratios = extract_payout_ratios_from_payload(item["resolution"])
+                                if ratios is None and out in ("UP", "DOWN"):
+                                    ratios = {"UP": 1.0, "DOWN": 0.0} if out == "UP" else {"UP": 0.0, "DOWN": 1.0}
+                                if ratios is None and out == "VOID":
+                                    ratios = self.fetch_official_market_payout_ratios(
+                                        str(market_id),
+                                        str(condition_id or item.get("condition_id") or ""),
+                                    )
                                 return {
                                     "market_id": str(market_id),
                                     "condition_id": str(condition_id or item.get("condition_id") or ""),
                                     "official_outcome": out,
+                                    "payout_ratios": ratios,
                                     "paper_payout_usd": float(item.get("payout_usd") or 0.0),
                                     "paper_realized_pnl_usd": float(item.get("realized_pnl_usd") or 0.0),
                                     "settled_at": item.get("utc") or item.get("settled_at"),
@@ -245,6 +487,7 @@ class UpstreamObserver:
                             and res_st not in non_final_statuses
                             and mkt.get("disputed") is not True
                         ):
+                            clob_ratios = extract_payout_ratios_from_payload(mkt)
                             tokens = mkt.get("tokens")
                             if isinstance(tokens, list):
                                 winning_tokens = [
@@ -263,15 +506,29 @@ class UpstreamObserver:
                                     else:
                                         winner = raw_out
                                     if winner in ("UP", "DOWN", "VOID"):
+                                        if clob_ratios is None and winner in ("UP", "DOWN"):
+                                            clob_ratios = {"UP": 1.0, "DOWN": 0.0} if winner == "UP" else {"UP": 0.0, "DOWN": 1.0}
                                         return {
                                             "market_id": str(market_id),
                                             "condition_id": str(condition_id),
                                             "official_outcome": winner,
+                                            "payout_ratios": clob_ratios,
                                             "paper_payout_usd": 0.0,
                                             "paper_realized_pnl_usd": 0.0,
                                             "settled_at": None,
                                             "source": "polymarket_clob",
                                         }
+                            if clob_ratios is not None and any(0.0 < float(v) < 1.0 for v in clob_ratios.values()):
+                                return {
+                                    "market_id": str(market_id),
+                                    "condition_id": str(condition_id),
+                                    "official_outcome": "VOID",
+                                    "payout_ratios": clob_ratios,
+                                    "paper_payout_usd": 0.0,
+                                    "paper_realized_pnl_usd": 0.0,
+                                    "settled_at": None,
+                                    "source": "polymarket_clob",
+                                }
             except Exception:
                 pass
 
@@ -321,7 +578,11 @@ class UpstreamObserver:
                             )
                         )
                         if is_officially_resolved:
-                            # 3a. Check explicit winner / resolution outcome field first
+                            gamma_ratios = extract_payout_ratios_from_payload(gm)
+                            if gamma_ratios is None and res_block:
+                                gamma_ratios = extract_payout_ratios_from_payload(res_block)
+
+                            # 3a. Check explicit winner / resolution outcome field first (preserving extracted payout_ratios!)
                             explicit_out = str(
                                 gm.get("winningOutcome")
                                 or gm.get("winner")
@@ -335,52 +596,82 @@ class UpstreamObserver:
                                     if explicit_out in ("UP", "YES")
                                     else ("DOWN" if explicit_out in ("DOWN", "NO") else explicit_out)
                                 )
+                                if gamma_ratios is None and winner in ("UP", "DOWN"):
+                                    gamma_ratios = {"UP": 1.0, "DOWN": 0.0} if winner == "UP" else {"UP": 0.0, "DOWN": 1.0}
                                 return {
                                     "market_id": str(market_id),
                                     "condition_id": str(condition_id or gm.get("conditionId") or ""),
                                     "official_outcome": winner,
+                                    "payout_ratios": gamma_ratios,
                                     "paper_payout_usd": 0.0,
                                     "paper_realized_pnl_usd": 0.0,
                                     "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
                                     "source": "polymarket_gamma",
                                 }
 
-                            # 3b. Check exact settled payout vector [1, 0] or [0, 1] (NEVER price >= 0.99!)
-                            raw_outcomes = gm.get("outcomes")
-                            raw_prices = gm.get("outcomePrices")
-                            outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
-                            prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-                            if (
-                                isinstance(outcomes, list)
-                                and isinstance(prices, list)
-                                and len(outcomes) == len(prices)
-                                and len(outcomes) >= 2
-                            ):
-                                parsed_payouts: list[tuple[str, float]] = []
-                                for out_label, pr_val in zip(outcomes, prices):
-                                    try:
-                                        parsed_payouts.append((str(out_label), float(pr_val)))
-                                    except (ValueError, TypeError):
-                                        parsed_payouts = []
-                                        break
-                                exact_winners = [lbl for lbl, p_num in parsed_payouts if p_num == 1.0]
-                                exact_losers = [lbl for lbl, p_num in parsed_payouts if p_num == 0.0]
-                                if len(exact_winners) == 1 and len(exact_losers) == len(parsed_payouts) - 1:
-                                    norm = exact_winners[0].upper().strip()
-                                    winner = "UP" if norm in ("UP", "YES") else ("DOWN" if norm in ("DOWN", "NO") else norm)
+                            # 3b. Check exact settled payout vector ([1, 0], [0, 1], or split vector such as [0.5, 0.5])
+                            if gamma_ratios is not None:
+                                exact_winners = [lbl for lbl, p_num in gamma_ratios.items() if p_num == 1.0]
+                                exact_losers = [lbl for lbl, p_num in gamma_ratios.items() if p_num == 0.0]
+                                if len(exact_winners) == 1 and len(exact_losers) == len(gamma_ratios) - 1:
+                                    winner = _normalize_outcome_key(exact_winners[0])
                                     if winner in ("UP", "DOWN", "VOID"):
                                         return {
                                             "market_id": str(market_id),
                                             "condition_id": str(condition_id or gm.get("conditionId") or ""),
                                             "official_outcome": winner,
+                                            "payout_ratios": gamma_ratios,
                                             "paper_payout_usd": 0.0,
                                             "paper_realized_pnl_usd": 0.0,
                                             "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
                                             "source": "polymarket_gamma",
                                         }
+                                elif sum(gamma_ratios.values()) > 0.0:
+                                    return {
+                                        "market_id": str(market_id),
+                                        "condition_id": str(condition_id or gm.get("conditionId") or ""),
+                                        "official_outcome": "VOID",
+                                        "payout_ratios": gamma_ratios,
+                                        "paper_payout_usd": 0.0,
+                                        "paper_realized_pnl_usd": 0.0,
+                                        "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
+                                        "source": "polymarket_gamma",
+                                    }
             except Exception:
                 pass
 
+        return None
+
+    def fetch_official_market_payout_ratios(
+        self,
+        market_id: str,
+        condition_id: str | None = None,
+    ) -> dict[str, float] | None:
+        """Query Polymarket Gamma / CLOB directly for verified official oracle payout ratios."""
+        if market_id:
+            try:
+                resp = requests.get(f"{self.gamma_host}/markets/{market_id}", timeout=2.5)
+                if resp.status_code == 200:
+                    gm = resp.json()
+                    if isinstance(gm, Mapping) and gm.get("closed") is True and gm.get("disputed") is not True:
+                        ratios = extract_payout_ratios_from_payload(gm)
+                        if ratios is None and isinstance(gm.get("resolution"), Mapping):
+                            ratios = extract_payout_ratios_from_payload(gm["resolution"])
+                        if ratios is not None:
+                            return ratios
+            except Exception:
+                pass
+        if condition_id and str(condition_id).startswith("0x"):
+            try:
+                resp = requests.get(f"{self.clob_host}/markets/{condition_id}", timeout=2.5)
+                if resp.status_code == 200:
+                    mkt = resp.json()
+                    if isinstance(mkt, Mapping) and mkt.get("closed") is True and mkt.get("disputed") is not True:
+                        ratios = extract_payout_ratios_from_payload(mkt)
+                        if ratios is not None:
+                            return ratios
+            except Exception:
+                pass
         return None
 
     @staticmethod

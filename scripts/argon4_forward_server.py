@@ -972,29 +972,99 @@ class Application:
         }
 
         latest_quota = dict(latest_quota) if latest_quota else {}
-        lwq = dict(latest_quota.get("live_wallet_and_quotas") or {})
-        tot_locked = float(lwq.get("total_locked_open_risk_usdc") or 0.0)
-        act_locked = float(lwq.get("active_window_locked_usdc") or 0.0)
-        lwq["remaining_total_open_risk_quota_usd"] = round(max(0.0, scaled_caps["max_open_risk_usd"] - tot_locked), 4)
-        lwq["remaining_active_window_quota_usd"] = round(max(0.0, scaled_caps["max_active_window_risk_usd"] - act_locked), 4)
-        lwq["remaining_cohort_budget_quota_usd"] = round(max(0.0, scaled_caps["max_tick_budget_usd"] - act_locked), 4)
-        rem_u = dict(lwq.get("remaining_underlying_quota_usd") or {})
-        for coin in ("BTC", "ETH", "SOL", "BNB"):
-            rem_u[coin] = round(max(0.0, scaled_caps["max_underlying_open_risk_usd"]), 4) if tot_locked <= 1e-6 else round(
-                max(0.0, float(rem_u.get(coin, scaled_caps["max_underlying_open_risk_usd"]))), 4
-            )
-        lwq["remaining_underlying_quota_usd"] = rem_u
-        init_cap_val = float(paper_caps["initial_capital_usd"] or 1269.0)
+        raw_lwq = dict(latest_quota.get("live_wallet_and_quotas") or {})
         q_ts = str(latest_quota.get("timestamp_utc") or "")
         acc_started = str(overview.get("started_at") or "")
-        if (not q_ts or (acc_started and q_ts < acc_started)) and float(lwq.get("onchain_free_usdc_balance") or 0.0) < init_cap_val:
-            old_bal = float(lwq.get("onchain_free_usdc_balance") or 0.0)
-            lwq["onchain_free_usdc_balance"] = round(old_bal + 800.0 if 400.0 <= old_bal < init_cap_val else init_cap_val, 6)
+        q_dt: datetime | None = None
+        if q_ts:
+            try:
+                q_dt = datetime.fromisoformat(q_ts.replace("Z", "+00:00"))
+                if q_dt.tzinfo is None:
+                    q_dt = q_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                q_dt = None
+        q_age_seconds: float | None = (
+            round(max(0.0, (datetime.now(timezone.utc) - q_dt).total_seconds()), 2)
+            if q_dt is not None
+            else None
+        )
+        stale_limit = 180.0 if process_running else 600.0
+        if not q_ts or not raw_lwq or q_dt is None:
+            quota_snapshot_status = "MISSING"
+        elif (q_age_seconds is not None and q_age_seconds > stale_limit) or (acc_started and q_ts < acc_started):
+            quota_snapshot_status = "STALE"
+        else:
+            quota_snapshot_status = "FRESH"
+
+        if quota_snapshot_status == "MISSING":
+            lwq: dict[str, Any] = {
+                "proxy_wallet_address": raw_lwq.get("proxy_wallet_address") or service.get("funder_address"),
+                "onchain_free_usdc_balance": None,
+                "clob_allowance_usdc": None,
+                "in_flight_reserved_usdc": None,
+                "active_window_locked_usdc": None,
+                "expired_awaiting_resolution_usdc": None,
+                "resolved_unredeemed_winning_usdc": None,
+                "total_locked_open_risk_usdc": None,
+                "remaining_total_open_risk_quota_usd": None,
+                "remaining_active_window_quota_usd": None,
+                "remaining_cohort_budget_quota_usd": None,
+                "remaining_underlying_quota_usd": {},
+                "remaining_underlying_active_quota_usd": {},
+            }
+        else:
+            lwq = dict(raw_lwq)
+
         latest_quota["live_wallet_and_quotas"] = lwq
+        raw_paper_cash = overview.get("cash")
+        paper_cash_usd = (
+            round(float(raw_paper_cash), 6)
+            if isinstance(raw_paper_cash, (int, float)) and not isinstance(raw_paper_cash, bool)
+            else None
+        )
+        raw_paper_locked = overview.get("locked_cost")
+        paper_locked_cost_usd = (
+            round(float(raw_paper_locked), 6)
+            if isinstance(raw_paper_locked, (int, float)) and not isinstance(raw_paper_locked, bool)
+            else None
+        )
+        raw_paper_pnl = overview.get("realized_pnl")
+        paper_realized_pnl_usd = (
+            round(float(raw_paper_pnl), 6)
+            if isinstance(raw_paper_pnl, (int, float)) and not isinstance(raw_paper_pnl, bool)
+            else None
+        )
         latest_quota["paper_account_mirror"] = {
-            "paper_cash_usd": float(overview.get("cash") or init_cap_val),
-            "paper_locked_cost_usd": float(overview.get("locked_cost") or 0.0),
-            "paper_realized_pnl_usd": float(overview.get("realized_pnl") or 0.0),
+            "paper_cash_usd": paper_cash_usd,
+            "paper_locked_cost_usd": paper_locked_cost_usd,
+            "paper_realized_pnl_usd": paper_realized_pnl_usd,
+        }
+
+        raw_init_cap = policy.get("initial_capital_usd")
+        configured_init_cap = (
+            round(float(raw_init_cap), 6)
+            if isinstance(raw_init_cap, (int, float)) and not isinstance(raw_init_cap, bool)
+            else None
+        )
+        capital_sources = {
+            "configured_initial_capital": {
+                "value_usd": configured_init_cap,
+                "source": "config/argon4_forward_policy.json",
+                "timestamp_utc": None,
+                "status": "CONFIGURED" if configured_init_cap is not None else "MISSING",
+            },
+            "paper_account_cash": {
+                "value_usd": paper_cash_usd,
+                "source": "paper_account_overview",
+                "timestamp_utc": overview.get("updated_at") or overview.get("last_updated_utc") or acc_started or None,
+                "status": "LIVE" if paper_cash_usd is not None else "MISSING",
+            },
+            "live_wallet_free_pusd": {
+                "value_usd": lwq.get("onchain_free_usdc_balance"),
+                "source": "live_quota_snapshot" if quota_snapshot_status != "MISSING" else "UNAVAILABLE",
+                "timestamp_utc": q_ts or None,
+                "status": quota_snapshot_status,
+            },
         }
 
         pipeline_obj = self.pipeline.status() if self.pipeline else {"active": False, "models": {}, "status": "NOT_ENABLED"}
@@ -1014,6 +1084,9 @@ class Application:
             "paper_policy_caps": paper_caps,
             "scaled_live_caps": scaled_caps,
             "latest_quota": latest_quota,
+            "quota_snapshot_status": quota_snapshot_status,
+            "quota_snapshot_age_seconds": q_age_seconds,
+            "capital_sources": capital_sources,
             "quota_history": raw_quotas[-40:],
             "summary": {
                 "total_signals": len(dedup_orders),

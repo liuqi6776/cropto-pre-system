@@ -1,6 +1,7 @@
 "use strict";
 const $=id=>document.getElementById(id);
 const money=v=>v===null||v===undefined||Number.isNaN(Number(v))?"待估值":new Intl.NumberFormat("en-US",{style:"currency",currency:"USD"}).format(Number(v));
+const moneyStrict=(v,fb="未知")=>(v===null||v===undefined||v===""||Number.isNaN(Number(v)))?String(fb):new Intl.NumberFormat("en-US",{style:"currency",currency:"USD"}).format(Number(v));
 const signedMoney=v=>v===null||v===undefined||Number.isNaN(Number(v))?"待结算":(Number(v)>0?"+":"")+money(Number(v));
 const when=v=>v?new Date(v).toLocaleString("zh-CN",{hour12:false}):"尚无观测";
 function elem(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=String(text);if(cls)n.className=cls;return n;}
@@ -23,8 +24,22 @@ function initTabs(){
  btnMon.addEventListener("click",()=>activate("monitor"));
 }
 
+function renderLiveError(reason){
+ if(!$("tab-panel-live"))return;
+ const msg=reason||"实盘接口请求失败";
+ if($("tab-badge-live")){
+  $("tab-badge-live").textContent="接口异常 · "+msg;
+  $("tab-badge-live").className="tab-pill offline";
+ }
+ if($("live-banner")){
+  $("live-banner").className="banner offline";
+  $("live-banner").textContent="🟠 实盘接口异常（"+msg+"）：未能获取实盘账户与配额状态，请检查 /api/live_dashboard 或 argon4-order 服务";
+ }
+ if($("live-proc-status"))$("live-proc-status").textContent="接口异常 ("+msg+")";
+}
 function renderLive(d){
  if(!d||!$("tab-panel-live"))return;
+ if(d.__live_error){renderLiveError(d.reason);return;}
  const sum=d.summary||{};
  const q=(d.latest_quota||{}).live_wallet_and_quotas||{};
  const pm=(d.latest_quota||{}).paper_account_mirror||{};
@@ -32,24 +47,34 @@ function renderLive(d){
  const caps=d.scaled_live_caps||{};
  const pcaps=d.paper_policy_caps||{};
  const running=Boolean(d.process_running);
+ const snapStatus=d.quota_snapshot_status||((d.latest_quota||{}).timestamp_utc?"FRESH":"MISSING");
+ const snapAge=d.quota_snapshot_age_seconds;
+ const capSrc=d.capital_sources||{};
  const pnl=Number(sum.realized_pnl_usdc||0);
  const wins=Number(sum.wins||0),losses=Number(sum.losses||0);
  const filled=Number(sum.filled_orders||0),totalSig=Number(sum.total_signals||0);
 
  if($("tab-badge-live")){
-  $("tab-badge-live").textContent=running?("运行中 · "+signedMoney(pnl)):"已停止 · "+signedMoney(pnl);
-  $("tab-badge-live").className="tab-pill "+(running?"ok":"offline");
+  $("tab-badge-live").textContent=(snapStatus==="STALE"?"快照过期 · ":snapStatus==="MISSING"?"无快照 · ":"")+(running?("运行中 · "+signedMoney(pnl)):"已停止 · "+signedMoney(pnl));
+  $("tab-badge-live").className="tab-pill "+((running&&snapStatus==="FRESH")?"ok":"offline");
  }
  if($("live-banner")){
-  $("live-banner").className=running?"banner ok":"banner offline";
-  $("live-banner").textContent=running
+  $("live-banner").className=(running&&snapStatus==="FRESH")?"banner ok":"banner offline";
+  const snapNote=snapStatus==="MISSING"?" · ⚠️ 暂无配额快照（未伪造余额）":snapStatus==="STALE"?" · ⚠️ 配额快照已过期("+Number(snapAge||0).toFixed(0)+"s)":"";
+  $("live-banner").textContent=(running
    ?("外部实盘执行器运行中 (PID "+svc.pid+") · 模式 "+(d.active_mode||"live").toUpperCase()+" · 缩放 "+(Number(d.live_scale_factor||1)*100).toFixed(0)+"% · 实盘已结算 "+wins+" 胜 "+losses+" 负 · 净收益 "+signedMoney(pnl))
-   :("外部实盘执行器未运行 · 历史已结算 "+wins+" 胜 "+losses+" 负 · 累计净收益 "+signedMoney(pnl));
+   :("外部实盘执行器未运行 · 历史已结算 "+wins+" 胜 "+losses+" 负 · 累计净收益 "+signedMoney(pnl)))+snapNote;
  }
- if($("live-free-usdc"))$("live-free-usdc").textContent=q.onchain_free_usdc_balance!==undefined?money(q.onchain_free_usdc_balance):"—";
- if($("live-allowance-note"))$("live-allowance-note").textContent=q.clob_allowance_usdc>1e6?"CLOB 授权充足 · 提现硬锁已开启":"等待读取钱包快照";
- if($("live-open-risk"))$("live-open-risk").textContent=q.total_locked_open_risk_usdc!==undefined?money(q.total_locked_open_risk_usdc):"$0.00";
- if($("live-remaining-quota"))$("live-remaining-quota").textContent="剩余总风险额度 "+money(q.remaining_total_open_risk_quota_usd)+" · 窗口剩余 "+money(q.remaining_cohort_budget_quota_usd);
+ if($("live-free-usdc"))$("live-free-usdc").textContent=snapStatus==="MISSING"?"未知":(moneyStrict(q.onchain_free_usdc_balance)+(snapStatus==="STALE"?" (已过期)":""));
+ if($("live-allowance-note")){
+  const srcObj=capSrc.live_wallet_free_pusd||{};
+  const srcTag=srcObj.source?("来源: "+srcObj.source):"";
+  if(snapStatus==="MISSING")$("live-allowance-note").textContent="未知（暂无实时余额快照）";
+  else if(snapStatus==="STALE")$("live-allowance-note").textContent="已过期("+Number(snapAge||0).toFixed(0)+"s) · "+(srcTag||"请核实钱包快照");
+  else $("live-allowance-note").textContent=(Number(q.clob_allowance_usdc)>1e6?"CLOB 授权充足 · 提现硬锁已开启":q.clob_allowance_usdc!==null&&q.clob_allowance_usdc!==undefined?"CLOB 授权 "+moneyStrict(q.clob_allowance_usdc):"授权未知")+(srcTag?" · "+srcTag:"");
+ }
+ if($("live-open-risk"))$("live-open-risk").textContent=snapStatus==="MISSING"?"未知":(moneyStrict(q.total_locked_open_risk_usdc)+(snapStatus==="STALE"?" (已过期)":""));
+ if($("live-remaining-quota"))$("live-remaining-quota").textContent=snapStatus==="MISSING"?"剩余总风险额度 未知 · 窗口剩余 未知":("剩余总风险额度 "+moneyStrict(q.remaining_total_open_risk_quota_usd)+" · 窗口剩余 "+moneyStrict(q.remaining_cohort_budget_quota_usd)+(snapStatus==="STALE"?" (快照已过期)":""));
  if($("live-pnl")){
   $("live-pnl").textContent=signedMoney(pnl);
   $("live-pnl").className=pnl>0?"pnl-pos":(pnl<0?"pnl-neg":"");
@@ -60,13 +85,13 @@ function renderLive(d){
  if($("live-fills-count"))$("live-fills-count").textContent=filled+" 笔成交 / "+totalSig+" 信号";
  if($("live-latency-note"))$("live-latency-note").textContent="累计实付 "+money(sum.total_spent_usdc||0)+(sum.avg_clob_rtt_ms?" · CLOB 往返 "+Number(sum.avg_clob_rtt_ms).toFixed(0)+"ms":"")+(sum.avg_slippage_bps!==null&&sum.avg_slippage_bps!==undefined?" · 均价滑点 "+Number(sum.avg_slippage_bps).toFixed(1)+" bps":"");
 
- if($("live-quota-time"))$("live-quota-time").textContent=when((d.latest_quota||{}).timestamp_utc);
- if($("live-lock-active"))$("live-lock-active").textContent=money(q.active_window_locked_usdc||0);
- if($("live-lock-expired"))$("live-lock-expired").textContent=money(q.expired_awaiting_resolution_usdc||0);
- if($("live-lock-unredeemed"))$("live-lock-unredeemed").textContent=money(q.resolved_unredeemed_winning_usdc||0);
- if($("live-lock-inflight"))$("live-lock-inflight").textContent=money(q.in_flight_reserved_usdc||0);
- if($("live-rem-cohort"))$("live-rem-cohort").textContent=money(q.remaining_cohort_budget_quota_usd||0);
- if($("live-scaled-caps"))$("live-scaled-caps").textContent="单笔 "+money(caps.max_order_usd)+" / 窗口 "+money(caps.max_tick_budget_usd)+" / 总敞口 "+money(caps.max_open_risk_usd)+"（模拟基准 "+money(pcaps.max_order_usd)+" / "+money(pcaps.max_tick_budget_usd)+"）";
+ if($("live-quota-time"))$("live-quota-time").textContent=snapStatus==="MISSING"?"无快照":(when((d.latest_quota||{}).timestamp_utc)+(snapStatus==="STALE"?" (已过期 "+Number(snapAge||0).toFixed(0)+"s)":""));
+ if($("live-lock-active"))$("live-lock-active").textContent=moneyStrict(q.active_window_locked_usdc);
+ if($("live-lock-expired"))$("live-lock-expired").textContent=moneyStrict(q.expired_awaiting_resolution_usdc);
+ if($("live-lock-unredeemed"))$("live-lock-unredeemed").textContent=moneyStrict(q.resolved_unredeemed_winning_usdc);
+ if($("live-lock-inflight"))$("live-lock-inflight").textContent=moneyStrict(q.in_flight_reserved_usdc);
+ if($("live-rem-cohort"))$("live-rem-cohort").textContent=moneyStrict(q.remaining_cohort_budget_quota_usd);
+ if($("live-scaled-caps"))$("live-scaled-caps").textContent="单笔 "+moneyStrict(caps.max_order_usd)+" / 窗口 "+moneyStrict(caps.max_tick_budget_usd)+" / 活动 "+moneyStrict(caps.max_active_window_risk_usd)+" / 总敞口 "+moneyStrict(caps.max_open_risk_usd)+"（模拟基准 "+moneyStrict(pcaps.max_order_usd)+" / "+moneyStrict(pcaps.max_tick_budget_usd)+"）";
 
  const uqBody=$("live-underlying-quotas");
  if(uqBody){
@@ -75,8 +100,8 @@ function renderLive(d){
   for(const [coin,rem] of Object.entries(remMap)){
    const r=elem("tr");
    cell(r,coin);
-   cell(r,money(caps.max_underlying_open_risk_usd||450));
-   cell(r,money(rem));
+   cell(r,moneyStrict(caps.max_underlying_open_risk_usd));
+   cell(r,moneyStrict(rem));
    uqBody.append(r);
   }
  }
@@ -85,10 +110,10 @@ function renderLive(d){
  if($("live-proc-status"))$("live-proc-status").textContent=running?"正常运行中 (LIVE)":"已停止";
  if($("live-started-at"))$("live-started-at").textContent=when(svc.started_at);
  if($("live-mode-info"))$("live-mode-info").textContent=(svc.mode||"live").toUpperCase()+" / "+(svc.order_type||"FAK");
- if($("live-scale-info"))$("live-scale-info").textContent=(Number(d.live_scale_factor||1)*100).toFixed(0)+"% (1:1 跟随 "+money(pcaps.initial_capital_usd||1269)+" 统一配置)";
- if($("live-wallet-addr"))$("live-wallet-addr").textContent=svc.funder_address||q.proxy_wallet_address||"—";
+ if($("live-scale-info"))$("live-scale-info").textContent=(Number(d.live_scale_factor||1)*100).toFixed(0)+"% (1:1 跟随 "+moneyStrict(pcaps.initial_capital_usd)+" 统一配置)";
+ if($("live-wallet-addr"))$("live-wallet-addr").textContent=svc.funder_address||q.proxy_wallet_address||"未知";
  if($("live-withdraw-lock"))$("live-withdraw-lock").textContent=svc.withdrawal_permission===false?"已硬锁禁止提现 (withdrawal_permission=false)":"未知";
- if($("live-paper-mirror"))$("live-paper-mirror").textContent=pm.paper_cash_usd!==undefined?("镜像现金 "+money(pm.paper_cash_usd)+" · 镜像净盈亏 "+signedMoney(pm.paper_realized_pnl_usd)):"—";
+ if($("live-paper-mirror"))$("live-paper-mirror").textContent=(pm.paper_cash_usd!==null&&pm.paper_cash_usd!==undefined)?("镜像现金 "+moneyStrict(pm.paper_cash_usd)+" · 镜像净盈亏 "+signedMoney(pm.paper_realized_pnl_usd)+((capSrc.paper_account_cash||{}).source?" ("+capSrc.paper_account_cash.source+")":"")):"未知（无镜像快照）";
 
  const stByMkt={};
  for(const st of (d.settlements||[])){if(st.market_id)stByMkt[String(st.market_id)]=st;}
@@ -461,7 +486,9 @@ function render5mTimelineRows(){
 }
 
 function render5mDiagnostics(statusRes,liveRes){
- const src=(liveRes&&liveRes.cohort_timeline&&liveRes.cohort_timeline.length)?liveRes:statusRes;
+ const liveErr=!liveRes||Boolean(liveRes.__live_error);
+ const validLive=liveErr?null:liveRes;
+ const src=(validLive&&validLive.cohort_timeline&&validLive.cohort_timeline.length)?validLive:statusRes;
  if(!src||!$("diag5m-section"))return;
  const live5m=src.status_5m_live||statusRes.status_5m_live||{};
  const sum=src.cohort_summary||statusRes.cohort_summary||{};
@@ -472,11 +499,19 @@ function render5mDiagnostics(statusRes,liveRes){
  const ov=live5m.overall_state||"HEALTHY";
  const pillClsMap={HEALTHY:"diag-pill diag-healthy",IN_WINDOW:"diag-pill diag-inwin",DATA_MISMATCH:"diag-pill diag-warn",RATE_LIMIT:"diag-pill diag-warn",STUCK:"diag-pill diag-err",WARMUP:"diag-pill diag-muted"};
  if($("diag5m-badge")){
-  $("diag5m-badge").className=pillClsMap[ov]||"diag-pill diag-healthy";
-  $("diag5m-badge").textContent=live5m.overall_badge||"运行中";
+  if(liveErr){
+   $("diag5m-badge").className="diag-pill diag-warn";
+   $("diag5m-badge").textContent="🟠 实盘接口异常";
+  }else{
+   $("diag5m-badge").className=pillClsMap[ov]||"diag-pill diag-healthy";
+   $("diag5m-badge").textContent=live5m.overall_badge||"运行中";
+  }
  }
  if($("diag5m-headline")){
-  $("diag5m-headline").textContent=live5m.headline||"—";
+  const baseHeadline=live5m.headline||"—";
+  $("diag5m-headline").textContent=liveErr
+   ?("[告警] 实盘接口 /api/live_dashboard 异常（"+(liveRes&&liveRes.reason?liveRes.reason:"响应为空")+"） · "+baseHeadline)
+   :baseHeadline;
  }
 
  const hb=live5m.heartbeat||{},clk=live5m.clock||{},da=live5m.data_alignment||{},lf=live5m.latest_finished_window;
@@ -547,14 +582,19 @@ function init5mControls(){
 
 async function refresh(){
  try{
+  const liveFetch=fetch("/api/live_dashboard",{cache:"no-store"}).then(async r=>{
+   if(!r.ok)return {__live_error:true,reason:"HTTP "+r.status};
+   try{return await r.json();}catch(_e){return {__live_error:true,reason:"JSON解析失败"};}
+  }).catch(e=>({__live_error:true,reason:(e&&e.message)?String(e.message):"网络请求失败"}));
   const [statusRes,ledgerRes,equityRes,liveRes]=await Promise.all([
    fetch("/api/status",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP");return r.json();}),
    fetch("/api/ledger",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP");return r.json();}),
    fetch("/api/equity",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP");return r.json();}),
-   fetch("/api/live_dashboard",{cache:"no-store"}).then(r=>r.ok?r.json():null).catch(()=>null)
+   liveFetch
   ]);
   render5mDiagnostics(statusRes,liveRes);
-  if(liveRes)renderLive(liveRes);
+  if(liveRes&&liveRes.__live_error)renderLiveError(liveRes.reason);
+  else if(liveRes)renderLive(liveRes);
   renderEngineering(statusRes);render(statusRes);drawChart(equityRes);
   const tradeEvents=((statusRes.account||{}).trade_events)||[];
   const rawRows=Array.isArray(ledgerRes)?ledgerRes:(ledgerRes.events||ledgerRes.ledger||[]);

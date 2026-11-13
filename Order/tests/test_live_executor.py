@@ -157,6 +157,7 @@ def test_zero_latency_local_signing_makes_zero_http_gets(monkeypatch: pytest.Mon
         approved_stake_usd=200.0,
         live_scale_factor=0.10,
         fee_rate=0.075,
+        valid_until=(datetime.now(timezone.utc) + timedelta(seconds=15)).isoformat(),
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     assert res["live_execution"]["clob_status"] == "SHADOW_MATCHED"
@@ -230,12 +231,16 @@ def test_multi_look_incremental_execution_idempotency_and_deadline_abort(tmp_pat
     policy_path.write_text(
         json.dumps(
             {
+                "initial_capital_usd": 1269.0,
                 "max_order_usd": 200.0,
+                "max_active_window_risk_usd": 1000.0,
                 "max_open_risk_usd": 1000.0,
+                "max_underlying_active_risk_usd": 500.0,
                 "max_underlying_open_risk_usd": 500.0,
                 "max_tick_budget_usd": 1200.0,
                 "max_buy_price": 0.515,
                 "min_buy_price": 0.37,
+                "daily_loss_fraction": 0.15,
             }
         ),
         encoding="utf-8",
@@ -422,6 +427,18 @@ def test_multi_look_incremental_execution_idempotency_and_deadline_abort(tmp_pat
         "signal_id": sig_sol,
         "market_id": "512347",
         "underlying": "SOL",
+        "allocation_authorization": {
+            **fill_eth["allocation_authorization"],
+            "rank": 3,
+            "signal_id": sig_sol,
+            "market_id": "512347",
+        },
+        "venue_market": {
+            **fill_eth["venue_market"],
+            "market_id": "512347",
+            "asset": "SOL",
+            "window_end": "2026-11-08T13:20:00Z",
+        },
     }
     decisions["SOL_15m"] = {
         "status": "SIGNAL",
@@ -521,6 +538,7 @@ def test_p1_1_v2_order_protocol_and_pusd_router_and_adapter_redemption() -> None
         live_scale_factor=0.10,
         fee_rate=0.075,
         market_protocol="v2",
+        valid_until=(datetime.now(timezone.utc) + timedelta(seconds=15)).isoformat(),
     )
     assert len(captured_orders) == 1
     o_args, o_opts, signed_ord = captured_orders[0]
@@ -585,6 +603,7 @@ def test_p1_2_order_timeout_marked_unknown_locks_risk_and_reconciles(tmp_path: P
         approved_stake_usd=200.0,
         live_scale_factor=0.10,
         fee_rate=0.075,
+        valid_until=(datetime.now(timezone.utc) + timedelta(seconds=15)).isoformat(),
     )
     live_exec = res["live_execution"]
     assert live_exec["clob_status"] == "ORDER_STATE_UNKNOWN"
@@ -832,7 +851,9 @@ def test_p1_6_concurrent_instances_cannot_breach_open_risk_cap_and_single_instan
     now_iso = "2026-11-08T13:05:05+00:00"
     paper_caps = {
         "max_order_usd": 200.0,
+        "max_active_window_risk_usd": 5000.0,
         "max_open_risk_usd": 1000.0,  # 0.10x scale -> $100.00 live open risk cap
+        "max_underlying_active_risk_usd": 5000.0,
         "max_underlying_open_risk_usd": 5000.0,
         "max_tick_budget_usd": 5000.0,
     }
@@ -1044,6 +1065,7 @@ def test_design_gaps_loss_cooldown_mode_isolation_downtime_catchup_min_price_wal
         fee_rate=0.075,
         observed_best_ask=0.34,
         min_buy_price=0.37,
+        valid_until=(datetime.now(timezone.utc) + timedelta(seconds=15)).isoformat(),
     )
     assert res_low_ask["live_execution"]["clob_status"] == "ABORTED_BELOW_MIN_BUY_PRICE"
     assert res_low_ask["live_execution"]["filled_quantity"] == "0.00"
@@ -1246,7 +1268,21 @@ def test_round2_p1_a_engine_reconcile_no_keyerror_and_pre_send_crash_recovery(tm
     upstream_root = tmp_path / "crypto-predict_system"
     state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
     policy_path = upstream_root / "configs/argon4_ locked_policy.json"
-    _write_json(policy_path, {"max_order_usd": 200.0, "max_open_risk_usd": 1000.0, "max_underlying_open_risk_usd": 500.0, "max_tick_budget_usd": 1200.0})
+    _write_json(
+        policy_path,
+        {
+            "initial_capital_usd": 1269.0,
+            "max_order_usd": 200.0,
+            "max_active_window_risk_usd": 1000.0,
+            "max_open_risk_usd": 1000.0,
+            "max_underlying_active_risk_usd": 500.0,
+            "max_underlying_open_risk_usd": 500.0,
+            "max_tick_budget_usd": 1200.0,
+            "max_buy_price": 0.515,
+            "min_buy_price": 0.37,
+            "daily_loss_fraction": 0.15,
+        },
+    )
 
     cohort_id = "2026-11-08T13:05:00+00:00"
     _write_json(state_path, _make_sample_pipeline_state(cohort_id, signal_id="sig_crash_mid_send", approved_stake=200.0))
@@ -1352,7 +1388,21 @@ def test_round2_p1_b_unknown_order_never_prematurely_settled_as_lost_and_redeems
     upstream_root = tmp_path / "crypto-predict_system"
     state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
     policy_path = upstream_root / "configs/argon4_locked_policy.json"
-    _write_json(policy_path, {"max_order_usd": 200.0, "max_open_risk_usd": 1000.0})
+    _write_json(
+        policy_path,
+        {
+            "initial_capital_usd": 1269.0,
+            "max_order_usd": 200.0,
+            "max_active_window_risk_usd": 1000.0,
+            "max_open_risk_usd": 1000.0,
+            "max_underlying_active_risk_usd": 500.0,
+            "max_underlying_open_risk_usd": 500.0,
+            "max_tick_budget_usd": 1200.0,
+            "max_buy_price": 0.515,
+            "min_buy_price": 0.37,
+            "daily_loss_fraction": 0.15,
+        },
+    )
     _write_json(state_path, _make_sample_pipeline_state("2026-11-08T13:05:00+00:00", signal_id="sig_late_win", approved_stake=200.0))
 
     pk = "0x" + ("72" * 32)
@@ -1849,6 +1899,7 @@ def test_round2_p1_f_and_remaining_fixes_stop_script_live_orderbook_min_price_sc
         paper_benchmark={"avg_fill_price": 0.45},  # Paper fill was 0.45, but live orderbook crashed to 0.31!
         observed_best_ask=None,
         min_buy_price=0.37,
+        valid_until=(datetime.now(timezone.utc) + timedelta(seconds=15)).isoformat(),
     )
     assert post_called is False
     assert res_book["live_execution"]["clob_status"] == "ABORTED_BELOW_MIN_BUY_PRICE"
@@ -1863,6 +1914,8 @@ def test_round2_p1_f_and_remaining_fixes_stop_script_live_orderbook_min_price_sc
     _write_json(policy_path, {})
     _write_json(state_path, {})
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     audit = AuditStore(
         local_root / "runtime/live/live_audit.sqlite3",
         local_root / "runtime/live/live_orders.jsonl",
@@ -1931,6 +1984,8 @@ def test_round3_p1_1_redemption_amount_bound_to_submitted_batch_and_new_fills_re
     pk = "0x" + ("81" * 32)
     cands = derive_polymarket_candidate_wallets(pk)
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     observer.fetch_status = lambda allow_in_critical_window=False: None  # type: ignore[method-assign]
     observer.fetch_ledger = lambda allow_in_critical_window=False: []  # type: ignore[method-assign]
 
@@ -2418,6 +2473,7 @@ def test_round3_p1_4_live_order_aborts_when_orderbook_fetch_fails_or_is_stale() 
         live_scale_factor=0.10,
         fee_rate=0.075,
         paper_benchmark={"avg_fill_price": 0.40},
+        valid_until="2026-11-08T13:35:20+00:00",
         reference_now_utc=now_utc,
     )
     assert post_called is False
@@ -2433,6 +2489,7 @@ def test_round3_p1_4_live_order_aborts_when_orderbook_fetch_fails_or_is_stale() 
         fee_rate=0.075,
         observed_best_ask=0.40,
         book_observed_at="2026-11-08T13:05:05+00:00",  # 30 minutes before 13:35:05!
+        valid_until="2026-11-08T13:35:20+00:00",
         reference_now_utc=now_utc,
     )
     assert post_called is False
@@ -2448,6 +2505,7 @@ def test_round3_p1_4_live_order_aborts_when_orderbook_fetch_fails_or_is_stale() 
         approved_stake_usd=200.0,
         live_scale_factor=0.10,
         fee_rate=0.075,
+        valid_until="2026-11-08T13:35:20+00:00",
         reference_now_utc=now_utc,
     )
     assert post_called is False
@@ -2548,7 +2606,21 @@ def test_round4_p1_1_unsent_or_local_sign_failed_order_never_claims_historical_t
     upstream_root = tmp_path / "crypto-predict_system"
     state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
     policy_path = upstream_root / "configs/argon4_locked_policy.json"
-    _write_json(policy_path, {})
+    _write_json(
+        policy_path,
+        {
+            "initial_capital_usd": 1269.0,
+            "max_tick_budget_usd": 1200.0,
+            "max_order_usd": 240.0,
+            "max_active_window_risk_usd": 450.0,
+            "max_open_risk_usd": 650.0,
+            "max_underlying_active_risk_usd": 300.0,
+            "max_underlying_open_risk_usd": 450.0,
+            "max_buy_price": 0.515,
+            "min_buy_price": 0.37,
+            "daily_loss_fraction": 0.15,
+        },
+    )
 
     now_dt = datetime.now(timezone.utc)
     w_start = (now_dt - timedelta(seconds=5)).isoformat()
@@ -2621,6 +2693,8 @@ def test_round4_p1_1_unsent_or_local_sign_failed_order_never_claims_historical_t
     )
 
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     observer.fetch_status = lambda allow_in_critical_window=False: None  # type: ignore[method-assign]
     observer.fetch_ledger = lambda allow_in_critical_window=False: []  # type: ignore[method-assign]
     audit = AuditStore(
@@ -3017,6 +3091,8 @@ def test_round4_p1_3_crash_during_redemption_confirm_wait_persists_tx_id_and_pre
     _write_json(state_path, {})
 
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     observer.fetch_ledger = lambda allow_in_critical_window=False: []  # type: ignore[method-assign]
     observer.fetch_status = lambda allow_in_critical_window=False: {}  # type: ignore[method-assign]
     observer.is_in_critical_window = lambda now_utc=None: False  # type: ignore[method-assign]
@@ -3174,6 +3250,8 @@ def test_round4_p2_4_balance_refresh_and_redemption_credit_never_double_count_fu
     _write_json(state_path, {})
 
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     observer.fetch_ledger = lambda allow_in_critical_window=False: []  # type: ignore[method-assign]
     observer.fetch_status = lambda allow_in_critical_window=False: {}  # type: ignore[method-assign]
     observer.is_in_critical_window = lambda now_utc=None: False  # type: ignore[method-assign]
@@ -3319,6 +3397,8 @@ def test_round4_p2_5_zero_fee_rate_preserved_during_order_reconciliation(
     _write_json(state_path, {})
 
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     observer.is_in_critical_window = lambda now_utc=None: False  # type: ignore[method-assign]
 
     audit = AuditStore(
@@ -3991,6 +4071,8 @@ def test_round5_p1_3_ambiguous_redemption_submission_never_resubmits_before_reco
     _write_json(state_path, {})
 
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     observer.fetch_ledger = lambda allow_in_critical_window=False: []  # type: ignore[method-assign]
     observer.fetch_status = lambda allow_in_critical_window=False: {}  # type: ignore[method-assign]
     observer.is_in_critical_window = lambda now_utc=None: False  # type: ignore[method-assign]
@@ -4210,6 +4292,8 @@ def test_round5_p2_4_pre_confirmation_balance_refresh_never_skips_new_redemption
     _write_json(state_path, {})
 
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     observer.fetch_ledger = lambda allow_in_critical_window=False: []  # type: ignore[method-assign]
     observer.fetch_status = lambda allow_in_critical_window=False: {}  # type: ignore[method-assign]
     observer.is_in_critical_window = lambda now_utc=None: False  # type: ignore[method-assign]
@@ -4354,6 +4438,8 @@ def test_round6_p1_1_authoritative_balance_on_redemption_confirm_never_double_cr
     _write_json(state_path, {})
 
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     observer.fetch_ledger = lambda allow_in_critical_window=False: []  # type: ignore[method-assign]
     observer.fetch_status = lambda allow_in_critical_window=False: {}  # type: ignore[method-assign]
     observer.is_in_critical_window = lambda now_utc=None: False  # type: ignore[method-assign]
@@ -4502,6 +4588,7 @@ def test_round6_p1_1_authoritative_balance_on_redemption_confirm_never_double_cr
         approved_stake_usd=200.0,
         live_scale_factor=0.10,
         fee_rate=0.0,
+        valid_until=(datetime.now(timezone.utc) + timedelta(seconds=15)).isoformat(),
     )
     assert spend_res["live_execution"]["total_spent_usdc"] == 20.0
     assert clob._cached_free_usdc == 68.0
@@ -4536,7 +4623,21 @@ def test_round6_p2_2_reconciled_timed_out_order_reduces_cached_free_balance_and_
     upstream_root = tmp_path / "crypto-predict_system"
     state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
     policy_path = upstream_root / "configs/argon4_locked_policy.json"
-    _write_json(policy_path, {})
+    _write_json(
+        policy_path,
+        {
+            "initial_capital_usd": 1269.0,
+            "max_tick_budget_usd": 1200.0,
+            "max_order_usd": 240.0,
+            "max_active_window_risk_usd": 450.0,
+            "max_open_risk_usd": 650.0,
+            "max_underlying_active_risk_usd": 300.0,
+            "max_underlying_open_risk_usd": 450.0,
+            "max_buy_price": 0.515,
+            "min_buy_price": 0.37,
+            "daily_loss_fraction": 0.15,
+        },
+    )
 
     now_dt = datetime.now(timezone.utc)
     w_start = (now_dt - timedelta(seconds=3)).isoformat()
@@ -4609,6 +4710,8 @@ def test_round6_p2_2_reconciled_timed_out_order_reduces_cached_free_balance_and_
     _write_json(state_path, _make_state("sig_r6_timeout_1", "990002"))
 
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     observer.fetch_status = lambda allow_in_critical_window=False: {}  # type: ignore[method-assign]
     observer.fetch_ledger = lambda allow_in_critical_window=False: []  # type: ignore[method-assign]
     observer.is_in_critical_window = lambda now_utc=None: False  # type: ignore[method-assign]
@@ -4776,6 +4879,8 @@ def test_round6_p2_3_real_relayer_v2_client_recovers_unknown_redemption_with_att
     _write_json(state_path, {})
 
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     observer.fetch_ledger = lambda allow_in_critical_window=False: []  # type: ignore[method-assign]
     observer.fetch_status = lambda allow_in_critical_window=False: {}  # type: ignore[method-assign]
     observer.is_in_critical_window = lambda now_utc=None: False  # type: ignore[method-assign]
@@ -4999,13 +5104,19 @@ def test_policy_hot_reload_and_dynamic_daily_loss_cap(tmp_path: Path) -> None:
             "initial_capital_usd": 1000,
             "max_order_usd": 40,
             "max_tick_budget_usd": 80,
+            "max_active_window_risk_usd": 160,
             "max_open_risk_usd": 200,
+            "max_underlying_active_risk_usd": 100,
             "max_underlying_open_risk_usd": 120,
+            "max_buy_price": 0.515,
+            "min_buy_price": 0.37,
             "daily_loss_fraction": 0.08,
         },
     )
 
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     audit = AuditStore(
         local_root / "runtime/live/live_audit.sqlite3",
         local_root / "runtime/live/live_orders.jsonl",
@@ -5037,8 +5148,12 @@ def test_policy_hot_reload_and_dynamic_daily_loss_cap(tmp_path: Path) -> None:
             "max_order_usd": 240,
             "stream_max_order_usd": {"BTC_15m": 240, "ETH_5m": 180, "SOL_5m": 45},
             "max_tick_budget_usd": 380,
+            "max_active_window_risk_usd": 450,
             "max_open_risk_usd": 650,
+            "max_underlying_active_risk_usd": 300,
             "max_underlying_open_risk_usd": 450,
+            "max_buy_price": 0.515,
+            "min_buy_price": 0.37,
             "daily_loss_fraction": 0.15,
         },
     )
@@ -5104,7 +5219,9 @@ def test_fak_killed_no_match_multi_look_retry_and_cohort_nonblocking(tmp_path: P
             "max_order_usd": 240,
             "stream_max_order_usd": {"BTC_15m": 240, "ETH_5m": 180},
             "max_tick_budget_usd": 380,
+            "max_active_window_risk_usd": 450,
             "max_open_risk_usd": 650,
+            "max_underlying_active_risk_usd": 300,
             "max_underlying_open_risk_usd": 450,
             "min_buy_price": 0.37,
             "max_buy_price": 0.515,
@@ -5113,6 +5230,8 @@ def test_fak_killed_no_match_multi_look_retry_and_cohort_nonblocking(tmp_path: P
     )
 
     observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
     audit = AuditStore(
         local_root / "runtime/live/live_audit.sqlite3",
         local_root / "runtime/live/live_orders.jsonl",
@@ -5433,6 +5552,785 @@ def test_fak_killed_no_match_multi_look_retry_and_cohort_nonblocking(tmp_path: P
     )
     assert fast_res["live_execution"]["clob_status"] == "MATCHED"
     observer.close()
+
+
+def test_audit_p1_1_missing_or_abnormal_deadline_and_decision_evidence_never_submit(tmp_path: Path) -> None:
+    """[Audit P1-1] Missing/invalid deadlines, missing decision evidence, cross-window mismatches,
+    valid_until > window_start+20s, and expired calibrated clock checks at reserve/post-sign/pre-send
+    must reject cleanly and NEVER invoke post_order; normal in-window signal still executes.
+    """
+    from argon4_live.math_utils import derive_effective_order_deadline, validate_and_project_utc
+
+    pk = "0x" + ("81" * 32)
+    cands = derive_polymarket_candidate_wallets(pk)
+    upstream_root = tmp_path / "crypto-predict_system"
+    local_root = tmp_path / "Order"
+    state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
+    policy_path = upstream_root / "config/argon4_forward_policy.json"
+    _write_json(state_path, {})
+    _write_json(
+        policy_path,
+        {
+            "initial_capital_usd": 1269.0,
+            "max_order_usd": 240.0,
+            "max_tick_budget_usd": 380.0,
+            "max_active_window_risk_usd": 450.0,
+            "max_open_risk_usd": 650.0,
+            "max_underlying_active_risk_usd": 300.0,
+            "max_underlying_open_risk_usd": 450.0,
+            "min_buy_price": 0.37,
+            "max_buy_price": 0.515,
+            "daily_loss_fraction": 0.15,
+        },
+    )
+
+    observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
+    audit = AuditStore(
+        local_root / "runtime/live/live_audit.sqlite3",
+        local_root / "runtime/live/live_orders.jsonl",
+        local_root / "runtime/live/live_quota_snapshots.jsonl",
+        local_root / "runtime/live/live_settlements.jsonl",
+        local_root=local_root,
+        upstream_root=upstream_root,
+    )
+    clob = ClobExecutor(
+        mode="live",
+        private_key=pk,
+        api_key="k",
+        api_secret="dGVzdF9zZWNyZXRfYmFzZTY0X3N0cmluZ18xMjM0NTY=",
+        api_passphrase="p",
+        signature_type=3,
+        funder_address=cands["beacon_deposit_wallet"],
+        auto_derive_l2_creds=False,
+    )
+    clob._cached_free_usdc = 500.0
+    clob._cached_allowance_usdc = 500.0
+    clob.balance_verified = True
+    assert clob.client is not None
+    submitted_calls: list[Any] = []
+
+    def _spy_post(*a: Any, **kw: Any) -> dict[str, Any]:
+        submitted_calls.append((a, kw))
+        return {"success": True, "orderID": f"0xord_{len(submitted_calls)}", "status": "MATCHED", "takingAmount": "20.00", "makingAmount": "10.00"}
+
+    clob.client.get_order_book = lambda tid: {"asks": [{"price": "0.50", "size": "500"}]}  # type: ignore[method-assign]
+    clob.client.post_order = _spy_post  # type: ignore[method-assign]
+    redeemer = AutoRedeemer(mode="shadow", withdrawal_permission=False)
+    engine = LiveExecutionEngine(
+        config={"capital_and_scaling": {"live_scale_factor": 0.10}, "withdrawal_permission": False},
+        observer=observer,
+        audit_store=audit,
+        clob_executor=clob,
+        redeemer=redeemer,
+    )
+
+    w0 = datetime(2026, 11, 10, 0, 0, 0, tzinfo=timezone.utc)
+    w_end = w0 + timedelta(minutes=5)
+    t_det = w0 + timedelta(seconds=10)
+
+    def _make_sig_state(sig_id: str, *, valid_until: Any, w_start_sig: Any, last_cohort: Any, include_decision: bool = True) -> dict[str, Any]:
+        decs = {}
+        if include_decision:
+            decs["BTC_5m"] = {
+                "status": "SIGNAL",
+                "outcome": "UP",
+                "signal": {
+                    "signal_id": sig_id,
+                    "stream": "BTC_5m",
+                    "underlying": "BTC",
+                    "outcome": "UP",
+                    "market_id": "970001",
+                    "decision_at": (w0 + timedelta(seconds=5)).isoformat(),
+                    **({"valid_until": valid_until} if valid_until is not None else {}),
+                    **({"window_start": w_start_sig} if w_start_sig is not None else {}),
+                    "window_end": w_end.isoformat(),
+                },
+            }
+        return {
+            "status": "PAPER_CYCLE_COMPLETE",
+            "active": True,
+            "last_cohort": last_cohort,
+            "clock": {"status": "CALIBRATED", "server_minus_local_seconds": 0.0, "uncertainty_seconds": 0.05},
+            "decisions": decs,
+            "execution": {
+                "status": "PROCESSED",
+                "fills": [
+                    {
+                        "order_id": f"paper:{sig_id}",
+                        "signal_id": sig_id,
+                        "market_id": "970001",
+                        "underlying": "BTC",
+                        "outcome": "UP",
+                        "status": "OPEN",
+                        "quantity": "100.00000000",
+                        "cost_usd": 50.0,
+                        "fee_usd": 0.0,
+                        "unfilled_budget_usd": 0.0,
+                        "fill_at": (w0 + timedelta(seconds=6)).isoformat(),
+                        "book_observed_at": (w0 + timedelta(seconds=9, milliseconds=800)).isoformat(),
+                        "observed_best_ask": 0.50,
+                        "fee_quote": {"fee_model": "polymarket_crypto", "rate": 0.0, "exponent": 1, "taker_only": True},
+                        "allocation_authorization": {
+                            "policy": "RANKED_CAPACITY_WATERFALL",
+                            "plan_id": "cohort:p1_1",
+                            "cohort_id": w0.isoformat(),
+                            "rank": 1,
+                            "signal_id": sig_id,
+                            "market_id": "970001",
+                            "approved_stake_usd": 50.0,
+                            "cohort_capacity_usd": 380.0,
+                        },
+                        "venue_market": {
+                            "market_id": "970001",
+                            "condition_id": "0x" + ("91" * 32),
+                            "protocol": "v1",
+                            "asset": "BTC",
+                            "window_start": w0.isoformat(),
+                            "window_end": w_end.isoformat(),
+                            "outcome_ids": {"UP": "10001", "DOWN": "10002"},
+                        },
+                    }
+                ],
+            },
+        }
+
+    # 1. Missing valid_until & missing window_start & missing matching decision evidence -> NEVER submit
+    for bad_idx, bad_state in enumerate(
+        [
+            _make_sig_state("sig_no_vu", valid_until=None, w_start_sig=w0.isoformat(), last_cohort=w0.isoformat()),
+            _make_sig_state("sig_no_ws", valid_until=(w0 + timedelta(seconds=20)).isoformat(), w_start_sig=None, last_cohort=w0.isoformat()),
+            _make_sig_state("sig_no_dec", valid_until=(w0 + timedelta(seconds=20)).isoformat(), w_start_sig=w0.isoformat(), last_cohort=w0.isoformat(), include_decision=False),
+            # 2. Explicit next-day valid_until (> window_start + 20s) must REJECT, never silently clamp!
+            _make_sig_state("sig_next_day", valid_until=(w0 + timedelta(days=1)).isoformat(), w_start_sig=w0.isoformat(), last_cohort=w0.isoformat()),
+            # 3. Cross-window mismatch
+            _make_sig_state("sig_cross_win", valid_until=(w0 + timedelta(seconds=20)).isoformat(), w_start_sig=w0.isoformat(), last_cohort=(w0 - timedelta(minutes=5)).isoformat()),
+        ],
+        start=1,
+    ):
+        recs = engine.process_pipeline_state(bad_state, detected_at_local_utc=t_det)
+        assert len(recs) == 1, f"case {bad_idx}"
+        assert recs[0]["live_execution"]["clob_status"] == "ABORTED_INVALID_DEADLINE"
+        assert submitted_calls == []
+    assert audit.get_open_live_orders() == []
+
+    # Invalid clock projection rejected
+    with pytest.raises(ValueError):
+        validate_and_project_utc(t_det, {"calibrated_offset_seconds": float("nan")})
+
+    # Direct executor call missing valid_until or valid_until > window_start + 20s never hits post_order
+    res_dir_missing = clob.sign_and_execute_fak(token_id="10001", approved_stake_usd=50.0, live_scale_factor=0.1, fee_rate=0.0, valid_until=None, reference_now_utc=t_det)
+    res_dir_nextday = clob.sign_and_execute_fak(
+        token_id="10001",
+        approved_stake_usd=50.0,
+        live_scale_factor=0.1,
+        fee_rate=0.0,
+        window_start=w0.isoformat(),
+        valid_until=(w0 + timedelta(days=1)).isoformat(),
+        reference_now_utc=t_det,
+    )
+    assert res_dir_missing["live_execution"]["clob_status"] == "ABORTED_INVALID_DEADLINE"
+    assert res_dir_nextday["live_execution"]["clob_status"] == "ABORTED_INVALID_DEADLINE"
+    assert submitted_calls == []
+
+    # 4. Calibrated clock past deadline inside reserve transaction -> aborts without post_order
+    res_reserve_late = audit.claim_and_reserve_signal(
+        signal_id="sig_late_at_reserve",
+        cohort_id=w0.isoformat(),
+        stream="BTC_5m",
+        paper_order_id="paper:sig_late_at_reserve",
+        rank=1,
+        market_id="970001",
+        condition_id="0x" + ("91" * 32),
+        token_id="10001",
+        outcome="UP",
+        underlying="BTC",
+        window_start=w0.isoformat(),
+        window_end=w_end.isoformat(),
+        approved_stake_usd=50.0,
+        live_scale_factor=1.0,
+        paper_caps=observer.read_policy(),
+        proxy_wallet_address=cands["beacon_deposit_wallet"],
+        onchain_free_usdc_balance=500.0,
+        clob_allowance_usdc=500.0,
+        balance_verified=True,
+        valid_until=(w0 + timedelta(seconds=20)).isoformat(),
+        calibrated_now_fn=lambda: w0 + timedelta(seconds=20, milliseconds=1),
+        claimed_at_utc=t_det,
+    )
+    assert res_reserve_late["aborted"] is True
+    assert res_reserve_late["abort_status"] == "ABORTED_PAST_VALID_UNTIL"
+
+    # 5. Normal in-window signal executes cleanly
+    good_state = _make_sig_state("sig_good_win", valid_until=(w0 + timedelta(seconds=20)).isoformat(), w_start_sig=w0.isoformat(), last_cohort=w0.isoformat())
+    good_recs = engine.process_pipeline_state(good_state, detected_at_local_utc=w0 + timedelta(seconds=8))
+    assert len(good_recs) == 1
+    assert good_recs[0]["live_execution"]["clob_status"] == "MATCHED"
+    assert len(submitted_calls) == 1
+    observer.close()
+
+
+def test_audit_p1_2_active_window_and_underlying_active_risk_caps_enforced_atomically(tmp_path: Path) -> None:
+    """[Audit P1-2] Enforce max_active_window_risk_usd ($450) and max_underlying_active_risk_usd ($300)
+    atomically inside SQLite BEGIN IMMEDIATE reservations, across ORDER_STATE_UNKNOWN and concurrency.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    local_root = tmp_path / "Order"
+    upstream_root = tmp_path / "crypto-predict_system"
+    audit = AuditStore(
+        local_root / "runtime/live/live_audit.sqlite3",
+        local_root / "runtime/live/live_orders.jsonl",
+        local_root / "runtime/live/live_quota_snapshots.jsonl",
+        local_root / "runtime/live/live_settlements.jsonl",
+        local_root=local_root,
+        upstream_root=upstream_root,
+    )
+    paper_caps = {
+        "max_order_usd": 240.0,
+        "max_tick_budget_usd": 380.0,
+        "max_active_window_risk_usd": 450.0,
+        "max_open_risk_usd": 650.0,
+        "max_underlying_active_risk_usd": 300.0,
+        "max_underlying_open_risk_usd": 450.0,
+    }
+    now_dt = datetime(2026, 11, 10, 1, 5, 5, tzinfo=timezone.utc)
+    w_start = "2026-11-10T01:05:00+00:00"
+    w_end = "2026-11-10T01:20:00+00:00"
+
+    def _seed_active(sig_id: str, coin: str, spent: float, *, status: str = "MATCHED") -> None:
+        audit.record_order_execution(
+            {
+                "cohort_id": w_start,
+                "stream": f"{coin}_15m",
+                "rank": 1,
+                "signal_id": sig_id,
+                "paper_order_id": f"paper:{sig_id}",
+                "market_id": f"m_{sig_id}",
+                "condition_id": "0x" + ("11" * 32),
+                "token_id": "10001",
+                "outcome": "UP",
+                "timing": {"decision_at": now_dt.isoformat(), "paper_fill_at": now_dt.isoformat(), "live_detected_at": now_dt.isoformat(), "live_signed_at": now_dt.isoformat(), "live_http_sent_at": now_dt.isoformat(), "live_http_ack_at": now_dt.isoformat(), "detection_lag_ms": 1.0, "clob_rtt_ms": 5.0},
+                "paper_benchmark": {"approved_stake_usd": spent, "paper_filled_quantity": spent * 2, "avg_fill_price": 0.50, "cost_usd": spent, "fee_usd": 0.0, "total_spent_usd": spent},
+                "live_execution": {
+                    "live_scale_factor": 1.0,
+                    "order_type": "FAK",
+                    "limit_price": 0.50,
+                    "requested_stake_usd": spent,
+                    "requested_quantity": f"{spent * 2:.2f}",
+                    "clob_order_id": f"0x_{sig_id}",
+                    "clob_status": status,
+                    "error_code": None,
+                    "filled_quantity": f"{spent * 2:.2f}" if status == "MATCHED" else "0.00",
+                    "avg_fill_price": 0.50 if status == "MATCHED" else None,
+                    "cost_usdc": spent if status == "MATCHED" else 0.0,
+                    "fee_usdc": 0.0,
+                    "total_spent_usdc": spent if status == "MATCHED" else 0.0,
+                    "unfilled_stake_usdc": 0.0,
+                    "polygon_tx_hashes": [],
+                    "onchain_confirmed": True,
+                    "onchain_block_number": 100,
+                },
+                "diff_vs_paper": {},
+            },
+            underlying=coin,
+            window_start=w_start,
+            window_end=w_end,
+        )
+
+    # Active BTC $200 + active ETH $200 = $400 active -> rem_active_window must be $50 (not $250!)
+    _seed_active("seed_btc_200", "BTC", 200.0, status="ORDER_STATE_UNKNOWN")
+    _seed_active("seed_eth_200", "ETH", 200.0, status="MATCHED")
+    proxy_addr = "0x" + ("12" * 20)
+    snap = audit.compute_live_quotas(
+        now_utc=now_dt,
+        cohort_id="2026-11-10T01:10:00+00:00",
+        live_scale_factor=1.0,
+        paper_caps=paper_caps,
+        proxy_wallet_address=proxy_addr,
+        onchain_free_usdc_balance=2000.0,
+        clob_allowance_usdc=2000.0,
+    )
+    assert snap["remaining_active_window_quota_usd"] == 50.0
+    assert snap["remaining_total_open_risk_quota_usd"] == 250.0
+    assert snap["remaining_underlying_active_quota_usd"]["BTC"] == 100.0
+
+    # Concurrent SOL $100 reservations under $450 active cap -> total newly reserved across all threads <= $50!
+    def _reserve_sol(idx: int) -> float:
+        r = audit.claim_and_reserve_signal(
+            signal_id=f"sol_conc_{idx}",
+            cohort_id="2026-11-10T01:10:00+00:00",
+            stream="SOL_5m",
+            paper_order_id=f"paper:sol_{idx}",
+            rank=idx + 1,
+            market_id=f"m_sol_{idx}",
+            condition_id="0x" + ("22" * 32),
+            token_id="20001",
+            outcome="UP",
+            underlying="SOL",
+            window_start="2026-11-10T01:10:00+00:00",
+            window_end="2026-11-10T01:15:00+00:00",
+            approved_stake_usd=100.0,
+            live_scale_factor=1.0,
+            paper_caps=paper_caps,
+            proxy_wallet_address=proxy_addr,
+            onchain_free_usdc_balance=2000.0,
+            clob_allowance_usdc=2000.0,
+            balance_verified=True,
+            claimed_at_utc=now_dt,
+        )
+        return float(r.get("reserved_stake_usd") or 0.0) if not r.get("aborted") else 0.0
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        sol_reserved = list(pool.map(_reserve_sol, range(4)))
+    assert round(sum(sol_reserved), 2) == 50.0
+
+    # Settle ETH + SOL, leaving BTC $200 active -> per-underlying BTC active cap ($300) allows at most $100 more BTC!
+    audit.record_settlement_and_redeem(
+        {
+            "timestamp_utc": now_dt.isoformat(),
+            "settled_at_utc": now_dt.isoformat(),
+            "market_id": "m_seed_eth_200",
+            "condition_id": "0x" + ("11" * 32),
+            "official_outcome": "UP",
+            "market_protocol": "v1",
+            "paper_payout_usd": 400.0,
+            "paper_realized_pnl_usd": 200.0,
+            "live_expected_payout_usdc": 400.0,
+            "redeem_status": "REDEEMED",
+            "redeemed_usdc_amount": 400.0,
+            "newly_redeemed_usdc_amount": 400.0,
+            "redeemed_order_keys": ["sig:seed_eth_200"],
+        }
+    )
+    with audit._connection(immediate=True) as con:
+        con.execute("DELETE FROM live_orders WHERE signal_id LIKE 'sol_conc_%'")
+
+    res_btc_cap = audit.claim_and_reserve_signal(
+        signal_id="btc_add_150",
+        cohort_id="2026-11-10T01:10:00+00:00",
+        stream="BTC_5m",
+        paper_order_id="paper:btc_add_150",
+        rank=1,
+        market_id="m_btc_add_150",
+        condition_id="0x" + ("33" * 32),
+        token_id="10001",
+        outcome="UP",
+        underlying="BTC",
+        window_start="2026-11-10T01:10:00+00:00",
+        window_end="2026-11-10T01:15:00+00:00",
+        approved_stake_usd=150.0,
+        live_scale_factor=1.0,
+        paper_caps=paper_caps,
+        proxy_wallet_address=proxy_addr,
+        onchain_free_usdc_balance=2000.0,
+        clob_allowance_usdc=2000.0,
+        balance_verified=True,
+        claimed_at_utc=now_dt,
+    )
+    assert float(res_btc_cap["reserved_stake_usd"]) == 100.0
+
+    res_btc_exhausted = audit.claim_and_reserve_signal(
+        signal_id="btc_add_extra",
+        cohort_id="2026-11-10T01:10:00+00:00",
+        stream="BTC_5m",
+        paper_order_id="paper:btc_add_extra",
+        rank=2,
+        market_id="m_btc_add_extra",
+        condition_id="0x" + ("44" * 32),
+        token_id="10001",
+        outcome="UP",
+        underlying="BTC",
+        window_start="2026-11-10T01:10:00+00:00",
+        window_end="2026-11-10T01:15:00+00:00",
+        approved_stake_usd=50.0,
+        live_scale_factor=1.0,
+        paper_caps=paper_caps,
+        proxy_wallet_address=proxy_addr,
+        onchain_free_usdc_balance=2000.0,
+        clob_allowance_usdc=2000.0,
+        balance_verified=True,
+        claimed_at_utc=now_dt,
+    )
+    assert float(res_btc_exhausted["quota_cap_usd"]) == 0.0
+    assert float(res_btc_exhausted["reserved_stake_usd"]) == 0.0
+
+
+def test_audit_p1_3_missing_corrupt_or_incomplete_policy_halts_new_orders_fail_closed(tmp_path: Path) -> None:
+    """[Audit P1-3] Missing, corrupt, incomplete, or non-finite policy files must raise
+    PolicyVerificationError (no defaults, no stale cache), halt new orders, keep
+    reconcile/settlement operational, and auto-resume only when a valid policy recovers.
+    """
+    from argon4_live.upstream_observer import PolicyVerificationError
+
+    pk = "0x" + ("83" * 32)
+    cands = derive_polymarket_candidate_wallets(pk)
+    upstream_root = tmp_path / "crypto-predict_system"
+    local_root = tmp_path / "Order"
+    state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
+    policy_path = upstream_root / "config/argon4_forward_policy.json"
+
+    valid_policy = {
+        "initial_capital_usd": 1269.0,
+        "max_order_usd": 240.0,
+        "max_tick_budget_usd": 380.0,
+        "max_active_window_risk_usd": 450.0,
+        "max_open_risk_usd": 650.0,
+        "max_underlying_active_risk_usd": 300.0,
+        "max_underlying_open_risk_usd": 450.0,
+        "min_buy_price": 0.37,
+        "max_buy_price": 0.515,
+        "daily_loss_fraction": 0.15,
+    }
+    _write_json(state_path, {})
+    _write_json(policy_path, valid_policy)
+
+    observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
+    audit = AuditStore(
+        local_root / "runtime/live/live_audit.sqlite3",
+        local_root / "runtime/live/live_orders.jsonl",
+        local_root / "runtime/live/live_quota_snapshots.jsonl",
+        local_root / "runtime/live/live_settlements.jsonl",
+        local_root=local_root,
+        upstream_root=upstream_root,
+    )
+    clob = ClobExecutor(
+        mode="live",
+        private_key=pk,
+        api_key="k",
+        api_secret="dGVzdF9zZWNyZXRfYmFzZTY0X3N0cmluZ18xMjM0NTY=",
+        api_passphrase="p",
+        signature_type=3,
+        funder_address=cands["beacon_deposit_wallet"],
+        auto_derive_l2_creds=False,
+    )
+    clob._cached_free_usdc = 500.0
+    clob._cached_allowance_usdc = 500.0
+    clob.balance_verified = True
+    assert clob.client is not None
+    post_calls: list[Any] = []
+    clob.client.get_order_book = lambda tid: {"asks": [{"price": "0.50", "size": "500"}]}  # type: ignore[method-assign]
+    clob.client.post_order = lambda *a, **kw: (post_calls.append(a), {"success": True, "orderID": "0xord_ok", "status": "MATCHED", "takingAmount": "20.00", "makingAmount": "10.00"})[1]  # type: ignore[method-assign]
+    clob.client.get_order = lambda oid: {"id": oid, "status": "MATCHED", "size_matched": "20.00", "price": "0.50"}  # type: ignore[method-assign]
+    clob.client.get_trades = lambda *a, **kw: []  # type: ignore[method-assign]
+    clob.client.get_balance_allowance = lambda params=None: {  # type: ignore[method-assign]
+        "balance": "500000000",
+        "allowances": {OFFICIAL_STANDARD_EXCHANGE_V2_ADDRESS: "500000000"},
+    }
+
+    redeemer = AutoRedeemer(mode="shadow", withdrawal_permission=False)
+    engine = LiveExecutionEngine(
+        config={"capital_and_scaling": {"live_scale_factor": 0.10}, "withdrawal_permission": False},
+        observer=observer,
+        audit_store=audit,
+        clob_executor=clob,
+        redeemer=redeemer,
+    )
+
+    # Prime valid cache first
+    assert observer.read_policy()["max_active_window_risk_usd"] == 450.0
+
+    # Seed an ORDER_STATE_UNKNOWN order to verify reconcile still works while policy is corrupt!
+    now_iso = "2026-11-10T02:00:05+00:00"
+    audit.record_order_execution(
+        {
+            "cohort_id": "2026-11-10T02:00:00+00:00",
+            "stream": "BTC_5m",
+            "rank": 1,
+            "signal_id": "sig_existing_unknown",
+            "paper_order_id": "paper:sig_existing_unknown",
+            "market_id": "980001",
+            "condition_id": "0x" + ("77" * 32),
+            "token_id": "10001",
+            "outcome": "UP",
+            "timing": {"decision_at": now_iso, "paper_fill_at": now_iso, "live_detected_at": now_iso, "live_signed_at": now_iso, "live_http_sent_at": now_iso, "live_http_ack_at": now_iso, "detection_lag_ms": 1.0, "clob_rtt_ms": 5.0},
+            "paper_benchmark": {"approved_stake_usd": 100.0, "paper_filled_quantity": 200.0, "avg_fill_price": 0.50, "cost_usd": 100.0, "fee_usd": 0.0, "total_spent_usd": 100.0},
+            "live_execution": {"live_scale_factor": 0.10, "order_type": "FAK", "limit_price": 0.50, "requested_stake_usd": 10.0, "requested_quantity": "20.00", "clob_order_id": "0xord_recon", "clob_status": "ORDER_STATE_UNKNOWN", "error_code": "TIMEOUT", "filled_quantity": "0.00", "avg_fill_price": None, "cost_usdc": 0.0, "fee_usdc": 0.0, "total_spent_usdc": 0.0, "unfilled_stake_usdc": 0.0, "polygon_tx_hashes": [], "onchain_confirmed": False, "onchain_block_number": None},
+            "diff_vs_paper": {},
+        },
+        underlying="BTC",
+        window_start="2026-11-10T02:00:00+00:00",
+        window_end="2026-11-10T02:05:00+00:00",
+    )
+
+    w0 = datetime(2026, 11, 10, 2, 5, 0, tzinfo=timezone.utc)
+    det_dt = w0 + timedelta(seconds=8)
+
+    def _valid_state(sig_id: str) -> dict[str, Any]:
+        return {
+            "status": "PAPER_CYCLE_COMPLETE",
+            "active": True,
+            "last_cohort": w0.isoformat(),
+            "clock": {"status": "CALIBRATED", "server_minus_local_seconds": 0.0, "uncertainty_seconds": 0.05},
+            "decisions": {
+                "BTC_5m": {
+                    "status": "SIGNAL",
+                    "outcome": "UP",
+                    "signal": {
+                        "signal_id": sig_id,
+                        "stream": "BTC_5m",
+                        "underlying": "BTC",
+                        "outcome": "UP",
+                        "market_id": "980002",
+                        "decision_at": (w0 + timedelta(seconds=4)).isoformat(),
+                        "valid_until": (w0 + timedelta(seconds=20)).isoformat(),
+                        "window_start": w0.isoformat(),
+                        "window_end": (w0 + timedelta(minutes=5)).isoformat(),
+                    },
+                }
+            },
+            "execution": {
+                "status": "PROCESSED",
+                "fills": [
+                    {
+                        "order_id": f"paper:{sig_id}",
+                        "signal_id": sig_id,
+                        "market_id": "980002",
+                        "underlying": "BTC",
+                        "outcome": "UP",
+                        "status": "OPEN",
+                        "quantity": "100.00000000",
+                        "cost_usd": 50.0,
+                        "fee_usd": 0.0,
+                        "unfilled_budget_usd": 0.0,
+                        "fill_at": (w0 + timedelta(seconds=5)).isoformat(),
+                        "book_observed_at": (w0 + timedelta(seconds=7, milliseconds=900)).isoformat(),
+                        "observed_best_ask": 0.50,
+                        "fee_quote": {"fee_model": "polymarket_crypto", "rate": 0.0, "exponent": 1, "taker_only": True},
+                        "allocation_authorization": {"policy": "RANKED_CAPACITY_WATERFALL", "plan_id": "p", "cohort_id": w0.isoformat(), "rank": 1, "signal_id": sig_id, "market_id": "980002", "approved_stake_usd": 50.0, "cohort_capacity_usd": 380.0},
+                        "venue_market": {"market_id": "980002", "condition_id": "0x" + ("88" * 32), "protocol": "v1", "asset": "BTC", "window_start": w0.isoformat(), "window_end": (w0 + timedelta(minutes=5)).isoformat(), "outcome_ids": {"UP": "10001", "DOWN": "10002"}},
+                    }
+                ],
+            },
+        }
+
+    # Test corrupt JSON, missing file, missing key, and illegal values -> NEVER use stale cache or defaults!
+    policy_path.write_text("{corrupt json", encoding="utf-8")
+    with pytest.raises(PolicyVerificationError):
+        observer.read_policy()
+    assert engine.process_pipeline_state(_valid_state("sig_corrupt"), detected_at_local_utc=det_dt) == []
+
+    policy_path.unlink()
+    with pytest.raises(PolicyVerificationError):
+        observer.read_policy(force=True)
+    assert engine.process_pipeline_state(_valid_state("sig_missing"), detected_at_local_utc=det_dt) == []
+
+    incomplete = dict(valid_policy)
+    incomplete.pop("max_active_window_risk_usd")
+    _write_json(policy_path, incomplete)
+    assert engine.process_pipeline_state(_valid_state("sig_incomplete"), detected_at_local_utc=det_dt) == []
+
+    bad_range = {**valid_policy, "min_buy_price": 0.60, "max_buy_price": 0.50}
+    _write_json(policy_path, bad_range)
+    assert engine.process_pipeline_state(_valid_state("sig_bad_range"), detected_at_local_utc=det_dt) == []
+    assert post_calls == []
+
+    # Reconcile still works while policy is broken!
+    rec_list = engine.reconcile_pending_orders(force=True)
+    assert len(rec_list) == 1
+    assert rec_list[0]["live_execution"]["clob_status"] == "MATCHED"
+
+    # Restore valid policy -> verified automatically & resumes new orders!
+    _write_json(policy_path, valid_policy)
+    resumed = engine.process_pipeline_state(_valid_state("sig_resumed"), detected_at_local_utc=det_dt)
+    assert len(resumed) == 1
+    assert resumed[0]["live_execution"]["clob_status"] == "MATCHED"
+    assert len(post_calls) == 1
+    observer.close()
+
+
+def test_audit_p1_4_void_and_fractional_payout_settlement_verified_and_idempotent(tmp_path: Path) -> None:
+    """[Audit P1-4] Unconfirmed VOID holds AWAITING_OFFICIAL_PAYOUT_VECTOR with OPEN position & $0 loss;
+    verified 50/50 split computes floor(qty*0.5), credits wallet ONLY after confirmed redeem,
+    encodes per-outcome V2 outcome_index, and prevents duplicate settlement replay credit.
+    """
+    pk = "0x" + ("84" * 32)
+    cands = derive_polymarket_candidate_wallets(pk)
+    upstream_root = tmp_path / "crypto-predict_system"
+    local_root = tmp_path / "Order"
+    state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
+    policy_path = upstream_root / "config/argon4_forward_policy.json"
+    _write_json(state_path, {})
+    _write_json(
+        policy_path,
+        {
+            "initial_capital_usd": 1269.0,
+            "max_order_usd": 240.0,
+            "max_tick_budget_usd": 380.0,
+            "max_active_window_risk_usd": 450.0,
+            "max_open_risk_usd": 650.0,
+            "max_underlying_active_risk_usd": 300.0,
+            "max_underlying_open_risk_usd": 450.0,
+            "min_buy_price": 0.37,
+            "max_buy_price": 0.515,
+            "daily_loss_fraction": 0.15,
+        },
+    )
+
+    observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.resolve_unsettled_market_fallback = lambda *a, **kw: None  # type: ignore[method-assign]
+    audit = AuditStore(
+        local_root / "runtime/live/live_audit.sqlite3",
+        local_root / "runtime/live/live_orders.jsonl",
+        local_root / "runtime/live/live_quota_snapshots.jsonl",
+        local_root / "runtime/live/live_settlements.jsonl",
+        local_root=local_root,
+        upstream_root=upstream_root,
+    )
+    clob = ClobExecutor(
+        mode="live",
+        private_key=pk,
+        api_key="k",
+        api_secret="dGVzdF9zZWNyZXRfYmFzZTY0X3N0cmluZ18xMjM0NTY=",
+        api_passphrase="p",
+        signature_type=3,
+        funder_address=cands["beacon_deposit_wallet"],
+        auto_derive_l2_creds=False,
+    )
+    clob._cached_free_usdc = 100.0
+    clob._cached_allowance_usdc = 100.0
+    clob.balance_verified = True
+
+    now_iso = "2026-11-10T03:00:05+00:00"
+    v2_cond = "0x00" + ("e4" * 31)
+    for sig_id, outcome, tok_id in [
+        ("sig_void_up", "UP", "0x02" + ("e4" * 30) + "0001"),
+        ("sig_void_dn", "DOWN", "0x02" + ("e4" * 30) + "0002"),
+    ]:
+        audit.record_order_execution(
+            {
+                "timestamp_utc": now_iso,
+                "cohort_id": "2026-11-10T03:00:00+00:00",
+                "stream": "BTC_5m",
+                "rank": 1,
+                "signal_id": sig_id,
+                "paper_order_id": f"paper:{sig_id}",
+                "market_id": "985001",
+                "condition_id": v2_cond,
+                "token_id": tok_id,
+                "outcome": outcome,
+                "market_protocol": "v2",
+                "neg_risk": False,
+                "timing": {"decision_at": now_iso, "paper_fill_at": now_iso, "live_detected_at": now_iso, "live_signed_at": now_iso, "live_http_sent_at": now_iso, "live_http_ack_at": now_iso, "detection_lag_ms": 1.0, "clob_rtt_ms": 5.0},
+                "paper_benchmark": {"approved_stake_usd": 50.0, "paper_filled_quantity": 100.0, "avg_fill_price": 0.50, "cost_usd": 50.0, "fee_usd": 0.0, "total_spent_usd": 50.0},
+                "live_execution": {"live_scale_factor": 0.10, "order_type": "FAK", "limit_price": 0.50, "requested_stake_usd": 5.0, "requested_quantity": "10.00", "clob_order_id": f"0x_{sig_id}", "clob_status": "MATCHED", "error_code": None, "filled_quantity": "10.00", "avg_fill_price": 0.50, "cost_usdc": 5.0, "fee_usdc": 0.0, "total_spent_usdc": 5.0, "unfilled_stake_usdc": 0.0, "polygon_tx_hashes": [], "onchain_confirmed": True, "onchain_block_number": 200},
+                "diff_vs_paper": {},
+            },
+            underlying="BTC",
+            window_start="2026-11-10T03:00:00+00:00",
+            window_end="2026-11-10T03:05:00+00:00",
+        )
+
+    clob._client = None
+    clob._query_onchain_erc20_balance = lambda *a, **kw: None  # type: ignore[method-assign]
+    clob.query_wallet_balance_and_allowance = lambda *a, **kw: (clob._cached_free_usdc, clob._cached_allowance_usdc)  # type: ignore[method-assign]
+    clob._try_refresh_authoritative_balance = lambda *a, **kw: None  # type: ignore[method-assign]
+    tx_confirmed = False
+    redeem_calls: list[list[str]] = []
+
+    class _FakeRelayer:
+        def get_nonce(self, address: str, tx_type: str) -> dict[str, Any]:
+            return {"nonce": str(len(redeem_calls) + 1)}
+
+        def execute(self, *, transactions: list[Any], metadata: str = "") -> _RelayerExecResponse:
+            redeem_calls.append([str(getattr(tx, "data", tx)) for tx in transactions])
+            idx = len(redeem_calls)
+            return _RelayerExecResponse(
+                transaction_id=f"tx_void_{idx}",
+                transaction_hash=f"0x{idx:064x}",
+                state="STATE_CONFIRMED" if tx_confirmed else "STATE_NEW",
+            )
+
+        def get_transaction(self, tx_id: str) -> list[dict[str, Any]]:
+            idx = int(str(tx_id).rsplit("_", 1)[-1]) if "_" in str(tx_id) else 1
+            return [{"state": "STATE_CONFIRMED" if tx_confirmed else "STATE_MINED", "transactionHash": f"0x{idx:064x}"}]
+
+        def poll_until_state(self, **kwargs: Any) -> dict[str, Any]:
+            tx_id = str(kwargs.get("transaction_id") or "")
+            idx = int(tx_id.rsplit("_", 1)[-1]) if "_" in tx_id else len(redeem_calls)
+            return {
+                "state": "STATE_CONFIRMED" if tx_confirmed else "STATE_NEW",
+                "transactionHash": f"0x{idx:064x}",
+            }
+
+    redeemer = AutoRedeemer(
+        mode="live",
+        withdrawal_permission=False,
+        private_key=pk,
+        funder_address=cands["beacon_deposit_wallet"],
+        signature_type=3,
+        relayer_host="https://relayer-v2.polymarket.com",
+        require_onchain_receipt=False,
+    )
+    redeemer.relayer_client = _FakeRelayer()  # type: ignore[assignment]
+    engine = LiveExecutionEngine(
+        config={"capital_and_scaling": {"live_scale_factor": 0.10}, "withdrawal_permission": False},
+        observer=observer,
+        audit_store=audit,
+        clob_executor=clob,
+        redeemer=redeemer,
+    )
+
+    # 1. Unconfirmed VOID (payout_ratios=None) -> AWAITING_OFFICIAL_PAYOUT_VECTOR, OPEN positions, $0 loss, $100 wallet
+    s_unconfirmed = engine._execute_and_record_settlement(
+        market_id="985001",
+        condition_id=v2_cond,
+        official_outcome="VOID",
+        paper_payout_usd=100.0,
+        paper_realized_pnl_usd=0.0,
+        paper_settled_at=now_iso,
+        payout_ratios=None,
+    )
+    assert s_unconfirmed["redeem_status"] == "AWAITING_OFFICIAL_PAYOUT_VECTOR"
+    assert s_unconfirmed["live_realized_pnl_usdc"] == 0.0
+    assert clob._cached_free_usdc == 100.0
+    assert len(audit.get_open_live_orders("985001")) == 2
+    assert redeem_calls == []
+
+    # 2. Verified 50/50 split -> Batch 1 submits V2 redemption for UP (outcome_index=0, $5.00), leaving DOWN remaining
+    s_split = engine._execute_and_record_settlement(
+        market_id="985001",
+        condition_id=v2_cond,
+        official_outcome="VOID",
+        paper_payout_usd=100.0,
+        paper_realized_pnl_usd=0.0,
+        paper_settled_at=now_iso,
+        payout_ratios={"UP": 0.5, "DOWN": 0.5},
+    )
+    assert s_split["redeem_status"] == "REDEEM_PENDING"
+    assert s_split["live_expected_payout_usdc"] == 5.0
+    assert s_split["has_remaining_unredeemed"] is True
+    assert clob._cached_free_usdc == 100.0
+    assert len(redeem_calls) == 1
+    assert encode_v2_router_redeem_calldata(v2_cond, 0, 10_000_000) in redeem_calls[0]
+
+    # 3. Confirm Batch 1 -> credits $5.00 ($100 -> $105); Poll 2 submits & confirms Batch 2 (DOWN, outcome_index=1) -> $110.00
+    tx_confirmed = True
+    polled1 = engine.poll_settlements_and_redeem(force=True)
+    assert len(polled1) == 1
+    assert polled1[0]["redeemed_usdc_amount"] == 5.0
+    assert clob._cached_free_usdc == 105.0
+
+    polled2 = engine.poll_settlements_and_redeem(force=True)
+    assert len(polled2) == 1
+    assert polled2[0]["redeem_status"] == "REDEEMED"
+    assert polled2[0]["redeemed_usdc_amount"] == 10.0
+    assert polled2[0]["live_realized_pnl_usdc"] == 0.0
+    assert encode_v2_router_redeem_calldata(v2_cond, 1, 10_000_000) in redeem_calls[1]
+    assert clob._cached_free_usdc == 110.0
+
+    # Re-polling & duplicate record replay must be idempotent ($110.00, never $120.00)
+    assert engine.poll_settlements_and_redeem(force=True) == []
+    audit.record_settlement_and_redeem(dict(polled2[0]))
+    saved_final = audit.get_settlement_record("985001")
+    assert saved_final is not None and saved_final["redeemed_usdc_amount"] == 10.0
+    assert clob._cached_free_usdc == 110.0
+    observer.close()
+
 
 
 

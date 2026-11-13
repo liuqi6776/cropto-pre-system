@@ -3153,6 +3153,51 @@ def test_v14r19_multi_signal_multi_look_never_blocks_with_response_precedes_requ
         p.close()
 
 
+def test_v14r20_audit_p1_5_large_33mib_observations_interior_tamper_and_delete_detected(tmp_path):
+    """[Audit P1-5] Even when observations DB exceeds 32 MiB, interior row updates,
+    deletions, and corrupt snapshot files must all be caught fail-closed (returns False).
+    """
+    from contextlib import closing
+
+    live_db = tmp_path / "obs_33mib_live.sqlite3"
+    snap_db = tmp_path / "obs_33mib_snap.sqlite3"
+    big_chunk = "X" * 40000
+    with closing(sqlite3.connect(live_db)) as conn, conn:
+        conn.execute("CREATE TABLE snapshots(id INTEGER PRIMARY KEY, recorded_at TEXT, status TEXT, payload TEXT)")
+        rows = [(i, "2026-11-10T00:00:00Z", "OK", f"{i:05d}_{big_chunk}") for i in range(1, 901)]
+        conn.executemany("INSERT INTO snapshots(id, recorded_at, status, payload) VALUES(?,?,?,?)", rows)
+    with closing(sqlite3.connect(live_db)) as s_conn, closing(sqlite3.connect(snap_db)) as d_conn:
+        s_conn.backup(d_conn)
+
+    assert live_db.stat().st_size > 32 * 1024 * 1024
+    assert snap_db.stat().st_size > 32 * 1024 * 1024
+
+    # Append row 901 to live DB -> valid strict prefix
+    with closing(sqlite3.connect(live_db)) as conn, conn:
+        conn.execute("INSERT INTO snapshots(id, recorded_at, status, payload) VALUES(?,?,?,?)", (901, "2026-11-10T00:05:00Z", "OK", f"00901_{big_chunk}"))
+    assert revisions._is_valid_observations_prefix(live_db, snap_db) is True
+
+    # Tamper interior row 450 in >32 MiB DB -> must return False
+    orig_payload = f"00450_{big_chunk}"
+    with closing(sqlite3.connect(live_db)) as conn, conn:
+        conn.execute("UPDATE snapshots SET payload=? WHERE id=450", (f"00450_TAMPER_{big_chunk[7:]}",))
+    assert revisions._is_valid_observations_prefix(live_db, snap_db) is False
+
+    # Restore row 450, verify True again, then delete row 450 and append row 902 -> must return False
+    with closing(sqlite3.connect(live_db)) as conn, conn:
+        conn.execute("UPDATE snapshots SET payload=? WHERE id=450", (orig_payload,))
+    assert revisions._is_valid_observations_prefix(live_db, snap_db) is True
+    with closing(sqlite3.connect(live_db)) as conn, conn:
+        conn.execute("DELETE FROM snapshots WHERE id=450")
+        conn.execute("INSERT INTO snapshots(id, recorded_at, status, payload) VALUES(?,?,?,?)", (902, "2026-11-10T00:10:00Z", "OK", f"00902_{big_chunk}"))
+    assert revisions._is_valid_observations_prefix(live_db, snap_db) is False
+
+    # Corrupt snapshot bytes -> fail closed (False) without raising sqlite3.Error
+    snap_db.write_bytes(b"NOT_A_VALID_SQLITE_HEADER" + snap_db.read_bytes()[25:4096])
+    assert revisions._is_valid_observations_prefix(live_db, snap_db) is False
+
+
+
 
 
 

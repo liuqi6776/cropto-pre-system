@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 import hashlib
+import math
 import re
 import time
 from typing import Any, Mapping
@@ -31,6 +32,7 @@ import requests
 
 from eth_abi import encode as abi_encode
 from eth_account import Account as EthAccount
+from eth_utils import keccak
 from polymarket._internal.actions.relayer.calls import (
     TransactionCall,
     ctf_redeem_positions_call,
@@ -66,6 +68,53 @@ from .safety import (
     assert_no_withdrawal_permission,
     assert_redeem_only_transaction,
 )
+
+
+def _norm_outcome_key(raw_label: Any) -> str:
+    txt = str(raw_label or "").upper().strip()
+    if txt in ("UP", "YES", "0"):
+        return "UP"
+    if txt in ("DOWN", "NO", "1"):
+        return "DOWN"
+    return txt
+
+
+def resolve_verified_payout_ratios(
+    official_outcome: str,
+    payout_ratios: Mapping[str, Any] | None = None,
+) -> dict[str, Decimal] | None:
+    """Resolve and validate per-outcome settlement payout ratios in `[0, 1]`.
+
+    Binary outcomes (`UP` / `DOWN`) without explicit `payout_ratios` resolve to `[1, 0]` / `[0, 1]`.
+    Special/non-binary outcomes such as `VOID` REQUIRE verified official `payout_ratios`;
+    when absent or invalid, returns `None` so callers fail closed (`AWAITING_OFFICIAL_PAYOUT_VECTOR`).
+    """
+    winner = str(official_outcome or "").upper().strip()
+    if isinstance(payout_ratios, Mapping) and payout_ratios:
+        parsed: dict[str, Decimal] = {}
+        for k, v in payout_ratios.items():
+            if isinstance(v, bool) or not isinstance(v, (int, float, Decimal, str)):
+                return None
+            try:
+                num_f = float(v)
+                if not math.isfinite(num_f):
+                    return None
+                dec = to_decimal(v, f"payout_ratios[{k}]")
+            except Exception:
+                return None
+            if not (Decimal("0") <= dec <= Decimal("1")):
+                return None
+            parsed[_norm_outcome_key(k)] = dec
+        total = sum(parsed.values(), Decimal("0"))
+        if total <= Decimal("0") or total > Decimal("1.000001"):
+            return None
+        return parsed
+
+    if winner in ("UP", "YES"):
+        return {"UP": Decimal("1"), "DOWN": Decimal("0")}
+    if winner in ("DOWN", "NO"):
+        return {"UP": Decimal("0"), "DOWN": Decimal("1")}
+    return None
 
 
 def encode_redeem_positions_calldata(
@@ -652,6 +701,7 @@ class AutoRedeemer:
         builder_passphrase: str | None = None,
         polygon_rpc_url: str = "https://polygon-rpc.com",
         ctf_address: str = OFFICIAL_CTF_COLLATERAL_ADAPTER_ADDRESS,
+        ctf_contract_address: str = OFFICIAL_POLYGON_CTF_ADDRESS,
         neg_risk_adapter_address: str = OFFICIAL_NEG_RISK_COLLATERAL_ADAPTER_ADDRESS,
         v2_router_address: str = OFFICIAL_PROTOCOL_V2_ROUTER_ADDRESS,
         pusd_address: str = OFFICIAL_POLYGON_PUSD_ADDRESS,
@@ -667,6 +717,7 @@ class AutoRedeemer:
         self.signature_type = int(signature_type if signature_type is not None else 2)
         self.polygon_rpc_url = polygon_rpc_url
         self.ctf_address = ctf_address
+        self.ctf_contract_address = ctf_contract_address or OFFICIAL_POLYGON_CTF_ADDRESS
         self.neg_risk_adapter_address = neg_risk_adapter_address
         self.v2_router_address = v2_router_address
         self.pusd_address = pusd_address or OFFICIAL_POLYGON_PUSD_ADDRESS
@@ -1049,6 +1100,52 @@ class AutoRedeemer:
             pass
         return None
 
+    def fetch_onchain_ctf_payout_ratios(
+        self,
+        condition_id: str,
+        outcome_labels: tuple[str, str] = ("UP", "DOWN"),
+    ) -> dict[str, float] | None:
+        """Query Polygon CTF `payoutDenominator` and `payoutNumerators` via `eth_call` (fail-closed -> None)."""
+        cond_clean = str(condition_id or "").strip()
+        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", cond_clean) or not self.polygon_rpc_url:
+            return None
+        try:
+            denom_sel = "0x" + keccak(b"payoutDenominator(bytes32)").hex()[:8]
+            num_sel = "0x" + keccak(b"payoutNumerators(bytes32,uint256)").hex()[:8]
+            cond_arg = bytes.fromhex(cond_clean[2:])
+
+            def _eth_call_uint(data_hex: str) -> int | None:
+                resp = requests.post(
+                    self.polygon_rpc_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "eth_call",
+                        "params": [{"to": self.ctf_contract_address, "data": data_hex}, "latest"],
+                    },
+                    timeout=3.0,
+                )
+                if resp.status_code != 200:
+                    return None
+                raw_res = str((resp.json() or {}).get("result") or "")
+                if not raw_res.startswith("0x") or len(raw_res) < 3:
+                    return None
+                return int(raw_res, 16)
+
+            denom = _eth_call_uint(denom_sel + abi_encode(["bytes32"], [cond_arg]).hex())
+            if denom is None or denom <= 0:
+                return None
+            n0 = _eth_call_uint(num_sel + abi_encode(["bytes32", "uint256"], [cond_arg, 0]).hex())
+            n1 = _eth_call_uint(num_sel + abi_encode(["bytes32", "uint256"], [cond_arg, 1]).hex())
+            if n0 is None or n1 is None or (n0 + n1) <= 0:
+                return None
+            return {
+                _norm_outcome_key(outcome_labels[0]): round(float(n0) / float(denom), 8),
+                _norm_outcome_key(outcome_labels[1]): round(float(n1) / float(denom), 8),
+            }
+        except Exception:
+            return None
+
     def redeem_settled_market(
         self,
         market_id: str,
@@ -1060,17 +1157,12 @@ class AutoRedeemer:
         outcome_index: int | None = None,
         existing_settlement: Mapping[str, Any] | None = None,
         on_progress_callback: Any | None = None,
+        payout_ratios: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Evaluate live positions for a settled market and redeem winning tokens back to Wallet pUSD.
+        """Evaluate live positions for a settled market and redeem tokens back to Wallet pUSD.
 
-        Enforces `[P1-R3-1]`, `[P1-R4-3]`, and `[P2-R4-6]`:
-          - Binds every submitted redemption transaction (`redeem_tx_id` / `redeem_tx_hash`) to the exact
-            batch of orders (`pending_batch_order_keys`), shares (`pending_batch_shares`), and expected payout
-            (`pending_batch_payout_usdc`) at submission time.
-          - Persists the pending batch before submission and immediately persists `redeem_tx_id`/`redeem_tx_hash`
-            via `on_progress_callback` BEFORE polling for confirmation (`[P1-R4-3]`).
-          - Never guesses batch attribution by order sequence when a legacy settlement record lacks
-            `pending_batch_order_keys` (`[P2-R4-6]`).
+        Supports partial/split settlements (e.g., official VOID `[0.5, 0.5]`) using verified `payout_ratios`,
+        failing closed with `AWAITING_OFFICIAL_PAYOUT_VECTOR` whenever special outcome ratios are unconfirmed.
         """
         winner = str(official_outcome).upper().strip()
         if not live_orders:
@@ -1081,6 +1173,7 @@ class AutoRedeemer:
                 "redeemed_usdc_amount": 0.0,
                 "newly_redeemed_usdc_amount": 0.0,
                 "redeem_latency_seconds": 0.0,
+                "payout_ratios": None,
                 "redeemed_order_keys": [],
                 "newly_redeemed_order_keys": [],
                 "pending_batch_order_keys": [],
@@ -1094,9 +1187,35 @@ class AutoRedeemer:
             if isinstance(raw_red_keys, list):
                 already_redeemed_keys.update(str(k) for k in raw_red_keys if k is not None)
 
-        unredeemed_orders: list[tuple[str, Mapping[str, Any], Decimal]] = []
+        ratio_map = resolve_verified_payout_ratios(winner, payout_ratios)
+        if ratio_map is None and self.mode != "shadow" and condition_id:
+            rpc_ratios = self.fetch_onchain_ctf_payout_ratios(condition_id)
+            if rpc_ratios is not None:
+                ratio_map = resolve_verified_payout_ratios(winner, rpc_ratios)
+
+        if ratio_map is None:
+            return {
+                "live_expected_payout_usdc": 0.0,
+                "redeem_tx_hash": None,
+                "redeem_status": "AWAITING_OFFICIAL_PAYOUT_VECTOR",
+                "redeemed_usdc_amount": 0.0,
+                "newly_redeemed_usdc_amount": 0.0,
+                "redeem_latency_seconds": 0.0,
+                "error": f"UNVERIFIED_PAYOUT_VECTOR:{winner}",
+                "payout_ratios": None,
+                "redeemed_order_keys": sorted(already_redeemed_keys),
+                "newly_redeemed_order_keys": [],
+                "pending_batch_order_keys": [],
+                "pending_batch_payout_usdc": 0.0,
+                "has_remaining_unredeemed": False,
+            }
+
+        float_ratios = {k: float(v) for k, v in ratio_map.items()}
+        unredeemed_orders: list[tuple[str, Mapping[str, Any], Decimal, Decimal, str]] = []
         unredeemed_winning_shares = Decimal("0")
+        unredeemed_expected_payout = Decimal("0")
         already_redeemed_shares = Decimal("0")
+        already_redeemed_payout = Decimal("0")
         has_in_flight = False
 
         for idx, order in enumerate(live_orders):
@@ -1106,17 +1225,23 @@ class AutoRedeemer:
                 continue
             if pos_status == "NO_FILL":
                 continue
-            if str(order.get("outcome", "")).upper() == winner:
+            ord_out = _norm_outcome_key(order.get("outcome", ""))
+            ord_ratio = ratio_map.get(ord_out, Decimal("0"))
+            if ord_ratio > Decimal("0"):
                 qty = to_decimal(order.get("filled_quantity", "0"), "filled_quantity")
                 if qty <= Decimal("0"):
                     continue
+                ord_payout = (qty * ord_ratio).quantize(USD_MICRO, rounding=ROUND_DOWN)
                 okey = self._order_batch_key(order, idx)
                 if pos_status == "WON_REDEEMED" or okey in already_redeemed_keys:
                     already_redeemed_keys.add(okey)
                     already_redeemed_shares += qty
+                    already_redeemed_payout += ord_payout
                     continue
-                unredeemed_orders.append((okey, order, qty))
-                unredeemed_winning_shares += qty
+                if ord_payout > Decimal("0"):
+                    unredeemed_orders.append((okey, order, qty, ord_payout, ord_out))
+                    unredeemed_winning_shares += qty
+                    unredeemed_expected_payout += ord_payout
 
         t0 = time.perf_counter()
 
@@ -1174,9 +1299,13 @@ class AutoRedeemer:
                 )
                 eff_neg_fb = bool(neg_risk or any(bool(o.get("neg_risk")) for o in live_orders))
                 fb_shares = (
-                    sum((q for (k, _, q) in unredeemed_orders if k in set(bound_keys)), Decimal("0"))
+                    sum((q for (k, _, q, _, _) in unredeemed_orders if k in set(bound_keys)), Decimal("0"))
                     if bound_keys
                     else unredeemed_winning_shares
+                )
+                fb_out = next(
+                    (o_out for (k, _, _, _, o_out) in unredeemed_orders if k in set(bound_keys)),
+                    (unredeemed_orders[0][4] if unredeemed_orders else winner),
                 )
                 fb_target_to = ""
                 fb_calldata_hex = ""
@@ -1185,7 +1314,7 @@ class AutoRedeemer:
                         res_idx_fb = (
                             int(outcome_index)
                             if outcome_index is not None
-                            else (0 if winner in ("UP", "YES", "0") else 1)
+                            else (0 if _norm_outcome_key(fb_out) in ("UP", "YES", "0") else 1)
                         )
                         atoms_fb = int((fb_shares * Decimal("1000000")).to_integral_value(rounding=ROUND_DOWN))
                         fb_target_to = self.v2_router_address
@@ -1241,13 +1370,12 @@ class AutoRedeemer:
                         USD_MICRO, rounding=ROUND_DOWN
                     )
                 elif bound_keys:
-                    bound_shares = sum(
-                        (q for (k, _, q) in unredeemed_orders if k in set(bound_keys)),
+                    bound_payout = sum(
+                        (p for (k, _, _, p, _) in unredeemed_orders if k in set(bound_keys)),
                         Decimal("0"),
-                    )
-                    bound_payout = (bound_shares * Decimal("1.0")).quantize(USD_MICRO, rounding=ROUND_DOWN)
+                    ).quantize(USD_MICRO, rounding=ROUND_DOWN)
                 else:
-                    bound_payout = (unredeemed_winning_shares * Decimal("1.0")).quantize(
+                    bound_payout = unredeemed_expected_payout.quantize(
                         USD_MICRO, rounding=ROUND_DOWN
                     )
 
@@ -1259,8 +1387,7 @@ class AutoRedeemer:
                     if (
                         len(unredeemed_orders) == 1
                         and not has_in_flight
-                        and (unredeemed_orders[0][2] * Decimal("1.0")).quantize(USD_MICRO, rounding=ROUND_DOWN)
-                        == bound_payout
+                        and unredeemed_orders[0][3] == bound_payout
                     ):
                         bound_keys = [unredeemed_orders[0][0]]
                     else:
@@ -1277,6 +1404,7 @@ class AutoRedeemer:
                             "newly_redeemed_usdc_amount": 0.0,
                             "redeem_latency_seconds": round(time.perf_counter() - t0, 4),
                             "error": "LEGACY_PENDING_BATCH_ATTRIBUTION_UNVERIFIED",
+                            "payout_ratios": float_ratios,
                             "redeemed_order_keys": sorted(already_redeemed_keys),
                             "newly_redeemed_order_keys": [],
                             "pending_batch_order_keys": [],
@@ -1335,6 +1463,7 @@ class AutoRedeemer:
                     }
 
                 resumed["submit_state"] = "SUBMITTED"
+                resumed["payout_ratios"] = float_ratios
                 if prev_request_id:
                     resumed["redeem_request_id"] = prev_request_id
 
@@ -1346,16 +1475,18 @@ class AutoRedeemer:
                     resumed["pending_batch_shares"] = str(bound_payout)
                     resumed["pending_batch_payout_usdc"] = float(bound_payout)
                     resumed["has_remaining_unredeemed"] = any(
-                        k not in set(bound_keys) for (k, _, _) in unredeemed_orders
+                        k not in set(bound_keys) for (k, _, _, _, _) in unredeemed_orders
                     )
                     return resumed
 
                 if resumed["redeem_status"] == "REDEEMED":
                     updated_redeemed_keys = set(already_redeemed_keys) | set(bound_keys)
                     remaining_orders = [
-                        (k, o, q) for (k, o, q) in unredeemed_orders if k not in updated_redeemed_keys
+                        (k, o, q, p, o_out)
+                        for (k, o, q, p, o_out) in unredeemed_orders
+                        if k not in updated_redeemed_keys
                     ]
-                    rem_payout = sum((q for (_, _, q) in remaining_orders), Decimal("0")).quantize(
+                    rem_payout = sum((p for (_, _, _, p, _) in remaining_orders), Decimal("0")).quantize(
                         USD_MICRO, rounding=ROUND_DOWN
                     )
                     resumed["newly_redeemed_usdc_amount"] = float(bound_payout)
@@ -1366,7 +1497,7 @@ class AutoRedeemer:
                     resumed["pending_batch_payout_usdc"] = 0.0
                     resumed["submit_state"] = "CONFIRMED"
                     resumed["has_remaining_unredeemed"] = bool(remaining_orders)
-                    resumed["remaining_unredeemed_order_keys"] = [k for (k, _, _) in remaining_orders]
+                    resumed["remaining_unredeemed_order_keys"] = [k for (k, _, _, _, _) in remaining_orders]
                     resumed["remaining_unredeemed_payout_usdc"] = float(rem_payout)
                     return resumed
                 # If REDEEM_FAILED, fall through to submit a fresh transaction for all currently unredeemed winning orders
@@ -1381,13 +1512,12 @@ class AutoRedeemer:
                         USD_MICRO, rounding=ROUND_DOWN
                     )
                 elif bound_keys:
-                    bound_shares = sum(
-                        (q for (k, _, q) in unredeemed_orders if k in set(bound_keys)),
+                    bound_payout = sum(
+                        (p for (k, _, _, p, _) in unredeemed_orders if k in set(bound_keys)),
                         Decimal("0"),
-                    )
-                    bound_payout = (bound_shares * Decimal("1.0")).quantize(USD_MICRO, rounding=ROUND_DOWN)
+                    ).quantize(USD_MICRO, rounding=ROUND_DOWN)
                 else:
-                    bound_payout = (unredeemed_winning_shares * Decimal("1.0")).quantize(
+                    bound_payout = unredeemed_expected_payout.quantize(
                         USD_MICRO, rounding=ROUND_DOWN
                     )
                 return {
@@ -1403,18 +1533,42 @@ class AutoRedeemer:
                     "newly_redeemed_usdc_amount": 0.0,
                     "redeem_latency_seconds": round(time.perf_counter() - t0, 4),
                     "error": "REDEEM_SUBMIT_UNKNOWN_AWAITING_RECONCILIATION",
+                    "payout_ratios": float_ratios,
                     "redeemed_order_keys": sorted(already_redeemed_keys),
                     "newly_redeemed_order_keys": [],
                     "pending_batch_order_keys": bound_keys,
                     "pending_batch_shares": str(bound_payout),
                     "pending_batch_payout_usdc": float(bound_payout),
                     "has_remaining_unredeemed": any(
-                        k not in set(bound_keys) for (k, _, _) in unredeemed_orders
+                        k not in set(bound_keys) for (k, _, _, _, _) in unredeemed_orders
                     ),
                 }
 
-        expected_payout = (unredeemed_winning_shares * Decimal("1.0")).quantize(USD_MICRO, rounding=ROUND_DOWN)
-        batch_keys = [okey for (okey, _, _) in unredeemed_orders]
+        cond_clean = str(condition_id or "").strip()
+        order_protocols = {str(o.get("market_protocol") or "").strip().lower() for o in live_orders}
+        has_v2_token = any(is_v2_position_id(str(o.get("token_id") or "").strip()) for o in live_orders)
+        is_v2 = (
+            str(market_protocol or "").strip().lower() == "v2"
+            or "v2" in order_protocols
+            or has_v2_token
+            or len(cond_clean.removeprefix("0x").removeprefix("0X")) == 62
+        )
+        effective_neg_risk = bool(neg_risk or any(bool(o.get("neg_risk")) for o in live_orders))
+
+        if is_v2 and outcome_index is None and unredeemed_orders:
+            target_v2_outcome = unredeemed_orders[0][4]
+            batch_orders = [item for item in unredeemed_orders if item[4] == target_v2_outcome]
+            remaining_other_orders = [item for item in unredeemed_orders if item[4] != target_v2_outcome]
+        else:
+            batch_orders = list(unredeemed_orders)
+            remaining_other_orders = []
+
+        batch_shares = sum((item[2] for item in batch_orders), Decimal("0"))
+        expected_payout = sum((item[3] for item in batch_orders), Decimal("0")).quantize(USD_MICRO, rounding=ROUND_DOWN)
+        remaining_other_payout = sum((item[3] for item in remaining_other_orders), Decimal("0")).quantize(
+            USD_MICRO, rounding=ROUND_DOWN
+        )
+        batch_keys = [item[0] for item in batch_orders]
         if expected_payout <= Decimal("0"):
             if has_in_flight:
                 return {
@@ -1424,6 +1578,7 @@ class AutoRedeemer:
                     "redeemed_usdc_amount": 0.0,
                     "newly_redeemed_usdc_amount": 0.0,
                     "redeem_latency_seconds": 0.0,
+                    "payout_ratios": float_ratios,
                     "redeemed_order_keys": sorted(already_redeemed_keys),
                     "newly_redeemed_order_keys": [],
                     "pending_batch_order_keys": [],
@@ -1431,7 +1586,7 @@ class AutoRedeemer:
                     "has_remaining_unredeemed": False,
                 }
             if already_redeemed_shares > Decimal("0"):
-                already_payout = (already_redeemed_shares * Decimal("1.0")).quantize(USD_MICRO, rounding=ROUND_DOWN)
+                already_payout = already_redeemed_payout.quantize(USD_MICRO, rounding=ROUND_DOWN)
                 return {
                     "live_expected_payout_usdc": float(already_payout),
                     "redeem_tx_hash": existing_settlement.get("redeem_tx_hash") if isinstance(existing_settlement, Mapping) else None,
@@ -1439,6 +1594,7 @@ class AutoRedeemer:
                     "redeemed_usdc_amount": 0.0,
                     "newly_redeemed_usdc_amount": 0.0,
                     "redeem_latency_seconds": 0.0,
+                    "payout_ratios": float_ratios,
                     "redeemed_order_keys": sorted(already_redeemed_keys),
                     "newly_redeemed_order_keys": [],
                     "pending_batch_order_keys": [],
@@ -1452,6 +1608,7 @@ class AutoRedeemer:
                 "redeemed_usdc_amount": 0.0,
                 "newly_redeemed_usdc_amount": 0.0,
                 "redeem_latency_seconds": 0.0,
+                "payout_ratios": float_ratios,
                 "redeemed_order_keys": [],
                 "newly_redeemed_order_keys": [],
                 "pending_batch_order_keys": [],
@@ -1459,24 +1616,14 @@ class AutoRedeemer:
                 "has_remaining_unredeemed": False,
             }
 
-        cond_clean = str(condition_id or "").strip()
-        order_protocols = {str(o.get("market_protocol") or "").strip().lower() for o in live_orders}
-        has_v2_token = any(is_v2_position_id(str(o.get("token_id") or "").strip()) for o in live_orders)
-        is_v2 = (
-            str(market_protocol or "").strip().lower() == "v2"
-            or "v2" in order_protocols
-            or has_v2_token
-            or len(cond_clean.removeprefix("0x").removeprefix("0X")) == 62
-        )
-        effective_neg_risk = bool(neg_risk or any(bool(o.get("neg_risk")) for o in live_orders))
-
         if is_v2:
+            batch_outcome_key = batch_orders[0][4] if batch_orders else _norm_outcome_key(winner)
             resolved_idx = (
                 int(outcome_index)
                 if outcome_index is not None
-                else (0 if winner in ("UP", "YES", "0") else 1)
+                else (0 if batch_outcome_key in ("UP", "YES", "0") else 1)
             )
-            amount_atoms = int((unredeemed_winning_shares * Decimal("1000000")).to_integral_value(rounding=ROUND_DOWN))
+            amount_atoms = int((batch_shares * Decimal("1000000")).to_integral_value(rounding=ROUND_DOWN))
             target_to = self.v2_router_address
             calldata_hex = encode_v2_router_redeem_calldata(
                 condition_id=cond_clean,
@@ -1504,7 +1651,7 @@ class AutoRedeemer:
         if self.mode == "shadow":
             latency = round(time.perf_counter() - t0, 4)
             shadow_tx = "0xshadow_redeem_" + hashlib.sha256(
-                f"{market_id}:{condition_id}:{winner}:{expected_payout}".encode()
+                f"{market_id}:{condition_id}:{winner}:{expected_payout}:{','.join(sorted(batch_keys))}".encode()
             ).hexdigest()[:50]
             updated_redeemed_keys = set(already_redeemed_keys) | set(batch_keys)
             return {
@@ -1514,11 +1661,14 @@ class AutoRedeemer:
                 "redeemed_usdc_amount": float(expected_payout),
                 "newly_redeemed_usdc_amount": float(expected_payout),
                 "redeem_latency_seconds": latency,
+                "payout_ratios": float_ratios,
                 "redeemed_order_keys": sorted(updated_redeemed_keys),
                 "newly_redeemed_order_keys": batch_keys,
                 "pending_batch_order_keys": [],
                 "pending_batch_payout_usdc": 0.0,
-                "has_remaining_unredeemed": False,
+                "has_remaining_unredeemed": bool(remaining_other_orders),
+                "remaining_unredeemed_order_keys": [x[0] for x in remaining_other_orders],
+                "remaining_unredeemed_payout_usdc": float(remaining_other_payout),
             }
 
         if self.relayer_client is None:
@@ -1530,6 +1680,7 @@ class AutoRedeemer:
                 "newly_redeemed_usdc_amount": 0.0,
                 "redeem_latency_seconds": round(time.perf_counter() - t0, 4),
                 "error": "RELAYER_CREDENTIALS_NOT_CONFIGURED",
+                "payout_ratios": float_ratios,
                 "redeemed_order_keys": sorted(already_redeemed_keys),
                 "newly_redeemed_order_keys": [],
                 "pending_batch_order_keys": [],
@@ -1558,12 +1709,13 @@ class AutoRedeemer:
                     "redeemed_usdc_amount": 0.0,
                     "newly_redeemed_usdc_amount": 0.0,
                     "redeem_latency_seconds": round(time.perf_counter() - t0, 4),
+                    "payout_ratios": float_ratios,
                     "redeemed_order_keys": sorted(already_redeemed_keys),
                     "newly_redeemed_order_keys": [],
                     "pending_batch_order_keys": batch_keys,
-                    "pending_batch_shares": str(unredeemed_winning_shares),
+                    "pending_batch_shares": str(batch_shares),
                     "pending_batch_payout_usdc": float(expected_payout),
-                    "has_remaining_unredeemed": False,
+                    "has_remaining_unredeemed": bool(remaining_other_orders),
                 }
             )
 
@@ -1595,6 +1747,7 @@ class AutoRedeemer:
                     "newly_redeemed_usdc_amount": 0.0,
                     "redeem_latency_seconds": round(time.perf_counter() - t0, 4),
                     "error": f"RELAYER_HTTP_400_REJECTED:{type(exc).__name__}:{str(exc)[:140]}",
+                    "payout_ratios": float_ratios,
                     "redeemed_order_keys": sorted(already_redeemed_keys),
                     "newly_redeemed_order_keys": [],
                     "pending_batch_order_keys": [],
@@ -1618,12 +1771,13 @@ class AutoRedeemer:
                 "newly_redeemed_usdc_amount": 0.0,
                 "redeem_latency_seconds": round(time.perf_counter() - t0, 4),
                 "error": f"REDEEM_SUBMIT_UNKNOWN:{type(exc).__name__}:{str(exc)[:140]}",
+                "payout_ratios": float_ratios,
                 "redeemed_order_keys": sorted(already_redeemed_keys),
                 "newly_redeemed_order_keys": [],
                 "pending_batch_order_keys": batch_keys,
-                "pending_batch_shares": str(unredeemed_winning_shares),
+                "pending_batch_shares": str(batch_shares),
                 "pending_batch_payout_usdc": float(expected_payout),
-                "has_remaining_unredeemed": False,
+                "has_remaining_unredeemed": bool(remaining_other_orders),
             }
 
         tx_hash = getattr(relayer_resp, "transaction_hash", None)
@@ -1654,12 +1808,13 @@ class AutoRedeemer:
                     "redeemed_usdc_amount": 0.0,
                     "newly_redeemed_usdc_amount": 0.0,
                     "redeem_latency_seconds": round(time.perf_counter() - t0, 4),
+                    "payout_ratios": float_ratios,
                     "redeemed_order_keys": sorted(already_redeemed_keys),
                     "newly_redeemed_order_keys": [],
                     "pending_batch_order_keys": batch_keys,
-                    "pending_batch_shares": str(unredeemed_winning_shares),
+                    "pending_batch_shares": str(batch_shares),
                     "pending_batch_payout_usdc": float(expected_payout),
-                    "has_remaining_unredeemed": False,
+                    "has_remaining_unredeemed": bool(remaining_other_orders),
                     "tx_submitted_at_utc": tx_submitted_at_iso,
                 }
             )
@@ -1683,6 +1838,7 @@ class AutoRedeemer:
                 "error": f"{type(exc).__name__}:{str(exc)[:160]}",
             }
 
+        res["payout_ratios"] = float_ratios
         res["tx_submitted_at_utc"] = tx_submitted_at_iso
         res["redeem_request_id"] = redeem_request_id
         res["redeem_target_to"] = str(target_to)
@@ -1696,16 +1852,18 @@ class AutoRedeemer:
             res["pending_batch_shares"] = "0.00"
             res["pending_batch_payout_usdc"] = 0.0
             res["submit_state"] = "CONFIRMED"
-            res["has_remaining_unredeemed"] = False
+            res["has_remaining_unredeemed"] = bool(remaining_other_orders)
+            res["remaining_unredeemed_order_keys"] = [x[0] for x in remaining_other_orders]
+            res["remaining_unredeemed_payout_usdc"] = float(remaining_other_payout)
         elif res["redeem_status"] == "REDEEM_PENDING":
             res["newly_redeemed_usdc_amount"] = 0.0
             res["redeemed_order_keys"] = sorted(already_redeemed_keys)
             res["newly_redeemed_order_keys"] = []
             res["pending_batch_order_keys"] = batch_keys
-            res["pending_batch_shares"] = str(unredeemed_winning_shares)
+            res["pending_batch_shares"] = str(batch_shares)
             res["pending_batch_payout_usdc"] = float(expected_payout)
             res["submit_state"] = "SUBMITTED" if (submitted_tx_id or submitted_tx_hash) else "REDEEM_SUBMIT_UNKNOWN"
-            res["has_remaining_unredeemed"] = False
+            res["has_remaining_unredeemed"] = bool(remaining_other_orders)
         else:
             res["newly_redeemed_usdc_amount"] = 0.0
             res["redeemed_order_keys"] = sorted(already_redeemed_keys)

@@ -171,3 +171,61 @@ def test_panel_blocks_foreign_hosts_origins_writes_and_paths(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+def test_live_dashboard_never_fabricates_balances_and_ui_surfaces_errors(tmp_path, monkeypatch):
+    from pathlib import Path
+    monkeypatch.setenv("ARGON4_ORDER_ROOT", str(tmp_path / "Order_sim"))
+    app = Application(tmp_path / "run_live_dash")
+    try:
+        # 1. Missing snapshot -> MISSING status, onchain_free_usdc_balance is None (never fabricated +800.0)
+        d_missing = app.live_dashboard()
+        assert d_missing["quota_snapshot_status"] == "MISSING"
+        lwq_m = d_missing["latest_quota"]["live_wallet_and_quotas"]
+        assert lwq_m["onchain_free_usdc_balance"] is None
+        assert "capital_sources" in d_missing
+        assert d_missing["capital_sources"]["live_wallet_free_pusd"]["status"] == "MISSING"
+
+        # 2. Stale snapshot & exact 0.0 cash preserved (never coerced to 1269.0 or +800.0)
+        order_rt = tmp_path / "Order_sim/runtime/live"
+        order_rt.mkdir(parents=True)
+        stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=900)).isoformat()
+        snap = {
+            "timestamp_utc": stale_ts,
+            "live_wallet_and_quotas": {
+                "onchain_free_usdc_balance": 0.0,
+                "clob_allowance_usdc": 0.0,
+                "total_locked_open_risk_usdc": 0.0,
+                "remaining_total_open_risk_quota_usd": 65.0,
+                "remaining_cohort_budget_quota_usd": 38.0,
+                "remaining_underlying_quota_usd": {},
+            },
+        }
+        (order_rt / "live_quota_snapshots.jsonl").write_text(json.dumps(snap) + "\n", encoding="utf-8")
+        monkeypatch.setattr(app.account, "overview", lambda policy=None: {
+            "cash": 0.0,
+            "locked_cost": 0.0,
+            "realized_pnl": 0.0,
+            "started_at": "2026-11-10T00:00:00+00:00",
+        })
+        d_stale = app.live_dashboard()
+        assert d_stale["quota_snapshot_status"] == "STALE"
+        assert d_stale["latest_quota"]["live_wallet_and_quotas"]["onchain_free_usdc_balance"] == 0.0
+        assert d_stale["latest_quota"]["paper_account_mirror"]["paper_cash_usd"] == 0.0
+        assert d_stale["capital_sources"]["paper_account_cash"]["value_usd"] == 0.0
+        assert d_stale["capital_sources"]["live_wallet_free_pusd"]["status"] == "STALE"
+
+        # 3. app.js surfaces /api/live_dashboard failures and never uses silent .catch(()=>null)
+        js_text = (Path(__file__).resolve().parents[1] / "dashboard/argon4_forward/app.js").read_text(encoding="utf-8")
+        assert "moneyStrict" in js_text
+        assert "renderLiveError" in js_text
+        assert "__live_error" in js_text
+        assert "🟠 实盘接口异常" in js_text
+        assert ".then(r=>r.ok?r.json():null).catch(()=>null)" not in js_text
+    finally:
+        if app.pipeline:
+            app.pipeline.close()
+        app.market_transport.close()
+        if app.telemetry:
+            app.telemetry.close()
+

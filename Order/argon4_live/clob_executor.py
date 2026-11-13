@@ -59,6 +59,7 @@ from py_clob_client_v2.order_utils.model.order_data_v2 import SignedOrderV2
 from py_clob_client_v2.order_utils.model.signature_type_v2 import SignatureTypeV2
 
 from .math_utils import (
+    HARD_WINDOW_DEADLINE_SECONDS,
     USD_MICRO,
     check_hard_deadline,
     compute_fee_per_share,
@@ -67,6 +68,7 @@ from .math_utils import (
     parse_utc_timestamp,
     project_to_calibrated_utc,
     to_decimal,
+    validate_clock_projection,
 )
 from .safety import (
     OFFICIAL_EXCHANGE_V3_ADDRESS,
@@ -794,6 +796,8 @@ class ClobExecutor:
         market_protocol: str = "v1",
         neg_risk: bool = False,
         valid_until: str | datetime | None = None,
+        window_start: str | datetime | None = None,
+        hard_deadline_seconds: float = HARD_WINDOW_DEADLINE_SECONDS,
         observed_best_ask: float | Decimal | None = None,
         book_observed_at: str | datetime | None = None,
         min_buy_price: float | Decimal | None = None,
@@ -810,7 +814,7 @@ class ClobExecutor:
           - [P1-1] V2 `OrderArgsV2` + `SignedOrderV2` (`version=3` for V2 `position_id`, `version=2` for CTF `token_id`).
           - [P1-2] / [P1-A] Persists `local_order_hash` via `pre_send_callback` BEFORE `post_order`; ambiguous transport/timeout errors return `ORDER_STATE_UNKNOWN`.
           - [P1-3] Strict response parsing (`{}` or missing `takingAmount` is never treated as a full fill).
-          - [P1-5] Re-checks `valid_until` immediately before HTTP `post_order`.
+          - [P1-5] Fail-closed `valid_until` & 20s window hard-cap check at entry, after signing, and immediately before HTTP `post_order`.
           - [Design Gap #4 / Issue #7] Enforces `min_buy_price` (`0.37`) and `max_buy_price` (`0.515`) against live orderbook, observed snapshot, and paper fill price before sending.
         """
         def _current_cal_utc() -> datetime:
@@ -875,7 +879,66 @@ class ClobExecutor:
 
         # Enforce FAK-only guard before any signing or network dispatch
         order_type_str = assert_fak_order_only(OrderType.FAK, post_only=False)
+        try:
+            validate_clock_projection(clock_projection)
+        except Exception as exc:
+            return self._build_aborted_result(
+                sizing=sizing,
+                order_type_str=order_type_str,
+                clob_status="ABORTED_INVALID_CLOCK",
+                error_code=f"INVALID_CLOCK_PROJECTION:{exc}",
+                live_signed_at=datetime.now(timezone.utc),
+                clock_projection=clock_projection,
+                fee_rate=fee_rate,
+            )
+
         now_dt = _current_cal_utc()
+
+        # Fail-closed validation of mandatory deadline and optional window ceiling in ALL modes
+        if valid_until is None or (isinstance(valid_until, str) and not valid_until.strip()):
+            return self._build_aborted_result(
+                sizing=sizing,
+                order_type_str=order_type_str,
+                clob_status="ABORTED_INVALID_DEADLINE",
+                error_code="MISSING_VALID_UNTIL",
+                live_signed_at=now_dt,
+                clock_projection=clock_projection,
+                fee_rate=fee_rate,
+            )
+        try:
+            valid_until_dt = parse_utc_timestamp(valid_until)
+            hard_cap_s = float(hard_deadline_seconds)
+            if not (0.0 < hard_cap_s <= HARD_WINDOW_DEADLINE_SECONDS):
+                raise ValueError(f"hard_deadline_seconds={hard_cap_s} out of bounds (0, {HARD_WINDOW_DEADLINE_SECONDS}]")
+            if window_start is not None and not (isinstance(window_start, str) and not str(window_start).strip()):
+                w_start_dt = parse_utc_timestamp(window_start)
+                if not (w_start_dt < valid_until_dt <= (w_start_dt + timedelta(seconds=hard_cap_s))):
+                    raise ValueError(
+                        f"valid_until={format_utc_iso(valid_until_dt)} outside "
+                        f"(window_start={format_utc_iso(w_start_dt)}, +{hard_cap_s}s]"
+                    )
+        except Exception as exc:
+            return self._build_aborted_result(
+                sizing=sizing,
+                order_type_str=order_type_str,
+                clob_status="ABORTED_INVALID_DEADLINE",
+                error_code=f"INVALID_DEADLINE:{exc}",
+                live_signed_at=now_dt,
+                clock_projection=clock_projection,
+                fee_rate=fee_rate,
+            )
+
+        within_deadline, _ = check_hard_deadline(now_dt, valid_until_dt)
+        if not within_deadline:
+            return self._build_aborted_result(
+                sizing=sizing,
+                order_type_str=order_type_str,
+                clob_status="ABORTED_PAST_VALID_UNTIL",
+                error_code=f"HARD_DEADLINE_EXCEEDED_PRE_BOOK:now={format_utc_iso(now_dt)}>=valid_until={format_utc_iso(valid_until_dt)}",
+                live_signed_at=now_dt,
+                clock_projection=clock_projection,
+                fee_rate=fee_rate,
+            )
 
         if sizing["size_shares_dec"] <= Decimal("0"):
             return self._build_aborted_result(
@@ -1079,19 +1142,18 @@ class ClobExecutor:
                 round(float(self._cumulative_local_spent_usdc), 6),
             )
 
-        # [P1-5] Re-check 20-second hard deadline immediately before sending (after queueing, DB lock, and signing)
-        if valid_until is not None:
-            within_deadline, _ = check_hard_deadline(live_signed_at, valid_until)
-            if not within_deadline:
-                return self._build_aborted_result(
-                    sizing=sizing,
-                    order_type_str=order_type_str,
-                    clob_status="ABORTED_PAST_VALID_UNTIL",
-                    error_code=f"HARD_DEADLINE_EXCEEDED_PRE_SEND:signed_at={format_utc_iso(live_signed_at)}>=valid_until={valid_until}",
-                    live_signed_at=live_signed_at,
-                    clock_projection=clock_projection,
-                    fee_rate=fee_rate,
-                )
+        # [P1-5] Re-check 20-second hard deadline immediately after signing (in both shadow and live modes)
+        within_deadline, _ = check_hard_deadline(live_signed_at, valid_until_dt)
+        if not within_deadline:
+            return self._build_aborted_result(
+                sizing=sizing,
+                order_type_str=order_type_str,
+                clob_status="ABORTED_PAST_VALID_UNTIL",
+                error_code=f"HARD_DEADLINE_EXCEEDED_PRE_SEND:signed_at={format_utc_iso(live_signed_at)}>=valid_until={format_utc_iso(valid_until_dt)}",
+                live_signed_at=live_signed_at,
+                clock_projection=clock_projection,
+                fee_rate=fee_rate,
+            )
 
         # Shadow mode: local V2 sign completed, simulate FAK match without network order submission
         if self.mode == "shadow":
@@ -1174,6 +1236,19 @@ class ClobExecutor:
         # the final `valid_until` deadline check immediately before `post_order` ([P1-A], [P1-5], [P1-R3-3])!
         assert self.client is not None
         assert_fak_order_only(OrderType.FAK, post_only=False)
+        pre_cb_now = _current_cal_utc()
+        within_pre_cb, _ = check_hard_deadline(pre_cb_now, valid_until_dt)
+        if not within_pre_cb:
+            return self._build_aborted_result(
+                sizing=sizing,
+                order_type_str=order_type_str,
+                clob_status="ABORTED_PAST_VALID_UNTIL",
+                error_code=f"HARD_DEADLINE_EXCEEDED_PRE_CB:now={format_utc_iso(pre_cb_now)}>=valid_until={format_utc_iso(valid_until_dt)}",
+                live_signed_at=live_signed_at,
+                clock_projection=clock_projection,
+                fee_rate=fee_rate,
+            )
+
         if callable(pre_send_callback):
             pre_send_callback(
                 local_order_hash,
@@ -1183,19 +1258,18 @@ class ClobExecutor:
             )
 
         live_http_sent_at = _current_cal_utc()
-        if valid_until is not None:
-            within_deadline, _ = check_hard_deadline(live_http_sent_at, valid_until)
-            if not within_deadline:
-                return self._build_aborted_result(
-                    sizing=sizing,
-                    order_type_str=order_type_str,
-                    clob_status="ABORTED_PAST_VALID_UNTIL",
-                    error_code=f"HARD_DEADLINE_EXCEEDED_AT_SEND:http_sent_at={format_utc_iso(live_http_sent_at)}>=valid_until={valid_until}",
-                    live_signed_at=live_signed_at,
-                    clock_projection=clock_projection,
-                    live_http_sent_at=live_http_sent_at,
-                    fee_rate=fee_rate,
-                )
+        within_deadline, _ = check_hard_deadline(live_http_sent_at, valid_until_dt)
+        if not within_deadline:
+            return self._build_aborted_result(
+                sizing=sizing,
+                order_type_str=order_type_str,
+                clob_status="ABORTED_PAST_VALID_UNTIL",
+                error_code=f"HARD_DEADLINE_EXCEEDED_AT_SEND:http_sent_at={format_utc_iso(live_http_sent_at)}>=valid_until={valid_until}",
+                live_signed_at=live_signed_at,
+                clock_projection=clock_projection,
+                live_http_sent_at=live_http_sent_at,
+                fee_rate=fee_rate,
+            )
 
         t_sent_mono = time.perf_counter()
         try:

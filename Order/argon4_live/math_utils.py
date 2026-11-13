@@ -16,6 +16,7 @@ SHARE_STEP = Decimal("0.01")
 USD_MICRO = Decimal("0.000001")
 MAX_BUY_PRICE_CEILING = Decimal("0.515")
 MIN_BUY_PRICE_FLOOR = Decimal("0.37")
+HARD_WINDOW_DEADLINE_SECONDS = 20.0
 
 TICK_SIZE_TO_LIMIT_PRICE: dict[str, Decimal] = {
     "0.01": Decimal("0.51"),
@@ -75,6 +76,138 @@ def project_to_calibrated_utc(
         return base + timedelta(seconds=shift_seconds)
     except (ValueError, TypeError):
         return base
+
+
+def validate_clock_projection(
+    clock_projection: Mapping[str, Any] | None = None,
+    *,
+    state_clock: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any] | None:
+    """Validate optional upstream clock projection (`CALIBRATED` with finite offset & uncertainty in [0, 2.0]s)."""
+    proj = clock_projection if clock_projection is not None else state_clock
+    if proj is None:
+        return None
+    if not isinstance(proj, Mapping):
+        raise ValueError("Invalid clock_projection: expected mapping")
+    status = proj.get("status")
+    if status != "CALIBRATED":
+        raise ValueError(f"Uncalibrated clock_projection status: {status!r}")
+    if "server_minus_local_seconds" not in proj or proj.get("server_minus_local_seconds") is None:
+        raise ValueError("Missing server_minus_local_seconds in clock_projection")
+    if "uncertainty_seconds" not in proj or proj.get("uncertainty_seconds") is None:
+        raise ValueError("Missing uncertainty_seconds in clock_projection")
+    to_decimal(proj.get("server_minus_local_seconds"), "server_minus_local_seconds")
+    uncertainty = to_decimal(proj.get("uncertainty_seconds"), "uncertainty_seconds")
+    if uncertainty < Decimal("0") or uncertainty > Decimal("2.0"):
+        raise ValueError(f"Clock projection uncertainty out of bounds [0, 2.0]: {uncertainty}")
+    return proj
+
+
+def validate_and_project_utc(
+    local_utc: datetime | str | None = None,
+    clock_projection: Mapping[str, Any] | None = None,
+    *,
+    state_clock: Mapping[str, Any] | None = None,
+) -> datetime:
+    """Validate `clock_projection` (failing closed if provided and invalid/uncalibrated) and project `local_utc`."""
+    base = parse_utc_timestamp(local_utc) if local_utc is not None else datetime.now(timezone.utc)
+    proj = validate_clock_projection(clock_projection, state_clock=state_clock)
+    if proj is None:
+        return base
+    return project_to_calibrated_utc(base, proj)
+
+
+def derive_effective_order_deadline(
+    *,
+    cohort_id: Any,
+    sig: Mapping[str, Any] | None,
+    fill: Mapping[str, Any] | None,
+    signal_id: str,
+    state_last_cohort: Any = None,
+    hard_cap_seconds: float = HARD_WINDOW_DEADLINE_SECONDS,
+) -> dict[str, Any]:
+    """Derive and fail-closed validate window boundaries, matching decision evidence, and `effective_valid_until`.
+
+    Enforces:
+      - Matching decision signal (`sig["signal_id"] == signal_id`).
+      - Required timezone-aware UTC timestamps (`cohort_id`, `window_start`, `window_end`,
+        `decision_at`, `valid_until`, `fill_at`).
+      - Cross-window consistency across `cohort_id`, `state.last_cohort`, `signal`,
+        `allocation_authorization`, and `venue_market`.
+      - Signal `valid_until` MUST satisfy `window_start < valid_until <= window_start + hard_cap_seconds`
+        (20s hard cap); signals with `valid_until > window_start + 20s` are REJECTED, never clamped/submitted.
+    """
+    sig_id_clean = str(signal_id or "").strip()
+    if not sig_id_clean:
+        raise ValueError("Missing signal_id")
+    if not isinstance(sig, Mapping) or str(sig.get("signal_id") or "").strip() != sig_id_clean:
+        raise ValueError("Missing matching decision signal evidence")
+    if not isinstance(fill, Mapping):
+        raise ValueError("Missing fill evidence")
+    if cohort_id is None or not str(cohort_id).strip():
+        raise ValueError("Missing cohort_id")
+    for req_key in ("window_start", "window_end", "decision_at", "valid_until"):
+        val = sig.get(req_key)
+        if val is None or (isinstance(val, str) and not val.strip()):
+            raise ValueError(f"Missing signal {req_key}")
+    fill_at_raw = fill.get("fill_at")
+    if fill_at_raw is None or (isinstance(fill_at_raw, str) and not fill_at_raw.strip()):
+        raise ValueError("Missing fill fill_at")
+
+    cohort_dt = parse_utc_timestamp(cohort_id)
+    w_start_dt = parse_utc_timestamp(sig["window_start"])
+    w_end_dt = parse_utc_timestamp(sig["window_end"])
+    decision_dt = parse_utc_timestamp(sig["decision_at"])
+    fill_dt = parse_utc_timestamp(fill_at_raw)
+    sig_valid_dt = parse_utc_timestamp(sig["valid_until"])
+
+    if w_start_dt != cohort_dt:
+        raise ValueError(f"Cross-window mismatch: signal.window_start={w_start_dt.isoformat()} != cohort_id={cohort_dt.isoformat()}")
+    if state_last_cohort is not None and str(state_last_cohort).strip():
+        last_cohort_dt = parse_utc_timestamp(state_last_cohort)
+        if last_cohort_dt != w_start_dt:
+            raise ValueError(
+                f"Cross-window mismatch: state.last_cohort={last_cohort_dt.isoformat()} != window_start={w_start_dt.isoformat()}"
+            )
+    venue_mkt = fill.get("venue_market") if isinstance(fill.get("venue_market"), Mapping) else {}
+    if venue_mkt.get("window_start") is not None and str(venue_mkt.get("window_start")).strip():
+        if parse_utc_timestamp(venue_mkt["window_start"]) != w_start_dt:
+            raise ValueError("Cross-window mismatch: venue_market.window_start != signal.window_start")
+    if venue_mkt.get("window_end") is not None and str(venue_mkt.get("window_end")).strip():
+        if parse_utc_timestamp(venue_mkt["window_end"]) != w_end_dt:
+            raise ValueError("Cross-window mismatch: venue_market.window_end != signal.window_end")
+    auth = fill.get("allocation_authorization") if isinstance(fill.get("allocation_authorization"), Mapping) else {}
+    if auth.get("cohort_id") is not None and str(auth.get("cohort_id")).strip():
+        if parse_utc_timestamp(auth["cohort_id"]) != w_start_dt:
+            raise ValueError("Cross-window mismatch: allocation_authorization.cohort_id != signal.window_start")
+
+    dur_sec = (w_end_dt - w_start_dt).total_seconds()
+    if not (60.0 <= dur_sec <= 3600.0):
+        raise ValueError(f"Invalid market window duration: {dur_sec}s")
+
+    cap_s = float(hard_cap_seconds)
+    if not (0.0 < cap_s <= HARD_WINDOW_DEADLINE_SECONDS):
+        raise ValueError(f"Invalid hard_cap_seconds: {cap_s}")
+    hard_cap_dt = w_start_dt + timedelta(seconds=cap_s)
+
+    if not (w_start_dt <= decision_dt < hard_cap_dt):
+        raise ValueError("decision_at outside [window_start, window_start + hard_cap)")
+    if not (decision_dt <= fill_dt < hard_cap_dt):
+        raise ValueError("fill_at outside [decision_at, window_start + hard_cap)")
+    if not (w_start_dt < sig_valid_dt <= hard_cap_dt):
+        raise ValueError("signal valid_until outside (window_start, window_start + 20s]")
+    if not (decision_dt < sig_valid_dt):
+        raise ValueError("signal valid_until must be strictly after decision_at")
+
+    effective_valid_dt = min(sig_valid_dt, hard_cap_dt)
+    return {
+        "window_start_dt": w_start_dt,
+        "window_end_dt": w_end_dt,
+        "decision_dt": decision_dt,
+        "fill_dt": fill_dt,
+        "effective_valid_dt": effective_valid_dt,
+        "effective_valid_iso": format_utc_iso(effective_valid_dt),
+    }
 
 
 def check_hard_deadline(

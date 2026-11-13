@@ -30,26 +30,34 @@ from dotenv import load_dotenv
 from .audit_store import AuditStore
 from .clob_executor import ClobExecutor
 from .math_utils import (
+    HARD_WINDOW_DEADLINE_SECONDS,
     USD_MICRO,
     align_limit_price,
     check_hard_deadline,
     compute_diff_vs_paper,
     compute_paper_benchmark_metrics,
+    derive_effective_order_deadline,
     format_utc_iso,
     parse_utc_timestamp,
     project_to_calibrated_utc,
     to_decimal,
+    validate_and_project_utc,
 )
 from .redeemer import AutoRedeemer
 from .safety import (
     OFFICIAL_CTF_COLLATERAL_ADAPTER_ADDRESS,
     OFFICIAL_NEG_RISK_COLLATERAL_ADAPTER_ADDRESS,
+    OFFICIAL_POLYGON_CTF_ADDRESS,
     OFFICIAL_POLYGON_PUSD_ADDRESS,
     OFFICIAL_PROTOCOL_V2_ROUTER_ADDRESS,
     SingleInstanceFileLock,
     assert_no_withdrawal_permission,
 )
-from .upstream_observer import UpstreamObserver
+from .upstream_observer import (
+    PolicyVerificationError,
+    UpstreamObserver,
+    extract_payout_ratios_from_payload,
+)
 
 logger = logging.getLogger("argon4_live.engine")
 
@@ -128,6 +136,11 @@ class LiveExecutionEngine:
         self.fak_no_match_min_remaining_seconds = max(
             0.20, float(exec_cfg.get("fak_no_match_min_remaining_seconds", 1.8))
         )
+        self.hard_deadline_after_cohort_seconds = min(
+            HARD_WINDOW_DEADLINE_SECONDS,
+            max(0.5, float(exec_cfg.get("hard_deadline_after_cohort_seconds", HARD_WINDOW_DEADLINE_SECONDS))),
+        )
+        self._last_verified_policy_sha256: str | None = None
 
         up_cfg = self.config.get("upstream", {})
         self.poll_interval_seconds = max(0.01, float(up_cfg.get("poll_interval_ms", 50)) / 1000.0)
@@ -239,6 +252,7 @@ class LiveExecutionEngine:
                 builder_passphrase=os.getenv("POLY_BUILDER_PASSPHRASE", ""),
                 polygon_rpc_url=rpc_url,
                 ctf_address=red_cfg.get("ctf_collateral_adapter_address", OFFICIAL_CTF_COLLATERAL_ADAPTER_ADDRESS),
+                ctf_contract_address=red_cfg.get("ctf_contract_address", OFFICIAL_POLYGON_CTF_ADDRESS),
                 neg_risk_adapter_address=red_cfg.get(
                     "neg_risk_collateral_adapter_address", OFFICIAL_NEG_RISK_COLLATERAL_ADAPTER_ADDRESS
                 ),
@@ -268,7 +282,6 @@ class LiveExecutionEngine:
 
     def _paper_risk_caps(self) -> dict[str, Any]:
         policy = self.observer.read_policy()
-        cap_cfg = self.config.get("capital_and_scaling", {})
         raw_stream_min = policy.get("stream_min_buy_price")
         stream_min_buy_price = (
             {str(k): float(v) for k, v in raw_stream_min.items() if v is not None}
@@ -282,18 +295,16 @@ class LiveExecutionEngine:
             else {}
         )
         return {
-            "max_order_usd": float(policy.get("max_order_usd", cap_cfg.get("paper_max_order_usd", 240.0))),
+            "max_order_usd": float(policy["max_order_usd"]),
             "stream_max_order_usd": stream_max_order_usd,
-            "max_open_risk_usd": float(policy.get("max_open_risk_usd", cap_cfg.get("paper_max_open_risk_usd", 650.0))),
-            "max_underlying_open_risk_usd": float(
-                policy.get("max_underlying_open_risk_usd", cap_cfg.get("paper_max_underlying_open_risk_usd", 450.0))
-            ),
-            "max_tick_budget_usd": float(
-                policy.get("max_tick_budget_usd", cap_cfg.get("paper_max_tick_budget_usd", 380.0))
-            ),
-            "min_buy_price": float(policy.get("min_buy_price", 0.37)),
+            "max_active_window_risk_usd": float(policy["max_active_window_risk_usd"]),
+            "max_open_risk_usd": float(policy["max_open_risk_usd"]),
+            "max_underlying_active_risk_usd": float(policy["max_underlying_active_risk_usd"]),
+            "max_underlying_open_risk_usd": float(policy["max_underlying_open_risk_usd"]),
+            "max_tick_budget_usd": float(policy["max_tick_budget_usd"]),
+            "min_buy_price": float(policy["min_buy_price"]),
             "stream_min_buy_price": stream_min_buy_price,
-            "max_buy_price": float(policy.get("max_buy_price", 0.515)),
+            "max_buy_price": float(policy["max_buy_price"]),
         }
 
     def _live_loss_limits(self, scale_dec: Decimal, now_utc: datetime | None = None) -> tuple[Decimal, int, float]:
@@ -360,9 +371,45 @@ class LiveExecutionEngine:
             return []
 
         has_multiple_candidates = len(candidates) > 1
-        paper_caps = self._paper_risk_caps()
-        scale_dec = to_decimal(self.live_scale_factor, "live_scale_factor")
-        daily_loss_cap, max_consec_losses, cooldown_mins = self._live_loss_limits(scale_dec, now_utc=detected_local)
+        try:
+            paper_caps = self._paper_risk_caps()
+            scale_dec = to_decimal(self.live_scale_factor, "live_scale_factor")
+            daily_loss_cap, max_consec_losses, cooldown_mins = self._live_loss_limits(
+                scale_dec, now_utc=detected_local
+            )
+        except PolicyVerificationError as pol_exc:
+            self._last_verified_policy_sha256 = None
+            halt_info = {
+                "verified": False,
+                "reason_code": pol_exc.reason_code,
+                "error": str(pol_exc),
+                "timestamp_utc": format_utc_iso(detected_local),
+            }
+            try:
+                self.audit.set_kv("policy_verification_status", json.dumps(halt_info, ensure_ascii=False))
+            except Exception:
+                pass
+            logger.error("Policy verification failed; halting new orders fail-closed: %s", pol_exc)
+            return []
+
+        diag_sha = self.observer.get_diagnostic_policy_state().get("sha256")
+        if diag_sha != self._last_verified_policy_sha256:
+            try:
+                self.audit.set_kv(
+                    "policy_verification_status",
+                    json.dumps(
+                        {
+                            "verified": True,
+                            "sha256": diag_sha,
+                            "timestamp_utc": format_utc_iso(detected_local),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            except Exception:
+                pass
+            self._last_verified_policy_sha256 = diag_sha
+
         min_buy_price = paper_caps.get("min_buy_price", 0.37)
         max_buy_price = paper_caps.get("max_buy_price", 0.515)
 
@@ -457,34 +504,107 @@ class LiveExecutionEngine:
             condition_id = str(venue_mkt.get("condition_id") or "")
             outcome_ids = venue_mkt.get("outcome_ids") or {}
             token_id = str(outcome_ids.get(outcome) or "")
-            window_start = str(sig.get("window_start") or venue_mkt.get("window_start") or cohort_id)
-            window_end = str(sig.get("window_end") or venue_mkt.get("window_end") or "")
-
-            clock_proj = fill.get("clock_projection")
-            live_detected_cal = project_to_calibrated_utc(detected_local, clock_proj)
-
-            valid_until_str = sig.get("valid_until")
-            if not valid_until_str and cohort_id:
-                try:
-                    valid_until_str = format_utc_iso(parse_utc_timestamp(cohort_id) + timedelta(seconds=20))
-                except ValueError:
-                    valid_until_str = None
-
-            decision_at_str = str(sig.get("decision_at") or auth.get("planned_at") or format_utc_iso(live_detected_cal))
-            paper_fill_at_str = str(fill.get("fill_at") or format_utc_iso(live_detected_cal))
-            try:
-                detection_lag_ms = round(
-                    max(0.0, (live_detected_cal - parse_utc_timestamp(paper_fill_at_str)).total_seconds() * 1000.0),
-                    2,
-                )
-            except ValueError:
-                detection_lag_ms = 0.0
-
             paper_benchmark = compute_paper_benchmark_metrics(fill)
             approved_stake_usd = to_decimal(auth.get("approved_stake_usd", 0), "approved_stake_usd")
             desired_stake_usd = (scale_dec * approved_stake_usd).quantize(USD_MICRO, rounding=ROUND_DOWN)
             fee_quote = fill.get("fee_quote") or {}
             fee_rate = to_decimal(fee_quote.get("rate", 0.075), "fee_rate")
+
+            eff_clock_proj = fill.get("clock_projection") if fill.get("clock_projection") is not None else state.get("clock")
+            try:
+                live_detected_cal = validate_and_project_utc(
+                    detected_local,
+                    fill.get("clock_projection"),
+                    state_clock=state.get("clock"),
+                )
+                deadline_info = derive_effective_order_deadline(
+                    cohort_id=cohort_id,
+                    sig=sig,
+                    fill=fill,
+                    signal_id=signal_id,
+                    state_last_cohort=state.get("last_cohort"),
+                    hard_cap_seconds=self.hard_deadline_after_cohort_seconds,
+                )
+            except (ValueError, TypeError) as time_exc:
+                fallback_ws = str((sig or {}).get("window_start") or venue_mkt.get("window_start") or cohort_id or "")
+                fallback_we = str((sig or {}).get("window_end") or venue_mkt.get("window_end") or "")
+                if not self.audit.claim_signal(
+                    signal_id=signal_id,
+                    cohort_id=str(cohort_id or ""),
+                    stream=str(stream or ""),
+                    paper_order_id=paper_order_id,
+                    claimed_at_utc=detected_local,
+                ):
+                    continue
+                slot_idx = len(ordered_slots)
+                ordered_slots.append(None)
+                now_iso = format_utc_iso(detected_local)
+                dec_fallback = str((sig or {}).get("decision_at") or auth.get("planned_at") or now_iso)
+                pfill_fallback = str(fill.get("fill_at") or now_iso)
+                live_exec = {
+                    "live_scale_factor": float(scale_dec),
+                    "order_type": "FAK",
+                    "limit_price": 0.51,
+                    "requested_stake_usd": float(desired_stake_usd),
+                    "requested_quantity": "0.00",
+                    "clob_order_id": None,
+                    "clob_status": "ABORTED_INVALID_DEADLINE",
+                    "error_code": f"INVALID_TIMING_OR_DEADLINE:{time_exc}",
+                    "filled_quantity": "0.00",
+                    "avg_fill_price": 0.0,
+                    "cost_usdc": 0.0,
+                    "fee_usdc": 0.0,
+                    "total_spent_usdc": 0.0,
+                    "unfilled_stake_usdc": float(desired_stake_usd),
+                    "polygon_tx_hashes": [],
+                    "onchain_confirmed": False,
+                    "onchain_block_number": None,
+                }
+                order_record = {
+                    "cohort_id": cohort_id,
+                    "stream": stream,
+                    "rank": rank,
+                    "signal_id": signal_id,
+                    "paper_order_id": paper_order_id,
+                    "market_id": market_id,
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "outcome": outcome,
+                    "market_protocol": market_protocol,
+                    "neg_risk": neg_risk,
+                    "timing": {
+                        "decision_at": dec_fallback,
+                        "paper_fill_at": pfill_fallback,
+                        "live_detected_at": now_iso,
+                        "live_signed_at": now_iso,
+                        "live_http_sent_at": now_iso,
+                        "live_http_ack_at": now_iso,
+                        "detection_lag_ms": 0.0,
+                        "clob_rtt_ms": 0.0,
+                    },
+                    "paper_benchmark": paper_benchmark,
+                    "live_execution": live_exec,
+                    "diff_vs_paper": compute_diff_vs_paper(paper_benchmark, live_exec, paper_status="OPEN"),
+                }
+                self.audit.record_order_execution(
+                    order_record,
+                    underlying=underlying,
+                    window_start=fallback_ws,
+                    window_end=fallback_we,
+                )
+                ordered_slots[slot_idx] = order_record
+                deferred_snapshots.append((str(cohort_id or ""), detected_local))
+                continue
+
+            window_start = format_utc_iso(deadline_info["window_start_dt"])
+            window_end = format_utc_iso(deadline_info["window_end_dt"])
+            decision_at_str = format_utc_iso(deadline_info["decision_dt"])
+            paper_fill_at_str = format_utc_iso(deadline_info["fill_dt"])
+            valid_until_str = deadline_info["effective_valid_iso"]
+            detection_lag_ms = round(
+                max(0.0, (live_detected_cal - deadline_info["fill_dt"]).total_seconds() * 1000.0),
+                2,
+            )
 
             free_usdc, allowance_usdc = self.clob.query_wallet_balance_and_allowance(
                 refresh_network=False,
@@ -493,9 +613,8 @@ class LiveExecutionEngine:
             )
 
             # Check initial hard deadline `valid_until` before DB reservation
-            if valid_until_str:
-                within_deadline, _ = check_hard_deadline(live_detected_cal, valid_until_str)
-                if not within_deadline:
+            within_deadline, _ = check_hard_deadline(live_detected_cal, valid_until_str)
+            if not within_deadline:
                     if not self.audit.claim_signal(
                         signal_id=signal_id,
                         cohort_id=cohort_id,
@@ -608,6 +727,12 @@ class LiveExecutionEngine:
                 },
                 paper_benchmark=paper_benchmark,
                 fee_rate=float(fee_rate),
+                valid_until=valid_until_str,
+                hard_deadline_seconds=self.hard_deadline_after_cohort_seconds,
+                calibrated_now_fn=lambda _p=eff_clock_proj: validate_and_project_utc(
+                    detected_local + timedelta(seconds=max(0.0, time.perf_counter() - detected_mono)),
+                    _p,
+                ),
             )
 
             if not reservation.get("claimed"):
@@ -751,12 +876,14 @@ class LiveExecutionEngine:
                     approved_stake_usd=approved_stake_usd,
                     live_scale_factor=scale_dec,
                     fee_rate=fee_rate,
-                    clock_projection=clock_proj,
+                    clock_projection=eff_clock_proj,
                     quota_cap_usd=quota_cap,
                     paper_benchmark=paper_benchmark,
                     market_protocol=market_protocol,
                     neg_risk=neg_risk,
                     valid_until=valid_until_str,
+                    window_start=window_start,
+                    hard_deadline_seconds=self.hard_deadline_after_cohort_seconds,
                     observed_best_ask=observed_best_ask,
                     book_observed_at=book_observed_at,
                     min_buy_price=effective_min_buy_price,
@@ -818,7 +945,7 @@ class LiveExecutionEngine:
                 "fee_rate": fee_rate,
                 "approved_stake_usd": approved_stake_usd,
                 "quota_cap": quota_cap,
-                "clock_proj": clock_proj,
+                "clock_proj": eff_clock_proj,
                 "valid_until_str": valid_until_str,
                 "decision_at_str": decision_at_str,
                 "paper_fill_at_str": paper_fill_at_str,
@@ -872,7 +999,7 @@ class LiveExecutionEngine:
                 now_chk_local = detected_local + timedelta(
                     seconds=max(virtual_wait_accum, time.perf_counter() - detected_mono)
                 )
-                now_chk_cal = project_to_calibrated_utc(now_chk_local, r_ctx["clock_proj"])
+                now_chk_cal = validate_and_project_utc(now_chk_local, r_ctx["clock_proj"])
                 valid_dt = parse_utc_timestamp(r_ctx["valid_until_str"])
                 if (valid_dt - now_chk_cal).total_seconds() >= (
                     self.fak_no_match_retry_interval_seconds + self.fak_no_match_min_remaining_seconds
@@ -898,7 +1025,7 @@ class LiveExecutionEngine:
                 retry_ref_utc = detected_local + timedelta(
                     seconds=max(virtual_wait_accum, retry_ref_mono - detected_mono)
                 )
-                now_retry_cal = project_to_calibrated_utc(retry_ref_utc, r_ctx["clock_proj"])
+                now_retry_cal = validate_and_project_utc(retry_ref_utc, r_ctx["clock_proj"])
                 valid_dt = parse_utc_timestamp(r_ctx["valid_until_str"])
                 if (valid_dt - now_retry_cal).total_seconds() < self.fak_no_match_min_remaining_seconds:
                     _finalize_exec_bundle(r_ctx, r_ctx["exec_bundle"], retry_count=r_ctx["retry_count"])
@@ -981,6 +1108,8 @@ class LiveExecutionEngine:
                         market_protocol=r_ctx["market_protocol"],
                         neg_risk=r_ctx["neg_risk"],
                         valid_until=r_ctx["valid_until_str"],
+                        window_start=r_ctx["window_start"],
+                        hard_deadline_seconds=self.hard_deadline_after_cohort_seconds,
                         observed_best_ask=live_ask,
                         book_observed_at=format_utc_iso(now_retry_cal),
                         min_buy_price=r_ctx["effective_min_buy_price"],
@@ -1118,7 +1247,17 @@ class LiveExecutionEngine:
     ) -> dict[str, Any]:
         """Build and persist a Spec Section 5.2 `live_quota_snapshots.jsonl` entry."""
         stamp = now_utc or datetime.now(timezone.utc)
-        paper_caps = self._paper_risk_caps()
+        try:
+            paper_caps = self._paper_risk_caps()
+        except PolicyVerificationError as pol_exc:
+            logger.warning("Skipping quota snapshot while policy is unverified: %s", pol_exc)
+            return {
+                "timestamp_utc": format_utc_iso(stamp),
+                "trigger_event": trigger_event,
+                "cohort_id": cohort_id,
+                "policy_verified": False,
+                "policy_error": str(pol_exc),
+            }
         free_usdc, allowance_usdc = self.clob.query_wallet_balance_and_allowance(refresh_network=False)
 
         cohort_budget_usd = None
@@ -1160,6 +1299,7 @@ class LiveExecutionEngine:
         paper_settled_at: str | None,
         market_protocol: str | None = None,
         neg_risk: bool | None = None,
+        payout_ratios: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         live_orders = self.audit.get_live_orders_for_market(market_id)
         if any(
@@ -1189,6 +1329,14 @@ class LiveExecutionEngine:
             else any(bool(o.get("neg_risk")) for o in live_orders)
         )
         existing_settlement = self.audit.get_settlement_record(market_id)
+        eff_payout_ratios = payout_ratios
+        if eff_payout_ratios is None and isinstance(existing_settlement, Mapping):
+            existing_pr = existing_settlement.get("payout_ratios")
+            if isinstance(existing_pr, Mapping) and existing_pr:
+                eff_payout_ratios = existing_pr
+        if eff_payout_ratios is None and str(official_outcome).upper().strip() not in ("UP", "DOWN"):
+            eff_payout_ratios = self.observer.fetch_official_market_payout_ratios(market_id, resolved_cond)
+        before_redeemed = float((existing_settlement or {}).get("redeemed_usdc_amount") or 0.0)
         was_pending_redemption = (
             isinstance(existing_settlement, Mapping)
             and str(existing_settlement.get("redeem_status") or "").upper() in ("REDEEM_PENDING", "REDEEM_SUBMIT_UNKNOWN")
@@ -1270,6 +1418,7 @@ class LiveExecutionEngine:
                 "free_usdc_at_submit": submit_free_usdc,
                 "local_spent_at_submit": submit_local_spent,
                 "tx_submitted_at_utc": submit_ts_utc,
+                "payout_ratios": res_dict.get("payout_ratios") if res_dict.get("payout_ratios") is not None else eff_payout_ratios,
                 "error": res_dict.get("error"),
             }
 
@@ -1287,12 +1436,14 @@ class LiveExecutionEngine:
             neg_risk=resolved_neg_risk,
             existing_settlement=existing_settlement,
             on_progress_callback=_on_redeem_progress,
+            payout_ratios=eff_payout_ratios,
         )
 
         now_utc = datetime.now(timezone.utc)
         settlement_record = _build_settlement_dict(redeem_res, format_utc_iso(now_utc))
         self.audit.record_settlement_and_redeem(settlement_record)
         saved_settlement = self.audit.get_settlement_record(market_id)
+        after_redeemed = before_redeemed
         if isinstance(saved_settlement, Mapping):
             settlement_record["redeem_status"] = str(saved_settlement.get("redeem_status") or settlement_record["redeem_status"])
             settlement_record["redeemed_usdc_amount"] = float(
@@ -1300,20 +1451,23 @@ class LiveExecutionEngine:
                 if saved_settlement.get("redeemed_usdc_amount") is not None
                 else settlement_record["redeemed_usdc_amount"]
             )
+            after_redeemed = float(settlement_record["redeemed_usdc_amount"] or 0.0)
             settlement_record["live_realized_pnl_usdc"] = float(saved_settlement.get("live_realized_pnl_usdc") or 0.0)
 
         # [P1-4] / [P1-E] / [P1-R3-1] / [P2-R4-4] Only credit newly redeemed pUSD for the batch confirmed in this pass,
-        # deduplicated against any wallet balance refresh that already occurred since submission.
+        # deduplicated against any wallet balance refresh and idempotent against replay in `audit_store`.
+        raw_redeem_status = str(redeem_res.get("redeem_status") or "").upper()
         newly_credited = (
             float(redeem_res.get("newly_redeemed_usdc_amount"))
             if redeem_res.get("newly_redeemed_usdc_amount") is not None
             else (
                 float(redeem_res.get("redeemed_usdc_amount") or 0.0)
-                if str(redeem_res.get("redeem_status") or "").upper() in ("REDEEMED", "SHADOW_REDEEMED")
+                if raw_redeem_status in ("REDEEMED", "SHADOW_REDEEMED")
                 else 0.0
             )
         )
-        if newly_credited > 0:
+        store_increased = (saved_settlement is None) or ((after_redeemed - before_redeemed) > 1e-9)
+        if newly_credited > 0 and raw_redeem_status in ("REDEEMED", "SHADOW_REDEEMED") and store_increased:
             batch_keys_str = ",".join(
                 sorted(str(k) for k in (redeem_res.get("newly_redeemed_order_keys") or redeem_res.get("redeemed_order_keys") or []))
             )
@@ -1399,6 +1553,7 @@ class LiveExecutionEngine:
                 paper_settled_at=str(ev.get("utc")) if ev.get("utc") else None,
                 market_protocol=market_protocol_map.get(market_id),
                 neg_risk=market_negrisk_map.get(market_id),
+                payout_ratios=extract_payout_ratios_from_payload(res_obj) or extract_payout_ratios_from_payload(payload),
             )
             processed_markets_this_pass.add(market_id)
             settled_records.append(settlement_record)
@@ -1423,6 +1578,7 @@ class LiveExecutionEngine:
                 paper_settled_at=pend.get("paper_settled_at") or pend.get("settled_at_utc"),
                 market_protocol=pend.get("market_protocol") or market_protocol_map.get(mid),
                 neg_risk=pend.get("neg_risk") if pend.get("neg_risk") is not None else market_negrisk_map.get(mid),
+                payout_ratios=pend.get("payout_ratios") if isinstance(pend.get("payout_ratios"), Mapping) else None,
             )
             processed_markets_this_pass.add(mid)
             settled_records.append(settlement_record)
@@ -1458,6 +1614,7 @@ class LiveExecutionEngine:
                     paper_settled_at=fallback.get("settled_at"),
                     market_protocol=item.get("market_protocol"),
                     neg_risk=bool(item.get("neg_risk")) if item.get("neg_risk") is not None else None,
+                    payout_ratios=fallback.get("payout_ratios") if isinstance(fallback.get("payout_ratios"), Mapping) else None,
                 )
                 processed_markets_this_pass.add(mid)
                 settled_records.append(settlement_record)
