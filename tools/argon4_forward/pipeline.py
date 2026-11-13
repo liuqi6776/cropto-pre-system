@@ -144,6 +144,7 @@ class ForwardPipeline:
                       "live_enabled": False, "reason": "等待本地训练与数据准备"}
         self.bundles = {}
         self.clock = None
+        self._last_known_clock_offset = 0.0
         self.last_cohort = None
         self.inputs = None
         self._input_spacing = None
@@ -258,14 +259,15 @@ class ForwardPipeline:
                     if reason == "PRE_DECISION_WINDOW":
                         # A still-valid clock is safer than starting proactive
                         # collection too late. This does not extend its TTL.
-                        if until <= 2 or self._critical_window():
+                        if until <= 4.0 or self._critical_window():
                             return self.clock
                         budget = min(budget, until-.25)
                         extra_allowed = True
                     elif 0 < until <= 6:
                         budget = max(.1, until-.25)
                 elif not is_calibrated:
-                    wall_elapsed = datetime.now(timezone.utc).timestamp() % 300.0
+                    offset_est = getattr(self, "_last_known_clock_offset", 0.0)
+                    wall_elapsed = (datetime.now(timezone.utc).timestamp() + offset_est) % 300.0
                     wall_until = 300.0 - wall_elapsed
                     if 22.0 < wall_elapsed < 293.0 and not self._critical_window():
                         extra_allowed = True
@@ -273,11 +275,16 @@ class ForwardPipeline:
                         extra_allowed = True
                         budget = 4.5
                     elif 0.0 < wall_until <= 6.0:
-                        budget = max(0.5, wall_until - 0.25)
+                        budget = max(3.5, wall_until - 0.25)
                 kwargs = {"retry_borderline": extra_allowed,
                           "budget_monotonic": time.monotonic()+budget}
             self._last_clock_attempt_mono = time.monotonic()
             self.clock = calibrate(transport=self.public_transport, **kwargs)
+            if (self.clock.get("status") == "CALIBRATED"
+                    and not isinstance(self.clock.get("server_minus_local_seconds"), bool)
+                    and isinstance(self.clock.get("server_minus_local_seconds"), (int, float))
+                    and math.isfinite(self.clock["server_minus_local_seconds"])):
+                self._last_known_clock_offset = float(self.clock["server_minus_local_seconds"])
             self._last_clock_attempt_mono = (
                 self.clock["calibrated_monotonic"]
                 if isinstance(self.clock.get("calibrated_monotonic"), (int, float))
@@ -392,6 +399,20 @@ class ForwardPipeline:
             except Exception:
                 pass
 
+    def _sync_mark_registry_if_committed(self):
+        raw_root = (self.runtime / "features/raw_data").resolve()
+        allowed = (ROOT / "paper_runtime/argon4_forward_20261105/features/raw_data").resolve()
+        if raw_root != allowed or not raw_root.is_dir():
+            return
+        marker_path = self.runtime / "features/revisions/view_state.json"
+        if marker_path.is_file():
+            try:
+                if json.loads(marker_path.read_text(encoding="utf-8")).get("status") != "COMMITTED":
+                    return
+            except Exception:
+                return
+        register_online_marks(raw_root)
+
     def reconcile_inputs(self, collector, inputs):
         if not any("CONFLICTING_CLOSED_OBSERVATION" in e.get("error", "")
                    for e in inputs.get("errors", [])):
@@ -402,6 +423,8 @@ class ForwardPipeline:
         if any(e.get("source", "").startswith("mark:") for e in inputs["errors"]):
             kwargs["mark_registry_path"] = ROOT / "archive/catalog/mark_candle_registry.json"
         with collector._lock:
+            if "mark_registry_path" in kwargs:
+                self._sync_mark_registry_if_committed()
             result = reconcile_confirmed_price_revisions(
                 self.runtime, inputs["errors"], now=lambda: calibrated_now(self.clock),
                 cutover_now=self.revision_cutover_now, **kwargs)
@@ -468,10 +491,25 @@ class ForwardPipeline:
                 return True
             if allow_hourly and (text.startswith("futures:") or text.startswith("mark:")) and text.endswith(":1h"):
                 return True
+            if allow_hourly and (text.startswith("futures:") or text.startswith("spot:")) and text.endswith(":4h"):
+                return True
             return False
-        if not errors or any(e.get("error") not in (
-                "CONFLICTING_CLOSED_OBSERVATION", "ValueError:CONFLICTING_CLOSED_OBSERVATION")
-                or not _supported_fast_source(e.get("source")) for e in errors):
+        has_4h_conflict = allow_hourly and any(
+            isinstance(e, dict)
+            and e.get("error") in ("CONFLICTING_CLOSED_OBSERVATION", "ValueError:CONFLICTING_CLOSED_OBSERVATION")
+            and str(e.get("source") or "").endswith(":4h")
+            and _supported_fast_source(e.get("source"))
+            for e in errors
+        )
+        def _supported_fast_error(e):
+            if not isinstance(e, dict):
+                return False
+            if (has_4h_conflict and e.get("source") == "basis"
+                    and e.get("error") in ("BASIS_LEG_COVERAGE_MISMATCH", "ValueError:BASIS_LEG_COVERAGE_MISMATCH")):
+                return True
+            return (e.get("error") in ("CONFLICTING_CLOSED_OBSERVATION", "ValueError:CONFLICTING_CLOSED_OBSERVATION")
+                    and _supported_fast_source(e.get("source")))
+        if not errors or any(not _supported_fast_error(e) for e in errors):
             return inputs, None
         raw_deadline_sec = float(engineering.get("input_deadline_after_boundary_seconds", 14.0))
         if raw_deadline_sec > 14.0:
@@ -499,6 +537,8 @@ class ForwardPipeline:
                         raise ValueError("REVISION_INPUT_WORKERS_BUSY")
                     extra_kwargs = ({"mark_registry_path": ROOT / "archive/catalog/mark_candle_registry.json"}
                                     if any(str(e.get("source", "")).startswith("mark:") for e in inputs["errors"]) else {})
+                    if "mark_registry_path" in extra_kwargs:
+                        self._sync_mark_registry_if_committed()
                     revision = reconcile_confirmed_price_revisions(self.runtime, inputs["errors"],
                         now=lambda: calibrated_now(clock), cutover_now=lambda: calibrated_now(clock),
                         fast_context=context, cohort_guard=guard, **extra_kwargs)
@@ -633,10 +673,46 @@ class ForwardPipeline:
         )
         vol_guard = (policy.get("volatility_regime_guard")
                      if isinstance(policy.get("volatility_regime_guard"), dict) else None)
+        hcap_guard_cfg = (vol_guard.get("twap60_handicap_guard")
+                          if isinstance(vol_guard, dict) and isinstance(vol_guard.get("twap60_handicap_guard"), dict)
+                          else None)
+        hcap_guard_enabled = bool(vol_guard and vol_guard.get("enabled") is True
+                                  and hcap_guard_cfg and hcap_guard_cfg.get("enabled") is True)
         rv12_cache = {}
         own_rets_cache = {}
+        spot_1m_cache = {}
         btc_macro_rets = compute_ex_ante_btc_macro_returns_pct(
             inputs.get("data_root"), as_of=now_lower, snapshot=snapshot)
+        if snapshot is not None:
+            due_symbols = []
+            for stream in policy["order"]:
+                if stream in profile["disabled_streams"]:
+                    continue
+                underlying, timeframe = stream.split("_")
+                if int(cohort.timestamp()) % (int(timeframe[:-1]) * 60):
+                    continue
+                sym = underlying + "USDT"
+                if sym not in frames and sym not in due_symbols:
+                    due_symbols.append(sym)
+            if len(due_symbols) > 1:
+                import os
+            if len(due_symbols) > 1 and (os.cpu_count() or 1) >= 4:
+                if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
+                    raise ValueError("missed feature decision window")
+                from concurrent.futures import ThreadPoolExecutor
+                from threadpoolctl import threadpool_limits
+
+                def _build_due_symbol(sym):
+                    t0 = time.perf_counter()
+                    return snapshot.build(sym, tail_rows=1), time.perf_counter() - t0
+
+                wall_t0 = time.perf_counter()
+                with threadpool_limits(limits=1):
+                    with ThreadPoolExecutor(max_workers=min(3, len(due_symbols)), thread_name_prefix="argon4-feat") as pool:
+                        fut_map = {sym: pool.submit(_build_due_symbol, sym) for sym in due_symbols}
+                        for sym in due_symbols:
+                            frames[sym], self._decision_timing["features_seconds"][sym] = fut_map[sym].result()
+                self._decision_timing["features_parallel_wall_seconds"] = time.perf_counter() - wall_t0
         for stream in policy["order"]:
             if stream in profile["disabled_streams"]:
                 decisions[stream] = disabled_decision(profile)
@@ -675,6 +751,7 @@ class ForwardPipeline:
             score = predict_stream(stream, f["base"], f["expert"], calibrated_now(self.clock), **score_kwargs)
             if rv12_cache[symbol] is not None or vol_guard is not None:
                 own_rets = own_rets_cache.get(symbol) or {}
+                cached_s1 = spot_1m_cache.get(symbol) if isinstance(spot_1m_cache.get(symbol), dict) else None
                 score = apply_volatility_regime_guard(
                     stream,
                     score,
@@ -688,7 +765,53 @@ class ForwardPipeline:
                     own_ret_1h_pct=own_rets.get("own_ret_1h_pct"),
                     own_ret_15m_bps=own_rets.get("own_ret_15m_bps"),
                     own_streak_3bar=own_rets.get("own_streak_3bar"),
+                    spot_twap60_t=cached_s1.get("twap60") if cached_s1 and cached_s1.get("status") == "OBSERVED" else None,
+                    spot_close_t=cached_s1.get("spot_close") if cached_s1 and cached_s1.get("status") == "OBSERVED" else None,
                 )
+                if (hcap_guard_enabled and score.get("selected") is True
+                        and symbol not in spot_1m_cache
+                        and hasattr(self.inputs, "capture_spot_1m_twap60")):
+                    rem_win = (cohort + timedelta(seconds=18.5) - calibrated_now(self.clock)).total_seconds()
+                    timeout_s = float(hcap_guard_cfg.get("timeout_seconds", 1.2))
+                    if rem_win > 0.15:
+                        dl_mono = time.monotonic() + min(timeout_s, rem_win)
+                        try:
+                            s1_obs = self.inputs.capture_spot_1m_twap60(
+                                symbol, cohort, cohort_id=cohort.isoformat(), deadline_monotonic=dl_mono
+                            )
+                        except Exception as exc:
+                            s1_obs = {"status": "ERROR", "symbol": symbol, "cohort_id": cohort.isoformat(),
+                                      "error": f"{type(exc).__name__}:{str(exc)[:120]}"}
+                    else:
+                        s1_obs = {"status": "DEADLINE_SKIPPED", "symbol": symbol, "cohort_id": cohort.isoformat()}
+                    spot_1m_cache[symbol] = s1_obs
+                    if s1_obs.get("status") == "OBSERVED":
+                        score = apply_volatility_regime_guard(
+                            stream,
+                            score,
+                            ex_ante_rv12_bps=rv12_cache[symbol],
+                            guard_config=vol_guard,
+                            cohort_time=cohort,
+                            btc_ret_1h_pct=btc_macro_rets.get("btc_ret_1h_pct"),
+                            btc_ret_2h_pct=btc_macro_rets.get("btc_ret_2h_pct"),
+                            btc_ret_4h_pct=btc_macro_rets.get("btc_ret_4h_pct"),
+                            btc_ema_gap_bps=btc_macro_rets.get("btc_ema_gap_bps"),
+                            own_ret_1h_pct=own_rets.get("own_ret_1h_pct"),
+                            own_ret_15m_bps=own_rets.get("own_ret_15m_bps"),
+                            own_streak_3bar=own_rets.get("own_streak_3bar"),
+                            spot_twap60_t=s1_obs["twap60"],
+                            spot_close_t=s1_obs["spot_close"],
+                        )
+                        score["spot_1m_receipt_sha256"] = s1_obs.get("receipt_sha256")
+                    elif str(hcap_guard_cfg.get("on_unavailable", "PASS_WITH_WARNING")).upper() == "SKIP":
+                        score = {
+                            **score,
+                            "volatility_regime_guarded": True,
+                            "volatility_regime_reason": "TWAP60_SPOT_1M_UNAVAILABLE",
+                            "selected": False,
+                        }
+                elif cached_s1 and cached_s1.get("status") == "OBSERVED":
+                    score["spot_1m_receipt_sha256"] = cached_s1.get("receipt_sha256")
             self._decision_timing["inference_seconds"][stream] = time.perf_counter()-started
             if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
                 raise ValueError("missed feature decision window")
@@ -709,6 +832,12 @@ class ForwardPipeline:
                     signal["effective_max_buy_price"] = float(score["effective_max_buy_price"])
                     decisions[stream]["effective_max_buy_price"] = float(score["effective_max_buy_price"])
                 decisions[stream].update(status="SIGNAL", signal=signal)
+        if spot_1m_cache and getattr(self, "observations", None) is not None:
+            try:
+                self.observations.save("spot_1m_twap60_handicap", {
+                    "cohort": cohort.isoformat(), "symbols": spot_1m_cache})
+            except Exception:
+                pass
         return decisions
 
     def set_input_clock(self, clock=None):
@@ -841,6 +970,8 @@ class ForwardPipeline:
                 kwargs = ({"mark_registry_path": ROOT/"archive/catalog/mark_candle_registry.json"}
                           if any(str(e.get("source", "")).startswith("mark:")
                                  for e in inputs["errors"] if isinstance(e, dict)) else {})
+                if "mark_registry_path" in kwargs:
+                    self._sync_mark_registry_if_committed()
                 result = reconcile_confirmed_price_revisions(self.runtime, inputs["errors"],
                     now=lambda: calibrated_now(clock), cutover_now=lambda: calibrated_now(clock),
                     maintenance_guard=guard, **kwargs)
@@ -1280,7 +1411,7 @@ class ForwardPipeline:
         if self.resume_prepared(policy):
             return
         spacing = policy.get("input_http_min_spacing_seconds", 1.0)
-        if isinstance(spacing, bool) or not isinstance(spacing, (int, float)) or not math.isfinite(spacing) or not .25 <= spacing <= 1:
+        if isinstance(spacing, bool) or not isinstance(spacing, (int, float)) or not math.isfinite(spacing) or not .05 <= spacing <= 1:
             raise ValueError("unsupported live public-input request spacing")
         active_symbols = _policy_symbols(policy, profile)
         if self.inputs is not None and (self._input_spacing != spacing or getattr(self.inputs, "symbols", SYMBOLS) != active_symbols):
@@ -1442,11 +1573,14 @@ class ForwardPipeline:
                 try:
                     self.cycle()
                 except Exception as exc:
+                    est_now = datetime.now(timezone.utc) + timedelta(
+                        seconds=getattr(self, "_last_known_clock_offset", 0.0)
+                    )
                     err_cohort = (
                         (self._pending_timing or {}).get("cohort")
                         if isinstance(getattr(self, "_pending_timing", None), dict)
                         else None
-                    ) or cohort_at(datetime.now(timezone.utc)).isoformat()
+                    ) or cohort_at(est_now).isoformat()
                     self.abandon_prepared("CHECK_FAILED_DURING_RECHECK")
                     self._log_block_once(
                         ("PIPELINE_CYCLE_EXCEPTION", err_cohort, type(exc).__name__, str(exc)[:120]),

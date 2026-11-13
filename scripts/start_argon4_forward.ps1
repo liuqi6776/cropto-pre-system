@@ -40,13 +40,17 @@ if (-not $panelStatus -and -not $existingService) {
     $stderrLog = Join-Path $runtimePath 'server.stderr.log'
     $paperFlag = if ($paperPolicy.paper_trading_active -eq $true) { ' --enable-paper' } else { '' }
     $cmdLine = "cmd.exe /c `"`"$pythonPath`" -B -u `"$serverPath`" --port 8897$paperFlag 1>`"$stdoutLog`" 2>`"$stderrLog`"`""
-    $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
-    $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-        CommandLine = $cmdLine
-        CurrentDirectory = $workspacePath
-        ProcessStartupInformation = $startup
-    }
-    if ($created.ReturnValue -ne 0) {
+    $createdOk = $false
+    try {
+        $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 } -ErrorAction Stop
+        $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+            CommandLine = $cmdLine
+            CurrentDirectory = $workspacePath
+            ProcessStartupInformation = $startup
+        } -ErrorAction Stop
+        $createdOk = ($created.ReturnValue -eq 0)
+    } catch {}
+    if (-not $createdOk) {
         $processArgs = @('-B', '-u', ('"' + $serverPath + '"'), '--port', '8897')
         if ($paperPolicy.paper_trading_active -eq $true) { $processArgs += '--enable-paper' }
         Start-Process -FilePath $pythonPath -ArgumentList $processArgs -WorkingDirectory $workspacePath -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog | Out-Null
@@ -55,7 +59,7 @@ if (-not $panelStatus -and -not $existingService) {
 $ready = $false
 for ($attempt = 0; $attempt -lt 60; $attempt++) {
     try {
-        $panelStatus = Invoke-RestMethod -Uri 'http://127.0.0.1:8897/api/status' -TimeoutSec 2
+        $panelStatus = Invoke-RestMethod -Uri 'http://127.0.0.1:8897/api/status' -TimeoutSec 8
         if ($panelStatus.strategy -eq 'ARGON4_SEVEN_STREAM_PRIORITY_WATERFALL' -and $panelStatus.live_enabled -eq $false) { $ready = $true; break }
     } catch { Start-Sleep -Milliseconds 500 }
 }

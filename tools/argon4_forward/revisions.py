@@ -30,16 +30,21 @@ import numpy as np
 import pandas as pd
 
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT")
+BASIS_SYMBOLS = SYMBOLS[:3]
 PROVENANCE = ("first_received_at", "receipt_sha256", "receipt_time_basis", "clock_evidence_sha256")
 PRICE_FIELDS = {1: "open", 2: "high", 3: "low", 4: "close", 5: "volume",
                 7: "quote_volume", 8: "count", 9: "taker_buy_base_volume", 10: "taker_buy_quote_volume"}
 REVISION_SPECS = {
-    ("futures", "5m"): {"endpoint": "/fapi/v1/klines", "directory": "intraday", "step_ms": 300000},
-    ("futures", "1h"): {"endpoint": "/fapi/v1/klines", "directory": "auxiliary", "step_ms": 3600000},
-    ("mark", "1h"): {"endpoint": "/fapi/v1/markPriceKlines", "directory": "auxiliary", "step_ms": 3600000},
+    ("futures", "5m"): {"host": "fapi.binance.com", "endpoint": "/fapi/v1/klines", "directory": "intraday", "step_ms": 300000},
+    ("futures", "1h"): {"host": "fapi.binance.com", "endpoint": "/fapi/v1/klines", "directory": "auxiliary", "step_ms": 3600000},
+    ("mark", "1h"): {"host": "fapi.binance.com", "endpoint": "/fapi/v1/markPriceKlines", "directory": "auxiliary", "step_ms": 3600000},
+    ("futures", "4h"): {"host": "fapi.binance.com", "endpoint": "/fapi/v1/klines", "directory": "auxiliary", "step_ms": 14400000},
+    ("spot", "4h"): {"host": "data-api.binance.vision", "endpoint": "/api/v3/klines", "directory": "auxiliary", "step_ms": 14400000},
 }
 SAFE_ERROR = "REVISION_VIEW_NOT_COMMITTED"
 FAST_PROFILE = "argon4-aged-revision-v13"
+FAST_V14_PROFILE = "argon4-aged-revision-v14"
+ALLOWED_FAST_PROFILES = (FAST_PROFILE, FAST_V14_PROFILE)
 _RECOVERY_LOCK = threading.Lock()
 _COMMITTED_ARCHIVE_HASH_LOCK = threading.Lock()
 _COMMITTED_ARCHIVE_HASH_CACHE = {}
@@ -212,14 +217,22 @@ def _error_sources(errors):
     if not isinstance(errors, list) or not errors:
         return []
     sources = []
+    saw_basis_leg_mismatch = False
     for error in errors:
         if not isinstance(error, dict):
             raise ValueError("UNSUPPORTED_REVISION_ERROR")
+        if (error.get("source") == "basis"
+                and error.get("error") in ("BASIS_LEG_COVERAGE_MISMATCH", "ValueError:BASIS_LEG_COVERAGE_MISMATCH")):
+            saw_basis_leg_mismatch = True
+            continue
         parts = str(error.get("source", "")).split(":")
-        if (len(parts) != 3 or (parts[0], parts[2]) not in REVISION_SPECS or parts[1] not in SYMBOLS
+        allowed_symbols = BASIS_SYMBOLS if len(parts) == 3 and parts[2] == "4h" else SYMBOLS
+        if (len(parts) != 3 or (parts[0], parts[2]) not in REVISION_SPECS or parts[1] not in allowed_symbols
                 or error.get("error") not in ("CONFLICTING_CLOSED_OBSERVATION", "ValueError:CONFLICTING_CLOSED_OBSERVATION")):
             raise ValueError("UNSUPPORTED_REVISION_ERROR")
         sources.append(tuple(parts))
+    if saw_basis_leg_mismatch and not any(interval == "4h" for _, _, interval in sources):
+        raise ValueError("UNSUPPORTED_REVISION_ERROR")
     return sorted(set(sources))
 
 
@@ -258,7 +271,8 @@ def _read_cache(path, step_ms=300000):
 def _query(url, symbol, kind="futures", interval="5m"):
     spec = REVISION_SPECS[(kind, interval)]
     parsed = urlsplit(url)
-    if parsed.scheme != "https" or parsed.netloc != "fapi.binance.com" or parsed.path != spec["endpoint"] or parsed.fragment:
+    expected_host = spec.get("host", "fapi.binance.com")
+    if parsed.scheme != "https" or parsed.netloc != expected_host or parsed.path != spec["endpoint"] or parsed.fragment:
         raise ValueError("UNSUPPORTED_RECEIPT_ENDPOINT")
     params = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
     if set(params) != {"symbol", "interval", "startTime", "endTime", "limit"} or any(len(v) != 1 for v in params.values()):
@@ -365,7 +379,7 @@ def _fast_context(context, validation_at):
         return None
     if (not isinstance(context, dict)
             or set(context) != {"profile", "cohort", "deadline", "minimum_spacing_seconds", "clock_evidence_sha256"}
-            or context["profile"] != FAST_PROFILE
+            or context["profile"] not in ALLOWED_FAST_PROFILES
             or isinstance(context["minimum_spacing_seconds"], bool)
             or float(context["minimum_spacing_seconds"]) not in (1.2, 2.0)):
         raise ValueError("INVALID_FAST_REVISION_CONTEXT")
@@ -384,7 +398,7 @@ def _fast_context(context, validation_at):
     if (cohort != cohort.floor("5min") or deadline not in allowed_deadlines
             or not cohort <= validation_at <= deadline):
         raise ValueError("FAST_REVISION_OUTSIDE_INPUT_BUDGET")
-    return {"profile": FAST_PROFILE, "cohort": cohort.isoformat(), "deadline": deadline.isoformat(),
+    return {"profile": context["profile"], "cohort": cohort.isoformat(), "deadline": deadline.isoformat(),
             "minimum_spacing_seconds": spacing_sec, "clock_evidence_sha256": clock_hash}
 
 
@@ -453,9 +467,16 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
             fast = fast_context is not None
             if fast:
                 cohort = _time(fast_context["cohort"])
-                aged = (kind == "futures" and interval == "5m"
-                        and pd.to_datetime(opened+spec["step_ms"], unit="ms", utc=True)
-                        <= cohort-pd.Timedelta(minutes=5))
+                bar_close = pd.to_datetime(opened+spec["step_ms"], unit="ms", utc=True)
+                allow_hourly = fast_context.get("profile") == FAST_V14_PROFILE
+                if kind == "futures" and interval == "5m":
+                    aged = bar_close <= cohort-pd.Timedelta(minutes=5)
+                elif allow_hourly and (kind, interval) in (("futures", "1h"), ("mark", "1h")):
+                    aged = bar_close <= cohort-pd.Timedelta(hours=1)
+                elif allow_hourly and (kind, interval) in (("futures", "4h"), ("spot", "4h")):
+                    aged = bar_close <= cohort-pd.Timedelta(hours=4)
+                else:
+                    aged = False
                 current_receipt = (cohort <= _time(latest["requested_at"])
                                    and latest["time_basis"] == "CALIBRATED_UTC_UPPER_BOUND"
                                    and latest["clock_evidence_sha256"] == fast_context["clock_evidence_sha256"])
@@ -498,7 +519,7 @@ def _plans(runtime, sources, now, *, raw_root_override=None, receipts_path_overr
             provenance_before = {field: (None if pd.isna(old.at[index, field]) else
                 _time(old.at[index, field]).isoformat() if field == "first_received_at" else str(old.at[index, field])) for field in PROVENANCE}
             changes.append({"symbol": symbol, "kind": kind, "interval": interval,
-                "source_endpoint": "https://fapi.binance.com" + spec["endpoint"],
+                "source_endpoint": "https://" + spec.get("host", "fapi.binance.com") + spec["endpoint"],
                 "bar_open": _time(old.at[index, "date"]).isoformat(),
                 "changed_price_fields": differs, "before": before, "after": after,
                 "provenance_before": provenance_before,
@@ -1347,7 +1368,12 @@ def reconcile_confirmed_price_revisions(runtime, errors, now=None, *, mark_regis
             if not callable(now) or not callable(cutover_now):
                 raise ValueError("FAST_REVISION_CALIBRATED_CLOCK_CALLBACKS_REQUIRED")
             guards.append(_guard_evidence(cohort_guard, "BEFORE_VALIDATION", fast))
-            if any((kind, interval) != ("futures", "5m") for kind, _, interval in sources):
+            allowed_fast_sources = (
+                {("futures", "5m"), ("futures", "1h"), ("mark", "1h"), ("futures", "4h"), ("spot", "4h")}
+                if fast.get("profile") == FAST_V14_PROFILE
+                else {("futures", "5m")}
+            )
+            if any((kind, interval) not in allowed_fast_sources for kind, _, interval in sources):
                 fast = None
         runtime, features, raw_root, revisions = _paths(runtime)
         before_files = _inventory(raw_root)

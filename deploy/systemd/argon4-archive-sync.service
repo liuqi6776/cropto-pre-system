@@ -1,0 +1,10 @@
+[Unit]
+Description=ARGON-4 Tiered Cold Archive & Google Drive Sync
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=liuqi
+Group=liuqi
+WorkingDirectory=/data/crypto-predict_system
+ExecStart=/data/crypto-predict_system/.venv/bin/python -B /data/crypto-predict_system/scripts/sync_archive_gdrive.py

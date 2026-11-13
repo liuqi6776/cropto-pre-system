@@ -22,6 +22,8 @@ V12_ENGINEERING = {
 }
 
 AGED_REVISION_PROFILE = "argon4-aged-revision-v13"
+AGED_REVISION_V14_PROFILE = "argon4-aged-revision-v14"
+ALLOWED_AGED_REVISION_PROFILES = (AGED_REVISION_PROFILE, AGED_REVISION_V14_PROFILE)
 AGED_REVISION_FASTPATH = {
     "profile": AGED_REVISION_PROFILE,
     "enabled": True,
@@ -42,7 +44,9 @@ def revision_fastpath_profile(policy):
     if not isinstance(value, dict) or set(value) != set(AGED_REVISION_FASTPATH):
         raise ValueError("invalid aged revision profile")
     for key, expected in AGED_REVISION_FASTPATH.items():
-        if isinstance(expected, bool):
+        if key == "profile":
+            valid = isinstance(value[key], str) and value[key] in ALLOWED_AGED_REVISION_PROFILES
+        elif isinstance(expected, bool):
             valid = type(value[key]) is bool and value[key] is expected
         else:
             valid = not isinstance(value[key], bool) and value[key] == expected
@@ -81,8 +85,8 @@ def engineering_profile(policy):
         if isinstance(number, bool) or not isinstance(number, (float, int)) or not math.isfinite(number) or not low <= number <= high:
             raise ValueError("unsafe engineering budget")
     if value["profile"] == V12_PROFILE_ID:
-        for key, allowed_numbers in (("window_poll_interval_seconds", (.2, .25)),
-                                     ("input_ready_retry_interval_seconds", (.35, .5))):
+        for key, allowed_numbers in (("window_poll_interval_seconds", (.1, .2, .25)),
+                                     ("input_ready_retry_interval_seconds", (.15, .35, .5))):
             if isinstance(value[key], bool) or value[key] not in allowed_numbers:
                 raise ValueError("unsafe opportunity timing")
         if value["telemetry_sampling_profile"] != "clock_center_v12":
@@ -94,7 +98,7 @@ def minimum_decision_delay(policy, engineering=None):
     profile = engineering or engineering_profile(policy)
     eng_block = policy.get("engineering") if isinstance(policy.get("engineering"), dict) else {}
     value = policy.get("min_decision_delay_seconds", eng_block.get("minimum_decision_delay_seconds", 5))
-    lower = 2 if profile["profile"] == V12_PROFILE_ID else 5
+    lower = 0.8 if profile["profile"] == V12_PROFILE_ID else 5
     if (isinstance(value, bool) or not isinstance(value, (float, int))
             or not math.isfinite(value) or not lower <= value <= 10):
         raise ValueError("unsupported minimum decision delay")

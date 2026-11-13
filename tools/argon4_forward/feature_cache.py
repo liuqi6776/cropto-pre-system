@@ -309,7 +309,8 @@ class FeatureSnapshot:
             if not isinstance(tail_rows, int) or tail_rows < 1:
                 raise reference.ModelInputError("positive tail_rows required")
             base, expert, raw_target = base.tail(tail_rows), expert.tail(tail_rows), raw_target.tail(tail_rows)
-        self._stats["builds"] += 1
+        with self._lock:
+            self._stats["builds"] += 1
         return {"base": base, "expert": expert, "index": base.index, "raw_target": raw_target,
                 "availability": availability, "provenance": fingerprints,
                 "classification": reference.CLASSIFICATION, "source_sha256": dict(reference.SOURCE_HASHES)}

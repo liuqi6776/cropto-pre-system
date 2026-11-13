@@ -58,11 +58,23 @@ def test_v12_timing_and_sampling_contract_fails_closed(key, value):
     with pytest.raises(ValueError): engineering_profile(p)
 
 
-@pytest.mark.parametrize("value", [True, None, float("nan"), 1.9, 10.1])
+@pytest.mark.parametrize("value", [True, None, float("nan"), 0.79, 10.1])
 def test_v12_rejects_unapproved_earliest_delay(value):
     p = fixture_policy()
     p.update(engineering=deepcopy(V12_ENGINEERING), min_decision_delay_seconds=value)
     with pytest.raises(ValueError): minimum_decision_delay(p)
+
+
+def test_v12_accepts_stage1b_high_speed_bounds():
+    p = fixture_policy()
+    eng = deepcopy(V12_ENGINEERING)
+    eng.update(window_poll_interval_seconds=0.1, input_ready_retry_interval_seconds=0.15,
+               minimum_decision_delay_seconds=0.8, prefetch_lead_seconds=9.5, prefetch_budget_seconds=6.5)
+    p.update(engineering=eng, min_decision_delay_seconds=0.8)
+    parsed = engineering_profile(p)
+    assert parsed["window_poll_interval_seconds"] == pytest.approx(0.1)
+    assert parsed["input_ready_retry_interval_seconds"] == pytest.approx(0.15)
+    assert minimum_decision_delay(p, parsed) == pytest.approx(0.8)
 
 
 def test_preflight_checks_bytes_without_deserializing_or_connecting(tmp_path):

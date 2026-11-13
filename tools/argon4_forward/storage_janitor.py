@@ -1,10 +1,17 @@
-"""Automated bi-weekly (14-day) hot-to-cold storage janitor for ARGON-4.
+"""Automated hot-to-cold storage janitor and 100GB tiered archiver for ARGON-4.
 
-Safely migrates >14-day non-pinned historical revision directories, old
-observation snapshots, and aged audit logs from the hot runtime directory to
-`D:/argon4_cold_archive` (with automatic fallback if D: is unavailable),
-verifying SHA256 digests before freeing hot-disk space and preserving 100%
-of active revision integrity (`ensure_view_committed`).
+Safely migrates aged non-pinned historical revision directories, old observation
+and book-telemetry rows, and aged audit logs from the hot runtime directory to
+the configured cold archive root, verifying SHA256 digests before freeing hot
+disk space and preserving 100% of active revision integrity (`ensure_view_committed`).
+
+Supports three-tier retention:
+- Hot runtime: active ledgers, rolling 20-day klines, pinned revision, recent SQLite rows.
+- Permanent core (`permanent_core/`): online backups of `account.sqlite3` and external
+  live order ledgers, plus `[-60s, +300s]` orderbook/decision keyframes around every
+  signal and trade (never deleted by capacity caps).
+- Rolling raw (`sqlite/`, `revisions/`, `logs/`): optional `zstd`/`gzip` compression,
+  redundant revision SQLite stripping, and FIFO pruning under `max_cold_total_gb`.
 """
 from __future__ import annotations
 
@@ -12,6 +19,7 @@ import argparse
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import gc
+import gzip
 import hashlib
 import json
 import os
@@ -19,6 +27,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -28,6 +37,33 @@ from . import revisions
 
 ROOT = Path(__file__).resolve().parents[2]
 _REV_TS_RE = re.compile(r"^(?:rev[-_])?(\d{8}T\d{6}(?:\d{6})?Z)")
+_REDUNDANT_REV_SQLITE_PREFIXES = (
+    "observations.sqlite3",
+    "observations_delta.sqlite3",
+    "receipts.sqlite3",
+)
+_SENSITIVE_NAME_TOKENS = (
+    "env",
+    "key",
+    "secret",
+    "cred",
+    "token",
+    "pass",
+    "priv",
+    "wallet",
+    "seed",
+    "mnemonic",
+    "auth",
+)
+_KEYFRAME_SNAPSHOT_KINDS = (
+    "prediction_decisions",
+    "paper_execution",
+    "paper_execution_abandoned",
+    "paper_settlements",
+    "settlement_label_alignment",
+    "paper_market_receipt",
+    "paper_book_receipt",
+)
 
 
 def _utc(value: Any = None) -> datetime:
@@ -80,6 +116,84 @@ def _dir_size_bytes(root: Path) -> int:
     return total
 
 
+def _physical_dir_size_bytes(root: Path) -> int:
+    """Count physical disk bytes once per unique (st_dev, st_ino) hardlink group."""
+    if not root.exists():
+        return 0
+    total = 0
+    seen_inodes: set[tuple[int, int]] = set()
+    for p in root.rglob("*"):
+        try:
+            if p.is_file() and not p.is_symlink():
+                st = p.stat()
+                if st.st_ino:
+                    key = (st.st_dev, st.st_ino)
+                    if key in seen_inodes:
+                        continue
+                    seen_inodes.add(key)
+                total += st.st_size
+        except OSError:
+            pass
+    return total
+
+
+def _is_sensitive_filename(name: str) -> bool:
+    low = name.lower()
+    if low.startswith("."):
+        return True
+    return any(tok in low for tok in _SENSITIVE_NAME_TOKENS)
+
+
+def _is_redundant_revision_file(rel: Path) -> bool:
+    parts = rel.parts
+    if not parts:
+        return False
+    if len(parts) == 1 and any(parts[0].startswith(pfx) for pfx in _REDUNDANT_REV_SQLITE_PREFIXES):
+        return True
+    # Unchanged baseline kline parquets in `raw_data/` are already covered by rolling
+    # cache + `manifest.json["before_files"]`; keep `proposed_raw_data/` diffs intact.
+    if parts[0] == "raw_data":
+        return True
+    return False
+
+
+def _compress_cold_artifact(src: Path) -> tuple[Path, str, str]:
+    """Compress `src` into `.zst` (if `zstd` CLI is installed) or `.gz`, removing `src`."""
+    src = Path(src)
+    zstd_bin = shutil.which("zstd")
+    if zstd_bin:
+        dst = Path(str(src) + ".zst")
+        tmp = Path(str(dst) + f".{os.getpid()}.tmp")
+        try:
+            subprocess.run(
+                [zstd_bin, "-3", "-q", "-f", str(src), "-o", str(tmp)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=600,
+            )
+            if not tmp.is_file() or tmp.stat().st_size == 0:
+                raise RuntimeError("ZSTD_EMPTY_OUTPUT")
+            os.replace(tmp, dst)
+            comp_sha = _sha256(dst)
+            src.unlink(missing_ok=True)
+            return dst, comp_sha, "zstd"
+        except Exception:
+            tmp.unlink(missing_ok=True)
+
+    dst_gz = Path(str(src) + ".gz")
+    tmp_gz = Path(str(dst_gz) + f".{os.getpid()}.tmp")
+    try:
+        with src.open("rb") as f_in, gzip.open(tmp_gz, "wb", compresslevel=6) as f_out:
+            shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
+        os.replace(tmp_gz, dst_gz)
+        comp_sha = _sha256(dst_gz)
+        src.unlink(missing_ok=True)
+        return dst_gz, comp_sha, "gzip"
+    finally:
+        tmp_gz.unlink(missing_ok=True)
+
+
 def _revision_timestamp(rev_dir: Path) -> datetime:
     for meta_name, keys in (
         ("manifest.json", ("view_effective_at", "committed_at", "validation_at")),
@@ -105,8 +219,36 @@ def _revision_timestamp(rev_dir: Path) -> datetime:
     return datetime.fromtimestamp(rev_dir.stat().st_mtime, tz=timezone.utc)
 
 
+def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if not intervals:
+        return []
+    ordered = sorted(intervals, key=lambda x: x[0])
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
+        prev_s, prev_e = merged[-1]
+        if start <= prev_e:
+            merged[-1] = (prev_s, max(prev_e, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _in_intervals(epoch_s: float, merged: list[tuple[float, float]]) -> bool:
+    lo, hi = 0, len(merged) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        s, e = merged[mid]
+        if epoch_s < s:
+            hi = mid - 1
+        elif epoch_s > e:
+            lo = mid + 1
+        else:
+            return True
+    return False
+
+
 class StorageJanitor:
-    """Revision-aware bi-weekly cold archiver and hot SQLite/log compactor."""
+    """Revision-aware hot-to-cold archiver, keyframe extractor, and 100GB cap enforcer."""
 
     def __init__(
         self,
@@ -118,6 +260,7 @@ class StorageJanitor:
     ) -> None:
         self.runtime = Path(runtime).resolve()
         self.state_path = self.runtime / "features" / "janitor_state.json"
+        self.override_path = self.runtime / "storage_override.json"
         self.policy_provider = policy_provider
         self.explicit_cold_root = Path(cold_root) if cold_root is not None else None
         self.monitor_log = monitor_log
@@ -172,7 +315,14 @@ class StorageJanitor:
     def _config(self) -> dict[str, Any]:
         pol = self._load_policy()
         raw = pol.get("storage_maintenance")
-        block = raw if isinstance(raw, Mapping) else {}
+        block = dict(raw) if isinstance(raw, Mapping) else {}
+        if self.override_path.is_file():
+            try:
+                ov = json.loads(self.override_path.read_text(encoding="utf-8"))
+                if isinstance(ov, Mapping):
+                    block.update(ov)
+            except Exception:
+                pass
         win_range = (
             block.get("allowed_window_seconds_range")
             or block.get("allowed_window_seconds_Range")
@@ -186,12 +336,22 @@ class StorageJanitor:
             "retain_hot_days": max(1, int(block.get("retain_hot_days", 14))),
             "cold_archive_root": str(block.get("cold_archive_root", "D:/argon4_cold_archive")),
             "max_hot_observations_mb": max(64, int(block.get("max_hot_observations_mb", 15000))),
-            "max_hot_total_gb": max(1.0, float(block.get("max_hot_total_gb", 35.0))),
+            "max_hot_total_gb": max(0.00001, float(block.get("max_hot_total_gb", 35.0))),
             "allowed_window_seconds_range": [float(win_range[0]), float(win_range[1])],
+            "strip_revision_sqlite": bool(block.get("strip_revision_sqlite", False)),
+            "compress_cold_files": bool(block.get("compress_cold_files", False)),
+            "extract_trade_keyframes": bool(block.get("extract_trade_keyframes", True)),
+            "always_prune_aged_observations": bool(block.get("always_prune_aged_observations", False)),
+            "max_cold_total_gb": max(0.0, float(block.get("max_cold_total_gb", 0.0))),
+            "external_order_runtime": str(block.get("external_order_runtime", "")).strip(),
         }
 
     def _resolve_cold_root(self, cfg: Mapping[str, Any]) -> tuple[Path, bool]:
         configured = self.explicit_cold_root if self.explicit_cold_root is not None else Path(cfg["cold_archive_root"])
+        raw_str = str(configured)
+        # Handle Windows drive path configured on POSIX Linux hosts gracefully
+        if os.name != "nt" and len(raw_str) >= 2 and raw_str[1] == ":":
+            return (self.runtime / "cold_archive").resolve(), True
         drive = configured.drive
         if drive:
             drive_root = Path(drive + "/")
@@ -223,6 +383,9 @@ class StorageJanitor:
                     pass
         return round(total / (1024 * 1024), 3)
 
+    def _hot_physical_gb(self) -> float:
+        return round(_physical_dir_size_bytes(self.runtime) / (1024 ** 3), 3)
+
     def should_run(self, now: Any = None, *, elapsed_in_window: float | None = None) -> tuple[bool, str]:
         cfg = self._config()
         if not cfg["enabled"]:
@@ -243,6 +406,15 @@ class StorageJanitor:
                     return True, "HOT_OBSERVATIONS_SIZE_EXCEEDED"
             except Exception:
                 return True, "HOT_OBSERVATIONS_SIZE_EXCEEDED"
+        hot_gb = self._hot_physical_gb()
+        if hot_gb >= cfg["max_hot_total_gb"]:
+            if last_scan_raw is None:
+                return True, "HOT_TOTAL_SIZE_EXCEEDED"
+            try:
+                if now_dt - _utc(last_scan_raw) >= timedelta(hours=1):
+                    return True, "HOT_TOTAL_SIZE_EXCEEDED"
+            except Exception:
+                return True, "HOT_TOTAL_SIZE_EXCEEDED"
         if last_scan_raw is None:
             cutoff_dt = now_dt - timedelta(days=cfg["retain_hot_days"])
             revs_dir = self.runtime / "features" / "revisions"
@@ -264,18 +436,26 @@ class StorageJanitor:
             return True, "BIWEEKLY_INTERVAL_DUE"
         return False, "NOT_DUE"
 
-    def pinned_revisions(self, now: Any = None) -> set[str]:
+    def pinned_revisions(
+        self,
+        now: Any = None,
+        *,
+        cutoff_override_dt: datetime | None = None,
+    ) -> set[str]:
         """Return the set of revision directory names that must never be moved or modified."""
         cfg = self._config()
         now_dt = _utc(now)
-        cutoff_dt = now_dt - timedelta(days=cfg["retain_hot_days"])
+        cutoff_dt = (
+            _utc(cutoff_override_dt)
+            if cutoff_override_dt is not None
+            else (now_dt - timedelta(days=cfg["retain_hot_days"]))
+        )
         revisions_dir = self.runtime / "features" / "revisions"
         pinned: set[str] = set()
         if not revisions_dir.is_dir():
             return pinned
 
         marker_path = revisions_dir / "view_state.json"
-        active_inodes: set[tuple[int, int]] = set()
         if marker_path.is_file():
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
             if marker.get("status") != "COMMITTED":
@@ -293,10 +473,6 @@ class StorageJanitor:
                                 p = Path(backup[key]).resolve()
                                 if p.parent.parent == revisions_dir.resolve():
                                     pinned.add(p.parent.name)
-                                if p.is_file():
-                                    st = p.stat()
-                                    if st.st_ino:
-                                        active_inodes.add((st.st_dev, st.st_ino))
                         for item in backup.get("delta_chain") or []:
                             if isinstance(item, Mapping) and item.get("delta_snapshot_path"):
                                 dp = Path(item["delta_snapshot_path"]).resolve()
@@ -315,13 +491,25 @@ class StorageJanitor:
         return pinned
 
     def _migrate_old_revisions(
-        self, cold_root: Path, cutoff_dt: datetime, pinned: set[str], now_dt: datetime
+        self,
+        cold_root: Path,
+        cutoff_dt: datetime,
+        pinned: set[str],
+        now_dt: datetime,
+        *,
+        strip_sqlite: bool = False,
     ) -> dict[str, Any]:
         revisions_dir = self.runtime / "features" / "revisions"
         migrated = []
         bytes_freed = 0
+        bytes_stripped = 0
         if not revisions_dir.is_dir():
-            return {"migrated_count": 0, "migrated_revisions": [], "bytes_freed": 0}
+            return {
+                "migrated_count": 0,
+                "migrated_revisions": [],
+                "bytes_freed": 0,
+                "bytes_stripped": 0,
+            }
 
         ledger_path = cold_root / "revisions" / "migration_ledger.jsonl"
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
@@ -341,10 +529,18 @@ class StorageJanitor:
 
             source_files = [p for p in sorted(rev_dir.rglob("*")) if p.is_file() and not p.is_symlink()]
             file_digests: dict[str, str] = {}
+            stripped_files: list[str] = []
             rev_bytes = 0
+            rev_stripped_bytes = 0
             for src_file in source_files:
                 self._yield_for_trading_window()
                 rel = src_file.relative_to(rev_dir)
+                fsize = src_file.stat().st_size
+                rev_bytes += fsize
+                if strip_sqlite and _is_redundant_revision_file(rel):
+                    stripped_files.append(rel.as_posix())
+                    rev_stripped_bytes += fsize
+                    continue
                 dst_file = dest_dir / rel
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_file, dst_file)
@@ -353,7 +549,6 @@ class StorageJanitor:
                 if src_sha != dst_sha:
                     raise RuntimeError(f"COLD_ARCHIVE_SHA256_MISMATCH:{rel.as_posix()}")
                 file_digests[rel.as_posix()] = dst_sha
-                rev_bytes += src_file.stat().st_size
 
             manifest_sha = file_digests.get("manifest.json")
             receipt = {
@@ -362,7 +557,10 @@ class StorageJanitor:
                 "revision_created_utc": _iso(rev_ts),
                 "source_path": str(rev_dir),
                 "cold_path": str(dest_dir),
-                "file_count": len(source_files),
+                "file_count": len(file_digests),
+                "stripped_file_count": len(stripped_files),
+                "stripped_files": stripped_files,
+                "stripped_bytes": rev_stripped_bytes,
                 "total_bytes": rev_bytes,
                 "manifest_sha256": manifest_sha,
                 "files_sha256": file_digests,
@@ -375,11 +573,272 @@ class StorageJanitor:
             shutil.rmtree(rev_dir)
             migrated.append(rev_dir.name)
             bytes_freed += rev_bytes
+            bytes_stripped += rev_stripped_bytes
 
         return {
             "migrated_count": len(migrated),
             "migrated_revisions": migrated,
             "bytes_freed": bytes_freed,
+            "bytes_stripped": bytes_stripped,
+        }
+
+    def _backup_sqlite_online(self, src_db: Path, dst_db: Path) -> str:
+        dst_db.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst_db.with_name(f"{dst_db.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with closing(sqlite3.connect(src_db.as_uri() + "?mode=ro", uri=True, timeout=15.0)) as src_con:
+                with closing(sqlite3.connect(tmp)) as dst_con:
+                    src_con.backup(dst_con)
+            sha = _sha256(tmp)
+            os.replace(tmp, dst_db)
+            return sha
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _collect_trade_windows(
+        self, lower_dt: datetime | None, upper_dt: datetime
+    ) -> list[tuple[float, float]]:
+        """Collect [-60s, +300s] epoch intervals around every signal, order, and book look."""
+        acc_db = self.runtime / "account.sqlite3"
+        if not acc_db.is_file():
+            return []
+        raw_stamps: list[str] = []
+        upper_iso = _iso(upper_dt)
+        lower_iso = _iso(lower_dt) if lower_dt is not None else None
+        try:
+            with closing(sqlite3.connect(acc_db.as_uri() + "?mode=ro", uri=True, timeout=10.0)) as con:
+                tables = {
+                    r[0]
+                    for r in con.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                    )
+                }
+                queries = [
+                    ("signals", "created_at"),
+                    ("orders", "fill_at"),
+                    ("resolutions", "resolved_at"),
+                    ("cohort_book_looks", "observed_at"),
+                ]
+                for tbl, col in queries:
+                    if tbl not in tables:
+                        continue
+                    cols = {r[1] for r in con.execute(f'PRAGMA table_info("{tbl}")')}
+                    if col not in cols:
+                        continue
+                    if lower_iso:
+                        sql = (
+                            f'SELECT "{col}" FROM "{tbl}" '
+                            f'WHERE "{col}" IS NOT NULL AND julianday("{col}") >= julianday(?) '
+                            f'AND julianday("{col}") <= julianday(?)'
+                        )
+                        params: tuple[Any, ...] = (lower_iso, upper_iso)
+                    else:
+                        sql = (
+                            f'SELECT "{col}" FROM "{tbl}" '
+                            f'WHERE "{col}" IS NOT NULL AND julianday("{col}") <= julianday(?)'
+                        )
+                        params = (upper_iso,)
+                    for (val,) in con.execute(sql, params):
+                        if val:
+                            raw_stamps.append(str(val))
+        except Exception:
+            return []
+
+        intervals: list[tuple[float, float]] = []
+        for ts_str in raw_stamps:
+            try:
+                ep = _utc(ts_str).timestamp()
+                intervals.append((ep - 60.0, ep + 300.0))
+            except Exception:
+                continue
+        return _merge_intervals(intervals)
+
+    def _archive_permanent_core(
+        self,
+        cold_root: Path,
+        cutoff_dt: datetime,
+        now_dt: datetime,
+        cfg: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Persist core PnL ledgers and [-60s, +300s] trade/signal keyframes permanently."""
+        perm_root = cold_root / "permanent_core"
+        ledgers_dir = perm_root / "ledgers"
+        keyframes_dir = perm_root / "trade_keyframes"
+        ledgers_dir.mkdir(parents=True, exist_ok=True)
+        keyframes_dir.mkdir(parents=True, exist_ok=True)
+
+        backed_up_ledgers: list[str] = []
+        acc_src = self.runtime / "account.sqlite3"
+        if acc_src.is_file():
+            self._yield_for_trading_window()
+            latest_dst = ledgers_dir / "account_latest.sqlite3"
+            acc_sha = self._backup_sqlite_online(acc_src, latest_dst)
+            _atomic_json(
+                latest_dst.with_suffix(".manifest.json"),
+                {
+                    "backed_up_at_utc": _iso(now_dt),
+                    "source_db": str(acc_src),
+                    "sha256": acc_sha,
+                    "bytes": latest_dst.stat().st_size,
+                },
+            )
+            backed_up_ledgers.append(str(latest_dst))
+
+        ext_order_str = cfg.get("external_order_runtime") or ""
+        if ext_order_str:
+            ext_dir = Path(ext_order_str)
+            if ext_dir.is_dir():
+                live_dst_dir = perm_root / "live_order_ledgers"
+                live_dst_dir.mkdir(parents=True, exist_ok=True)
+                for item in sorted(ext_dir.rglob("*")):
+                    if not item.is_file() or item.is_symlink():
+                        continue
+                    if _is_sensitive_filename(item.name):
+                        continue
+                    if item.suffix.lower() not in (".sqlite3", ".db", ".jsonl", ".csv"):
+                        continue
+                    self._yield_for_trading_window()
+                    rel = item.relative_to(ext_dir)
+                    if any(_is_sensitive_filename(part) for part in rel.parts):
+                        continue
+                    dst_item = live_dst_dir / rel
+                    dst_item.parent.mkdir(parents=True, exist_ok=True)
+                    if item.suffix.lower() in (".sqlite3", ".db"):
+                        self._backup_sqlite_online(item, dst_item)
+                    else:
+                        tmp_cp = dst_item.with_name(f"{dst_item.name}.{os.getpid()}.tmp")
+                        shutil.copy2(item, tmp_cp)
+                        os.replace(tmp_cp, dst_item)
+                    backed_up_ledgers.append(str(dst_item))
+
+        if not cfg.get("extract_trade_keyframes", True):
+            return {"ledgers_backed_up": backed_up_ledgers, "keyframes_extracted": 0}
+
+        cursor_path = keyframes_dir / "cursor.json"
+        lower_dt: datetime | None = None
+        if cursor_path.is_file():
+            try:
+                cur_data = json.loads(cursor_path.read_text(encoding="utf-8"))
+                if cur_data.get("last_cutoff_utc"):
+                    lower_dt = _utc(cur_data["last_cutoff_utc"])
+            except Exception:
+                lower_dt = None
+
+        if lower_dt is not None and cutoff_dt <= lower_dt:
+            return {"ledgers_backed_up": backed_up_ledgers, "keyframes_extracted": 0}
+
+        trade_windows = self._collect_trade_windows(lower_dt, cutoff_dt)
+        cutoff_iso = _iso(cutoff_dt)
+        lower_iso = _iso(lower_dt) if lower_dt is not None else None
+
+        records: list[dict[str, Any]] = []
+        obs_db = self.runtime / "observations.sqlite3"
+        if obs_db.is_file():
+            try:
+                with closing(sqlite3.connect(obs_db.as_uri() + "?mode=ro", uri=True, timeout=10.0)) as con:
+                    has_snaps = con.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='snapshots'"
+                    ).fetchone()
+                    if has_snaps:
+                        placeholders = ",".join("?" for _ in _KEYFRAME_SNAPSHOT_KINDS)
+                        if lower_iso:
+                            sql = (
+                                f"SELECT id, kind, saved_at, payload FROM snapshots "
+                                f"WHERE julianday(saved_at) >= julianday(?) AND julianday(saved_at) < julianday(?) "
+                                f"AND kind IN ({placeholders}) ORDER BY id"
+                            )
+                            params: tuple[Any, ...] = (lower_iso, cutoff_iso, *_KEYFRAME_SNAPSHOT_KINDS)
+                        else:
+                            sql = (
+                                f"SELECT id, kind, saved_at, payload FROM snapshots "
+                                f"WHERE julianday(saved_at) < julianday(?) "
+                                f"AND kind IN ({placeholders}) ORDER BY id"
+                            )
+                            params = (cutoff_iso, *_KEYFRAME_SNAPSHOT_KINDS)
+                        for row_id, kind, saved_at, payload in con.execute(sql, params):
+                            records.append(
+                                {
+                                    "source": "observations.snapshots",
+                                    "id": row_id,
+                                    "kind": kind,
+                                    "ts": saved_at,
+                                    "payload": payload,
+                                }
+                            )
+            except Exception:
+                pass
+
+        tel_db = self.runtime / "book_telemetry.sqlite3"
+        if tel_db.is_file() and trade_windows:
+            try:
+                with closing(sqlite3.connect(tel_db.as_uri() + "?mode=ro", uri=True, timeout=10.0)) as con:
+                    tables = {
+                        r[0]
+                        for r in con.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                        )
+                    }
+                    for tbl, ts_col in (("decision_links", "observed_at"), ("samples", "target_at")):
+                        if tbl not in tables:
+                            continue
+                        cols = [r[1] for r in con.execute(f'PRAGMA table_info("{tbl}")')]
+                        if ts_col not in cols:
+                            continue
+                        if lower_iso:
+                            q = (
+                                f'SELECT * FROM "{tbl}" '
+                                f'WHERE julianday("{ts_col}") >= julianday(?) AND julianday("{ts_col}") < julianday(?)'
+                            )
+                            q_params: tuple[Any, ...] = (lower_iso, cutoff_iso)
+                        else:
+                            q = f'SELECT * FROM "{tbl}" WHERE julianday("{ts_col}") < julianday(?)'
+                            q_params = (cutoff_iso,)
+                        ts_idx = cols.index(ts_col)
+                        for row in con.execute(q, q_params):
+                            try:
+                                ep = _utc(row[ts_idx]).timestamp()
+                            except Exception:
+                                continue
+                            if tbl == "decision_links" or _in_intervals(ep, trade_windows):
+                                records.append(
+                                    {
+                                        "source": f"book_telemetry.{tbl}",
+                                        "ts": row[ts_idx],
+                                        "row": dict(zip(cols, row)),
+                                    }
+                                )
+            except Exception:
+                pass
+
+        keyframe_file_str: str | None = None
+        if records:
+            self._yield_for_trading_window()
+            stamp = now_dt.strftime("%Y%m%d_%H%M%S")
+            raw_kf = keyframes_dir / f"trade_keyframes_{stamp}.jsonl"
+            with raw_kf.open("wb") as fh:
+                for rec in records:
+                    fh.write((json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+            comp_kf, comp_sha, codec = _compress_cold_artifact(raw_kf)
+            _atomic_json(
+                Path(str(comp_kf) + ".manifest.json"),
+                {
+                    "created_at_utc": _iso(now_dt),
+                    "lower_cutoff_utc": lower_iso,
+                    "upper_cutoff_utc": cutoff_iso,
+                    "record_count": len(records),
+                    "trade_window_count": len(trade_windows),
+                    "codec": codec,
+                    "sha256": comp_sha,
+                    "file": comp_kf.name,
+                },
+            )
+            keyframe_file_str = str(comp_kf)
+
+        _atomic_json(cursor_path, {"last_cutoff_utc": cutoff_iso, "updated_at_utc": _iso(now_dt)})
+        return {
+            "ledgers_backed_up": backed_up_ledgers,
+            "keyframes_extracted": len(records),
+            "keyframe_archive": keyframe_file_str,
         }
 
     def _refresh_active_revision_observations_baseline(self) -> bool:
@@ -481,6 +940,7 @@ class StorageJanitor:
         archive_prefix: str,
         table_time_cols: Mapping[str, str],
         prune_hot_rows: bool = True,
+        compress: bool = False,
     ) -> dict[str, Any]:
         if not db_path.is_file():
             return {"status": "ABSENT", "exported_rows": 0, "bytes_before": 0, "bytes_after": 0}
@@ -557,16 +1017,29 @@ class StorageJanitor:
                 except sqlite3.Error:
                     pass
 
-        cold_sha = _sha256(cold_db_path)
-        manifest_path = cold_db_path.with_suffix(".manifest.json")
+        raw_cold_sha = _sha256(cold_db_path)
+        final_cold_path = cold_db_path
+        final_cold_sha = raw_cold_sha
+        compression_codec = "none"
+        if compress:
+            self._yield_for_trading_window()
+            final_cold_path, final_cold_sha, compression_codec = _compress_cold_artifact(cold_db_path)
+
+        manifest_path = (
+            cold_db_path.with_suffix(".manifest.json")
+            if not compress
+            else Path(str(final_cold_path) + ".manifest.json")
+        )
         _atomic_json(
             manifest_path,
             {
                 "archived_at_utc": _iso(now_dt),
                 "cutoff_utc": cutoff_iso,
                 "source_db": str(db_path),
-                "cold_archive_db": str(cold_db_path),
-                "sha256": cold_sha,
+                "cold_archive_db": str(final_cold_path),
+                "sha256": final_cold_sha,
+                "uncompressed_sha256": raw_cold_sha,
+                "compression": compression_codec,
                 "exported_counts": exported_counts,
                 "total_exported_rows": total_exported,
                 "hot_rows_pruned": bool(prune_hot_rows),
@@ -599,8 +1072,9 @@ class StorageJanitor:
         )
         return {
             "status": "ARCHIVED_AND_VACUUMED" if prune_hot_rows else "ARCHIVED_COLD_ONLY_HOT_PRESERVED",
-            "cold_archive_db": str(cold_db_path),
-            "cold_sha256": cold_sha,
+            "cold_archive_db": str(final_cold_path),
+            "cold_sha256": final_cold_sha,
+            "compression": compression_codec,
             "exported_counts": exported_counts,
             "exported_rows": total_exported,
             "hot_rows_pruned": bool(prune_hot_rows),
@@ -609,7 +1083,9 @@ class StorageJanitor:
             "bytes_after": bytes_after,
         }
 
-    def _rotate_audit_logs(self, cold_root: Path, cutoff_dt: datetime, now_dt: datetime) -> dict[str, Any]:
+    def _rotate_audit_logs(
+        self, cold_root: Path, cutoff_dt: datetime, now_dt: datetime, *, compress: bool = False
+    ) -> dict[str, Any]:
         logs_dir = self.runtime / "logs"
         if not logs_dir.is_dir():
             return {"archived_lines": 0, "cold_files": []}
@@ -639,15 +1115,24 @@ class StorageJanitor:
                 cold_jsonl = cold_logs_dir / f"monitor_audit_{stamp_token}.jsonl"
                 payload = ("\n".join(old_lines) + "\n").encode("utf-8")
                 cold_jsonl.write_bytes(payload)
-                cold_sha = _sha256(cold_jsonl)
+                raw_sha = _sha256(cold_jsonl)
+                final_jsonl, final_sha = cold_jsonl, raw_sha
+                if compress:
+                    final_jsonl, final_sha, _ = _compress_cold_artifact(cold_jsonl)
+                manifest_target = (
+                    cold_jsonl.with_suffix(".manifest.json")
+                    if not compress
+                    else Path(str(final_jsonl) + ".manifest.json")
+                )
                 _atomic_json(
-                    cold_jsonl.with_suffix(".manifest.json"),
+                    manifest_target,
                     {
                         "archived_at_utc": _iso(now_dt),
                         "cutoff_utc": _iso(cutoff_dt),
                         "source_log": str(jsonl_path),
-                        "cold_log": str(cold_jsonl),
-                        "sha256": cold_sha,
+                        "cold_log": str(final_jsonl),
+                        "sha256": final_sha,
+                        "uncompressed_sha256": raw_sha,
                         "line_count": len(old_lines),
                     },
                 )
@@ -655,7 +1140,7 @@ class StorageJanitor:
                 tmp_hot.write_bytes(("\n".join(hot_lines) + ("\n" if hot_lines else "")).encode("utf-8"))
                 os.replace(tmp_hot, jsonl_path)
                 archived_total += len(old_lines)
-                cold_files.append(str(cold_jsonl))
+                cold_files.append(str(final_jsonl))
 
         text_log_path = logs_dir / "monitor_audit.log"
         if text_log_path.is_file():
@@ -674,15 +1159,24 @@ class StorageJanitor:
             if old_lines:
                 cold_log = cold_logs_dir / f"monitor_audit_{stamp_token}.log"
                 cold_log.write_bytes(("\n".join(old_lines) + "\n").encode("utf-8"))
-                cold_sha = _sha256(cold_log)
+                raw_sha = _sha256(cold_log)
+                final_log, final_sha = cold_log, raw_sha
+                if compress:
+                    final_log, final_sha, _ = _compress_cold_artifact(cold_log)
+                manifest_target = (
+                    cold_log.with_suffix(".manifest.json")
+                    if not compress
+                    else Path(str(final_log) + ".manifest.json")
+                )
                 _atomic_json(
-                    cold_log.with_suffix(".manifest.json"),
+                    manifest_target,
                     {
                         "archived_at_utc": _iso(now_dt),
                         "cutoff_utc": _iso(cutoff_dt),
                         "source_log": str(text_log_path),
-                        "cold_log": str(cold_log),
-                        "sha256": cold_sha,
+                        "cold_log": str(final_log),
+                        "sha256": final_sha,
+                        "uncompressed_sha256": raw_sha,
                         "line_count": len(old_lines),
                     },
                 )
@@ -690,9 +1184,95 @@ class StorageJanitor:
                 tmp_hot.write_bytes(("\n".join(hot_lines) + ("\n" if hot_lines else "")).encode("utf-8"))
                 os.replace(tmp_hot, text_log_path)
                 archived_total += len(old_lines)
-                cold_files.append(str(cold_log))
+                cold_files.append(str(final_log))
 
         return {"archived_lines": archived_total, "cold_files": cold_files}
+
+    def _enforce_cold_cap(
+        self, cold_root: Path, max_cold_total_gb: float, now_dt: datetime
+    ) -> dict[str, Any]:
+        """Enforce hard storage ceiling by FIFO-pruning Tier-2 rolling raw slices; never touches permanent_core/."""
+        if max_cold_total_gb <= 0.0 or not cold_root.exists():
+            return {"enforced": False, "pruned_files": 0, "bytes_freed": 0}
+        limit_bytes = int(max_cold_total_gb * (1024 ** 3))
+        current_bytes = _physical_dir_size_bytes(cold_root)
+        if current_bytes <= limit_bytes:
+            return {
+                "enforced": True,
+                "pruned_files": 0,
+                "bytes_freed": 0,
+                "bytes_after": current_bytes,
+                "limit_bytes": limit_bytes,
+            }
+
+        candidates: list[tuple[float, str, Path]] = []
+        for sub_name in ("sqlite", "logs"):
+            sub_dir = cold_root / sub_name
+            if not sub_dir.is_dir():
+                continue
+            for p in sub_dir.rglob("*"):
+                if not p.is_file() or p.is_symlink():
+                    continue
+                if p.name in ("migration_ledger.jsonl", "cap_enforcement_ledger.jsonl"):
+                    continue
+                if p.name.endswith(".manifest.json"):
+                    continue
+                try:
+                    st = p.stat()
+                    candidates.append((st.st_mtime, p.name, p))
+                except OSError:
+                    continue
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        pruned: list[str] = []
+        bytes_freed = 0
+        for _mtime, _name, target in candidates:
+            if current_bytes <= limit_bytes:
+                break
+            self._yield_for_trading_window()
+            try:
+                sz = target.stat().st_size
+                target.unlink(missing_ok=True)
+                current_bytes -= sz
+                bytes_freed += sz
+                pruned.append(str(target.relative_to(cold_root).as_posix()))
+                for companion in (
+                    Path(str(target) + ".manifest.json"),
+                    target.with_suffix(".manifest.json"),
+                ):
+                    if companion.is_file():
+                        csz = companion.stat().st_size
+                        companion.unlink(missing_ok=True)
+                        current_bytes -= csz
+                        bytes_freed += csz
+            except OSError:
+                continue
+
+        if pruned:
+            cap_ledger = cold_root / "cap_enforcement_ledger.jsonl"
+            with cap_ledger.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "enforced_at_utc": _iso(now_dt),
+                            "max_cold_total_gb": max_cold_total_gb,
+                            "pruned_count": len(pruned),
+                            "bytes_freed": bytes_freed,
+                            "pruned_files": pruned,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+
+        return {
+            "enforced": True,
+            "pruned_files": len(pruned),
+            "bytes_freed": bytes_freed,
+            "bytes_after": _physical_dir_size_bytes(cold_root),
+            "limit_bytes": limit_bytes,
+        }
 
     def run_maintenance(
         self,
@@ -700,21 +1280,41 @@ class StorageJanitor:
         *,
         prune_hot_observations: bool = True,
     ) -> dict[str, Any]:
-        """Execute a full bi-weekly cold-archive and hot-compaction pass."""
+        """Execute a cold-archive, permanent-keyframe extraction, and hot-compaction pass."""
         if not self._lock.acquire(blocking=False):
             return {"status": "SKIPPED", "reason": "JANITOR_ALREADY_RUNNING"}
         try:
             cfg = self._config()
             now_dt = _utc(now)
             cutoff_dt = now_dt - timedelta(days=cfg["retain_hot_days"])
+            hot_gb_before = self._hot_physical_gb()
+            # When physical disk exceeds max_hot_total_gb, compact unpinned revisions older than 6h immediately
+            rev_cutoff_dt = (
+                max(cutoff_dt, now_dt - timedelta(hours=6))
+                if hot_gb_before >= cfg["max_hot_total_gb"]
+                else cutoff_dt
+            )
             cold_root, fallback_used = self._resolve_cold_root(cfg)
             cold_root.mkdir(parents=True, exist_ok=True)
 
             # Verify active revision integrity before any maintenance
             view_before = revisions.ensure_view_committed(self.runtime)
-            pinned = self.pinned_revisions(now=now_dt)
+            pinned = self.pinned_revisions(now=now_dt, cutoff_override_dt=rev_cutoff_dt)
 
-            rev_result = self._migrate_old_revisions(cold_root, cutoff_dt, pinned, now_dt)
+            # Step 1: Extract permanent core ledgers & [-60s, +300s] trade keyframes BEFORE pruning hot SQLite
+            perm_result = self._archive_permanent_core(cold_root, cutoff_dt, now_dt, cfg)
+
+            # Step 2: Migrate aged unpinned revisions (stripping multi-GB redundant SQLite copies if configured)
+            rev_result = self._migrate_old_revisions(
+                cold_root,
+                rev_cutoff_dt,
+                pinned,
+                now_dt,
+                strip_sqlite=bool(cfg["strip_revision_sqlite"]),
+            )
+
+            # Step 3: Rotate & optionally compress aged SQLite rows
+            compress_flag = bool(cfg["compress_cold_files"])
             obs_result = self._rotate_one_sqlite(
                 self.runtime / "observations.sqlite3",
                 cold_root,
@@ -723,6 +1323,7 @@ class StorageJanitor:
                 archive_prefix="observations_archive",
                 table_time_cols={"snapshots": "saved_at", "receipts": "received_at"},
                 prune_hot_rows=bool(prune_hot_observations),
+                compress=compress_flag,
             )
             tel_result = self._rotate_one_sqlite(
                 self.runtime / "book_telemetry.sqlite3",
@@ -732,9 +1333,15 @@ class StorageJanitor:
                 archive_prefix="book_telemetry_archive",
                 table_time_cols={"samples": "target_at", "decision_links": "observed_at"},
                 prune_hot_rows=True,
+                compress=compress_flag,
             )
             self._yield_for_trading_window()
-            log_result = self._rotate_audit_logs(cold_root, cutoff_dt, now_dt)
+            log_result = self._rotate_audit_logs(
+                cold_root, cutoff_dt, now_dt, compress=compress_flag
+            )
+
+            # Step 4: Enforce hard cold-storage cap (e.g. 88GB/100GB) on Tier-2 rolling raw archives
+            cap_result = self._enforce_cold_cap(cold_root, float(cfg["max_cold_total_gb"]), now_dt)
 
             # Re-verify active revision integrity after maintenance
             view_after = revisions.ensure_view_committed(self.runtime)
@@ -749,11 +1356,15 @@ class StorageJanitor:
                 "next_scan_due_utc": _iso(next_due_dt),
                 "cold_archive_root": str(cold_root),
                 "fallback_used": fallback_used,
+                "hot_physical_gb_before": hot_gb_before,
+                "hot_physical_gb_after": self._hot_physical_gb(),
                 "pinned_revisions": sorted(pinned),
+                "permanent_core": perm_result,
                 "revisions": rev_result,
                 "observations_sqlite": obs_result,
                 "book_telemetry_sqlite": tel_result,
                 "logs": log_result,
+                "cold_cap": cap_result,
                 "active_view_status": view_after.get("status"),
             }
             state = self._load_state()
@@ -763,6 +1374,7 @@ class StorageJanitor:
                     "ran_at_utc": summary["ran_at_utc"],
                     "migrated_revisions": rev_result["migrated_count"],
                     "exported_observation_rows": obs_result.get("exported_rows", 0),
+                    "keyframes_extracted": perm_result.get("keyframes_extracted", 0),
                     "archived_log_lines": log_result.get("archived_lines", 0),
                 }
             )
@@ -779,7 +1391,8 @@ class StorageJanitor:
                     self.monitor_log.record(
                         "INFO",
                         "STORAGE_JANITOR_COMPLETED",
-                        f"双周冷备清理完成: 迁出旧修订={rev_result['migrated_count']}个, "
+                        f"冷备与瘦身完成: 迁出旧修订={rev_result['migrated_count']}个, "
+                        f"关键交易切片={perm_result.get('keyframes_extracted', 0)}条, "
                         f"导出观测行={obs_result.get('exported_rows', 0)}, 归档日志行={log_result.get('archived_lines', 0)}",
                         cold_archive_root=str(cold_root),
                         fallback_used=fallback_used,
@@ -822,8 +1435,12 @@ class StorageJanitor:
                     return {"status": "DEFERRED_INPUTS_BUSY"}
             cfg = self._config()
             obs_mb = self._observations_size_mb()
-            # Guarantee C: keep observations.sqlite3 hardlink prefix intact unless >= 15 GB
-            prune_hot_obs = obs_mb >= cfg["max_hot_observations_mb"]
+            hot_gb = self._hot_physical_gb()
+            prune_hot_obs = (
+                obs_mb >= cfg["max_hot_observations_mb"]
+                or hot_gb >= cfg["max_hot_total_gb"]
+                or bool(cfg.get("always_prune_aged_observations", False))
+            )
             worker = threading.Thread(
                 target=self._async_worker_main,
                 kwargs={"now": now, "prune_hot_observations": prune_hot_obs},
@@ -864,7 +1481,9 @@ class StorageJanitor:
             hot_free_gb = round(shutil.disk_usage(self.runtime).free / (1024 ** 3), 2)
         except OSError:
             hot_free_gb = None
-        cold_total_mb = round(_dir_size_bytes(cold_root) / (1024 * 1024), 3) if cold_root.exists() else 0.0
+        cold_total_mb = (
+            round(_physical_dir_size_bytes(cold_root) / (1024 * 1024), 3) if cold_root.exists() else 0.0
+        )
         due, due_reason = self.should_run(now=now_dt)
         worker_alive = bool(self._worker_thread is not None and self._worker_thread.is_alive())
         return {
@@ -875,9 +1494,11 @@ class StorageJanitor:
             "effective_cold_archive_root": str(cold_root),
             "fallback_used": fallback_used,
             "hot_free_gb": hot_free_gb,
+            "hot_physical_gb": self._hot_physical_gb(),
             "observations_sqlite_mb": self._observations_size_mb(),
             "max_hot_observations_mb": cfg["max_hot_observations_mb"],
             "max_hot_total_gb": cfg["max_hot_total_gb"],
+            "max_cold_total_gb": cfg["max_cold_total_gb"],
             "cold_archive_total_mb": cold_total_mb,
             "last_scan_utc": last_scan_utc,
             "next_scan_due_utc": next_due_utc,
@@ -889,9 +1510,9 @@ class StorageJanitor:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="ARGON-4 bi-weekly cold storage janitor")
+    parser = argparse.ArgumentParser(description="ARGON-4 tiered cold storage janitor")
     parser.add_argument("--runtime", required=True, help="Path to active runtime directory")
-    parser.add_argument("--cold-root", default=None, help="Optional cold archive root directory (e.g. D:/argon4_cold_archive)")
+    parser.add_argument("--cold-root", default=None, help="Optional cold archive root directory")
     args = parser.parse_args(argv)
     janitor = StorageJanitor(args.runtime, cold_root=args.cold_root)
     result = janitor.run_maintenance()

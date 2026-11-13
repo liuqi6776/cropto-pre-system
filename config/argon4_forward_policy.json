@@ -154,13 +154,23 @@
   },
   "ranking_model_scope": "LOCAL_SELF_TRAINED_OOS",
   "deployment_manifest_sha256": {
-    "BTC_15m": "a1013d7188d879d13331b767fdd88c755cace3c245fc20acd9a45ed38c1f383b",
-    "BTC_5m": "892796c9236a7f82531bd2764250d5455474642182494e2de533334d52aebe71",
-    "ETH_15m": "72dcaa30b92f00665a2af29d69fea9a753f11ec45aecb55fb530f008e2e3c922",
-    "ETH_5m": "045c1df0747e445b6b4357e57ee919e516db8484eb55284feb59569fffb23239",
-    "SOL_15m": "e3763beb9ba1e63b95dbe501b3cc265e1f005069289875af73f4b7e2e531242c",
-    "SOL_5m": "d024c28dbb773a6470b132cbc1ebd152ebdb706d0db8ee3047487493b3f4f822",
-    "BNB_15m": "366484e02b2552e3acd095310b381d216b6f2016a39bd2fe001b1aad3660118f"
+    "BTC_15m": "4f9b2c5ce4545c7f43bd04986dad1027389a9684cabb438a3bfe66a357ffcf37",
+    "BTC_5m": "a2847aa17ea3cf0c130877b0151aa6c86a2bb079c643724f1edcea8d7dce98fc",
+    "ETH_15m": "3a92c890f6a1d591defd7388e911ab6ccaeedc31b2b7abf7e41eba7491b0d393",
+    "ETH_5m": "e010b4bf15958f02c74902e9d0d8b7d0372d55b2cdfa52007dc887d5856e20ae",
+    "SOL_15m": "cc09e1d7a45fd35674b4420f3daf31ffbf28be477648a36385d8d3be5dfe63c0",
+    "SOL_5m": "f74b7cd26997ea4912bd9640f98ec2b07bbfb7cab1e9a93ae60d330101fb0f60",
+    "BNB_15m": "fe0a9d9309222ab86ed3f6a94c7c20a58d7cff29b43a728b3b8d37b8595a12b6"
+  },
+  "deployment_model_target_oracle": "S4_SPOT_TWAP60_BLEND_HL270D_BIMONTHLY_20261113",
+  "previous_deployment_manifest_sha256": {
+    "BTC_15m": "2e40d0fb86d9f45a2710e53d5ef99b3a77c1636385a2f1209d5d3b925ee00ff5",
+    "BTC_5m": "b9518a9addd766e3e3b57ecfab89a87bc90080157e55e25acf8eb7e5538085bb",
+    "ETH_15m": "19ed37c8f4844380c33550acf63151efc69bd4dbba5762f65587b921f282091b",
+    "ETH_5m": "71fd662b882312d7221211ef4209a0919dae1ac0b9e3c1d742a367dc13b04b1e",
+    "SOL_15m": "499cd6651f7f938262ddab781c4a0ebebc031fca1a7fca184147bfc0c30c2109",
+    "SOL_5m": "4e1bae288125d21a220d853b9122c0b3062ebd04f11c9b207368ad03c7290379",
+    "BNB_15m": "90f90df773353bf4d7f1bc196f617847a1d358f157dd1e6a42f988c6fdcc085e"
   },
   "min_decision_delay_seconds": 3.8,
   "input_revision_policy": {
@@ -174,7 +184,7 @@
     "mark_registry_publication_required": true,
     "skip_effective_cohort": true,
     "aged_futures_fastpath": {
-      "profile": "argon4-aged-revision-v13",
+      "profile": "argon4-aged-revision-v14",
       "enabled": true,
       "minimum_bar_age_seconds": 300,
       "minimum_receipt_spacing_seconds": 2.0,
@@ -257,17 +267,18 @@
       }
     ]
   },
-  "input_http_min_spacing_seconds": 0.25,
+  "min_decision_delay_seconds": 1.8,
+  "input_http_min_spacing_seconds": 0.05,
   "engineering": {
     "enabled": true,
     "profile": "argon4-latency-v12",
-    "window_poll_interval_seconds": 0.25,
-    "minimum_decision_delay_seconds": 3.8,
+    "window_poll_interval_seconds": 0.1,
+    "minimum_decision_delay_seconds": 1.8,
     "input_deadline_after_boundary_seconds": 16.5,
-    "input_ready_retry_interval_seconds": 0.35,
+    "input_ready_retry_interval_seconds": 0.15,
     "auxiliary_prefetch": true,
-    "prefetch_lead_seconds": 25.0,
-    "prefetch_budget_seconds": 8.0,
+    "prefetch_lead_seconds": 9.5,
+    "prefetch_budget_seconds": 6.5,
     "feature_snapshot_cache": true,
     "book_telemetry": true,
     "telemetry_sampling_profile": "clock_center_v12"
@@ -404,6 +415,13 @@
       "counter_15m_marginal_delta_z": 0.12,
       "counter_15m_marginal_max_buy_price": 0.475,
       "counter_15m_marginal_action": "CAP_OR_SKIP"
+    },
+    "twap60_handicap_guard": {
+      "enabled": true,
+      "max_5m_handicap_bps": 1.0,
+      "max_15m_handicap_bps": 2.0,
+      "timeout_seconds": 1.2,
+      "on_unavailable": "PASS_WITH_WARNING"
     },
     "action": "SKIP_OR_HALF_STAKE"
   },

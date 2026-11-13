@@ -1509,7 +1509,7 @@ def test_live_http_pacing_is_explicit_and_replacement_closes_old_client(harness,
     assert h.account.overview()["order_count"] == initial_orders
 
 
-@pytest.mark.parametrize("spacing", [True, 0, .249, 1.001, float("nan"), float("inf"), "0.25"])
+@pytest.mark.parametrize("spacing", [True, 0, .049, 1.001, float("nan"), float("inf"), "0.25"])
 def test_unsafe_live_http_pacing_is_rejected_without_input_or_orders(harness, spacing):
     h = harness
     h.policy["input_http_min_spacing_seconds"] = spacing

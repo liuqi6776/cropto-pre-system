@@ -1,10 +1,168 @@
 "use strict";
 const $=id=>document.getElementById(id);
-const money=v=>v===null||v===undefined?"待估值":new Intl.NumberFormat("en-US",{style:"currency",currency:"USD"}).format(v);
-const signedMoney=v=>v===null||v===undefined?"待结算":(Number(v)>0?"+":"")+money(Number(v));
+const money=v=>v===null||v===undefined||Number.isNaN(Number(v))?"待估值":new Intl.NumberFormat("en-US",{style:"currency",currency:"USD"}).format(Number(v));
+const signedMoney=v=>v===null||v===undefined||Number.isNaN(Number(v))?"待结算":(Number(v)>0?"+":"")+money(Number(v));
 const when=v=>v?new Date(v).toLocaleString("zh-CN",{hour12:false}):"尚无观测";
 function elem(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=String(text);if(cls)n.className=cls;return n;}
 function cell(row,text,cls){row.appendChild(elem("td",text,cls));}
+
+function initTabs(){
+ const btnLive=$("tab-btn-live"),btnMon=$("tab-btn-monitor");
+ const panLive=$("tab-panel-live"),panMon=$("tab-panel-monitor");
+ if(!btnLive||!btnMon||!panLive||!panMon)return;
+ const activate=tab=>{
+  const isLive=tab==="live";
+  btnLive.classList.toggle("active",isLive);
+  btnLive.setAttribute("aria-selected",String(isLive));
+  btnMon.classList.toggle("active",!isLive);
+  btnMon.setAttribute("aria-selected",String(!isLive));
+  panLive.hidden=!isLive;
+  panMon.hidden=isLive;
+ };
+ btnLive.addEventListener("click",()=>activate("live"));
+ btnMon.addEventListener("click",()=>activate("monitor"));
+}
+
+function renderLive(d){
+ if(!d||!$("tab-panel-live"))return;
+ const sum=d.summary||{};
+ const q=(d.latest_quota||{}).live_wallet_and_quotas||{};
+ const pm=(d.latest_quota||{}).paper_account_mirror||{};
+ const svc=d.service||{};
+ const caps=d.scaled_live_caps||{};
+ const pcaps=d.paper_policy_caps||{};
+ const running=Boolean(d.process_running);
+ const pnl=Number(sum.realized_pnl_usdc||0);
+ const wins=Number(sum.wins||0),losses=Number(sum.losses||0);
+ const filled=Number(sum.filled_orders||0),totalSig=Number(sum.total_signals||0);
+
+ if($("tab-badge-live")){
+  $("tab-badge-live").textContent=running?("运行中 · "+signedMoney(pnl)):"已停止 · "+signedMoney(pnl);
+  $("tab-badge-live").className="tab-pill "+(running?"ok":"offline");
+ }
+ if($("live-banner")){
+  $("live-banner").className=running?"banner ok":"banner offline";
+  $("live-banner").textContent=running
+   ?("外部实盘执行器运行中 (PID "+svc.pid+") · 模式 "+(d.active_mode||"live").toUpperCase()+" · 缩放 "+(Number(d.live_scale_factor||1)*100).toFixed(0)+"% · 实盘已结算 "+wins+" 胜 "+losses+" 负 · 净收益 "+signedMoney(pnl))
+   :("外部实盘执行器未运行 · 历史已结算 "+wins+" 胜 "+losses+" 负 · 累计净收益 "+signedMoney(pnl));
+ }
+ if($("live-free-usdc"))$("live-free-usdc").textContent=q.onchain_free_usdc_balance!==undefined?money(q.onchain_free_usdc_balance):"—";
+ if($("live-allowance-note"))$("live-allowance-note").textContent=q.clob_allowance_usdc>1e6?"CLOB 授权充足 · 提现硬锁已开启":"等待读取钱包快照";
+ if($("live-open-risk"))$("live-open-risk").textContent=q.total_locked_open_risk_usdc!==undefined?money(q.total_locked_open_risk_usdc):"$0.00";
+ if($("live-remaining-quota"))$("live-remaining-quota").textContent="剩余总风险额度 "+money(q.remaining_total_open_risk_quota_usd)+" · 窗口剩余 "+money(q.remaining_cohort_budget_quota_usd);
+ if($("live-pnl")){
+  $("live-pnl").textContent=signedMoney(pnl);
+  $("live-pnl").className=pnl>0?"pnl-pos":(pnl<0?"pnl-neg":"");
+ }
+ if($("live-winrate")){
+  $("live-winrate").textContent="已结算 "+wins+" 胜 / "+losses+" 负"+(sum.win_rate_pct!==null&&sum.win_rate_pct!==undefined?"（胜率 "+Number(sum.win_rate_pct).toFixed(2)+"%）":"")+" · 已赎回 "+money(sum.redeemed_usdc_total||0);
+ }
+ if($("live-fills-count"))$("live-fills-count").textContent=filled+" 笔成交 / "+totalSig+" 信号";
+ if($("live-latency-note"))$("live-latency-note").textContent="累计实付 "+money(sum.total_spent_usdc||0)+(sum.avg_clob_rtt_ms?" · CLOB 往返 "+Number(sum.avg_clob_rtt_ms).toFixed(0)+"ms":"")+(sum.avg_slippage_bps!==null&&sum.avg_slippage_bps!==undefined?" · 均价滑点 "+Number(sum.avg_slippage_bps).toFixed(1)+" bps":"");
+
+ if($("live-quota-time"))$("live-quota-time").textContent=when((d.latest_quota||{}).timestamp_utc);
+ if($("live-lock-active"))$("live-lock-active").textContent=money(q.active_window_locked_usdc||0);
+ if($("live-lock-expired"))$("live-lock-expired").textContent=money(q.expired_awaiting_resolution_usdc||0);
+ if($("live-lock-unredeemed"))$("live-lock-unredeemed").textContent=money(q.resolved_unredeemed_winning_usdc||0);
+ if($("live-lock-inflight"))$("live-lock-inflight").textContent=money(q.in_flight_reserved_usdc||0);
+ if($("live-rem-cohort"))$("live-rem-cohort").textContent=money(q.remaining_cohort_budget_quota_usd||0);
+ if($("live-scaled-caps"))$("live-scaled-caps").textContent="单笔 "+money(caps.max_order_usd)+" / 窗口 "+money(caps.max_tick_budget_usd)+" / 总敞口 "+money(caps.max_open_risk_usd)+"（模拟基准 "+money(pcaps.max_order_usd)+" / "+money(pcaps.max_tick_budget_usd)+"）";
+
+ const uqBody=$("live-underlying-quotas");
+ if(uqBody){
+  uqBody.replaceChildren();
+  const remMap=q.remaining_underlying_quota_usd||{};
+  for(const [coin,rem] of Object.entries(remMap)){
+   const r=elem("tr");
+   cell(r,coin);
+   cell(r,money(caps.max_underlying_open_risk_usd||450));
+   cell(r,money(rem));
+   uqBody.append(r);
+  }
+ }
+
+ if($("live-pid-badge"))$("live-pid-badge").textContent=svc.pid?"PID "+svc.pid:"未启动";
+ if($("live-proc-status"))$("live-proc-status").textContent=running?"正常运行中 (LIVE)":"已停止";
+ if($("live-started-at"))$("live-started-at").textContent=when(svc.started_at);
+ if($("live-mode-info"))$("live-mode-info").textContent=(svc.mode||"live").toUpperCase()+" / "+(svc.order_type||"FAK");
+ if($("live-scale-info"))$("live-scale-info").textContent=(Number(d.live_scale_factor||1)*100).toFixed(0)+"% (1:1 跟随 "+money(pcaps.initial_capital_usd||1269)+" 统一配置)";
+ if($("live-wallet-addr"))$("live-wallet-addr").textContent=svc.funder_address||q.proxy_wallet_address||"—";
+ if($("live-withdraw-lock"))$("live-withdraw-lock").textContent=svc.withdrawal_permission===false?"已硬锁禁止提现 (withdrawal_permission=false)":"未知";
+ if($("live-paper-mirror"))$("live-paper-mirror").textContent=pm.paper_cash_usd!==undefined?("镜像现金 "+money(pm.paper_cash_usd)+" · 镜像净盈亏 "+signedMoney(pm.paper_realized_pnl_usd)):"—";
+
+ const stByMkt={};
+ for(const st of (d.settlements||[])){if(st.market_id)stByMkt[String(st.market_id)]=st;}
+
+ if($("live-orders-summary"))$("live-orders-summary").textContent="共 "+totalSig+" 笔信号 · "+filled+" 笔实盘成交 · 实盘净收益 "+signedMoney(pnl);
+ const ordBody=$("live-orders-body");
+ if(ordBody){
+  ordBody.replaceChildren();
+  const orders=d.orders||[];
+  if(!orders.length){
+   const r=elem("tr");for(let i=0;i<7;i++)cell(r,i===0?"暂无记录":"—");ordBody.append(r);
+  }
+  for(const o of orders){
+   const r=elem("tr");
+   const tm=o.timing||{},pb=o.paper_benchmark||{},le=o.live_execution||{},df=o.diff_vs_paper||{};
+   const st=stByMkt[String(o.market_id)];
+   cell(r,when(tm.live_http_ack_at||tm.live_detected_at||tm.paper_fill_at||o.cohort_id));
+   cell(r,(o.stream||"—")+" · "+(o.outcome==="UP"?"上涨 (UP)":"下跌 (DOWN)")+" (#"+(o.rank||"")+")");
+   cell(r,"均价 "+Number(pb.avg_fill_price||0).toFixed(4)+" / "+Number(pb.filled_quantity||0).toFixed(2)+" 股 / "+money( Number(pb.cost_usd||0)+Number(pb.fee_usd||0) ));
+   cell(r,"限价 "+Number(le.limit_price||0).toFixed(3)+" / "+Number(le.requested_quantity||0).toFixed(2)+" 股 / "+money(le.requested_stake_usd));
+   const matched=Number(le.filled_quantity||0)>0;
+   cell(r,(le.clob_status||"—")+(matched?(" · 均价 "+Number(le.avg_fill_price||0).toFixed(4)+" / "+Number(le.filled_quantity||0).toFixed(2)+" 股 / 实付 "+money(le.total_spent_usdc)):" · 0 股 ($0.00)"),matched?"pnl-pos":"");
+   cell(r,(df.avg_price_slippage_bps!==undefined&&df.avg_price_slippage_bps!==null?Number(df.avg_price_slippage_bps).toFixed(1)+" bps":"—")+" / "+(tm.detection_lag_ms?Number(tm.detection_lag_ms).toFixed(0)+"ms":"—")+" / "+(tm.clob_rtt_ms?Number(tm.clob_rtt_ms).toFixed(0)+"ms":"—"));
+   let posText="未成交 (NO_FILL)",posCls="";
+   if(matched){
+    if(st){
+     const spnl=Number(st.live_realized_pnl_usdc||0);
+     if(spnl>0){posText="【已胜赎回】"+signedMoney(spnl);posCls="pnl-pos";}
+     else if(spnl<0){posText="【已负结算】"+signedMoney(spnl);posCls="pnl-neg";}
+     else{posText=st.redeem_status||"已结算";}
+    }else{
+     posText="持仓待官方结算";
+    }
+   }else if(le.clob_status==="ORDER_STATE_UNKNOWN"){
+    posText="状态待对账";
+   }
+   cell(r,posText,posCls);
+   ordBody.append(r);
+  }
+ }
+
+ if($("live-settlements-summary"))$("live-settlements-summary").textContent="已结算 "+wins+" 胜 "+losses+" 负 · 累计赎回 "+money(sum.redeemed_usdc_total||0)+" · 实盘净盈亏 "+signedMoney(pnl);
+ const stBody=$("live-settlements-body");
+ if(stBody){
+  stBody.replaceChildren();
+  const allSt=d.settlements||[];
+  const activeSt=allSt.filter(s=>Number(s.live_cost_usdc||0)>0||Number(s.live_expected_payout_usdc||0)>0||Number(s.redeemed_usdc_amount||0)>0||Math.abs(Number(s.live_realized_pnl_usdc||0))>1e-6||s.redeem_status==="AWAITING_ORDER_RECONCILIATION");
+  const rowsToShow=activeSt.length?activeSt:allSt;
+  if(!rowsToShow.length){
+   const r=elem("tr");for(let i=0;i<8;i++)cell(r,i===0?"暂无结算":"—");stBody.append(r);
+  }
+  for(const st of rowsToShow){
+   const r=elem("tr");
+   cell(r,when(st.first_settled_at_utc||st.timestamp_utc));
+   cell(r,(st.stream?st.stream+" · ":"")+"#"+st.market_id+(st.order_outcome?" (买 "+st.order_outcome+")":""));
+   cell(r,st.official_outcome==="UP"?"上涨 (UP)":"下跌 (DOWN)");
+   cell(r,money(st.paper_payout_usd||0));
+   cell(r,money(st.live_expected_payout_usdc||0)+(st.live_cost_usdc?"（成本 "+money(st.live_cost_usdc)+"）":""));
+   cell(r,money(st.redeemed_usdc_amount||0));
+   const spnl=Number(st.live_realized_pnl_usdc||0);
+   const pCls=spnl>1e-6?"pnl-pos":(spnl<-1e-6?"pnl-neg":"");
+   cell(r,signedMoney(spnl),pCls);
+   const txShort=st.redeem_tx_hash?(st.redeem_tx_hash.slice(0,10)+"…"+st.redeem_tx_hash.slice(-6)):"—";
+   cell(r,(st.redeem_status||"—")+(st.redeem_tx_hash?" · "+txShort:""));
+   stBody.append(r);
+  }
+ }
+
+ if($("live-logs-box")){
+  const logs=d.recent_logs||[];
+  $("live-logs-box").textContent=logs.length?logs.join("\n"):"暂无日志输出";
+ }
+}
+
 function renderEngineering(s){
  renderRisk(s);
  const e=s.engineering||{},t=(s.pipeline||{}).timing||{},b=s.book_telemetry||{},q=b.last_sample||{};
@@ -44,9 +202,17 @@ function executionText(result){
  if(status==="PRICE_LIMIT_NOT_MET"){
   if(result.best_ask!==undefined&&result.min_buy_price!==undefined&&Number(result.best_ask)<Number(result.min_buy_price))
    return "卖一价 "+result.best_ask+" 低于逆向保护线 "+result.min_buy_price+"，已跳过";
-  return "买价高于 0.515，已跳过";
+  if(result.min_executable_depth_usd!==undefined&&result.observed_executable_depth_usd!==undefined&&Number(result.observed_executable_depth_usd)<Number(result.min_executable_depth_usd))
+   return "限价内可执行深度 "+money(result.observed_executable_depth_usd)+" 低于门槛 "+money(result.min_executable_depth_usd)+"，已跳过";
+  const lim=result.limit_price!==undefined?result.limit_price:0.515;
+  return "卖一价 "+(result.best_ask!==undefined?result.best_ask+" ":"")+"高于限价 "+lim+"，已跳过";
  }
- if(status==="WAITING_PRICE_RECHECK")return "第 "+((result.attempt||0)+1)+" 次检查价格未达限价 · "+when(result.next_retry_at)+" 重检 · 下层等待";
+ if(status==="WAITING_PRICE_RECHECK"){
+  if(result.min_executable_depth_usd!==undefined&&result.observed_executable_depth_usd!==undefined&&Number(result.observed_executable_depth_usd)<Number(result.min_executable_depth_usd))
+   return "第 "+((result.attempt||0)+1)+" 次检查盘口深度 "+money(result.observed_executable_depth_usd)+" < "+money(result.min_executable_depth_usd)+" · "+when(result.next_retry_at)+" 重检";
+  return "第 "+((result.attempt||0)+1)+" 次检查价格未达限价 · "+when(result.next_retry_at)+" 重检 · 下层等待";
+ }
+ if(status==="BLEED_WINDOW_SINGLE_ORDER_CAP")return "2h阴跌/逼空期同窗口限 1 单护栏触发，已跳过第 2 单";
  if(status==="FILLED_BUDGET")return "本层额度已完成 · "+money(result.spent_usd)+" / "+money(result.approved_usd);
  if(status==="PARTIAL")return "本层未完成 · 已成交 "+money(result.spent_usd)+" / "+money(result.approved_usd)+"，下层等待";
  if(status==="UNREACHED")return "本轮未检查 · 上层或预算已阻断";
@@ -150,6 +316,10 @@ function render(s){
  const execution=pipe.execution||{};
  $("lastdecision").textContent=inputBlocked?"最近一轮输入检查未通过，没有生成新预测或模拟成交。":decisions.length?"最近窗口 "+when(pipe.last_attempt_cohort||pipe.last_cohort)+" · "+decisions.length+" 条流状态 · "+decisions.filter(x=>x.status==="SIGNAL").length+" 个信号 · "+(execution.fills||[]).filter(x=>Number(x.quantity)>0).length+" 笔模拟成交"+((execution.blocked||[]).length?" · 容量、报价或风控门槛未通过":""):"等待下一次实时预测";
  const a=s.account;const t=s.training||{};
+ if($("tab-badge-monitor")){
+  $("tab-badge-monitor").textContent=(s.paper_trading_active?"运行中 · ":"等待 · ")+signedMoney(a.realized_pnl);
+  $("tab-badge-monitor").className="tab-pill "+(s.paper_trading_active?"ok":"");
+ }
  $("trainingstatus").textContent=({COMPLETED:"本地训练与回测完成",TRAINING:"正在本地训练",FAILED:"训练检查未通过",PREPARING:"准备本地训练"})[t.status]||t.status||"准备中";
  $("trainingdetail").textContent="训练阶段："+(t.phase||"本地训练准备")+(t.current_stream?" · 当前 "+t.current_stream:"")+" · 完成 "+(Array.isArray(t.completed_streams)?t.completed_streams.filter(x=>x.phase==="deployment_q4").length:0)+" 条流";
  $("paperstate").textContent=inputBlocked?"暂停新单 · 输入检查未通过":s.paper_trading_active?"本地模拟执行已接通":s.pipeline&&s.pipeline.status!=="NOT_ENABLED"?"已启动 · 当前等待 / 暂停":"未启动 · 本地训练 / 数据接线中";
@@ -166,7 +336,7 @@ function render(s){
  $("wins").textContent=(a.wins||0)+" 胜 / "+(a.losses||0)+" 负";
  $("winrate").textContent=a.win_rate_pct===null||a.win_rate_pct===undefined?"尚无已结算交易":"结算胜率 "+Number(a.win_rate_pct).toFixed(2)+"%（共 "+((a.wins||0)+(a.losses||0))+" 笔已结算）";
  $("valuation").textContent=a.equity===null?"已实现净值（含在途成本 "+money(a.locked_cost)+"）· 初始 "+money(a.initial_capital):"初始本金 "+money(a.initial_capital);
- if($("header-subtitle")){const rl=a.risk_limits||{};$("header-subtitle").textContent="Polymarket · 共享本金 "+money(a.initial_capital)+(rl.max_order_usd?"（打法 B：单笔上限 "+money(rl.max_order_usd)+" / 窗口 "+money(rl.max_tick_budget_usd)+"）":"")+" · 从账户创建时刻开始";}
+ if($("header-subtitle")){const rl=a.risk_limits||{};$("header-subtitle").textContent="Polymarket · 共享本金 "+money(a.initial_capital)+(rl.max_order_usd?"（单笔上限 "+money(rl.max_order_usd)+" / 窗口 "+money(rl.max_tick_budget_usd)+" / 总敞口 "+money(rl.max_open_risk_usd)+"）":"")+" · 模拟盘与外部实盘双轨监控";}
  $("since").textContent="起算 "+when(a.started_at);
  $("lastcycle").textContent=when(s.last_cycle);
  $("observing").textContent=s.markets.stale?"观测已过期":(s.markets.market_data_status==="COMPLETE"?"市场与盘口已观测":s.markets.market_data_status==="PARTIAL"?"部分市场 / 盘口不可用":s.last_cycle?"循环运行 · 市场数据不可用":"等待首次采集");
@@ -207,12 +377,187 @@ function eventView(e){
  }
  return["账户记录","已保存完整审计记录。"];
 }
+let diag5mState={filter:"ALL",expanded:false,timeline:[],summary:{},live5m:null};
+
+function fmtCohortLabel(iso){
+ if(!iso)return "—";
+ const d=new Date(iso);
+ if(Number.isNaN(d.getTime()))return String(iso);
+ const loc=d.toLocaleString("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false});
+ const utcHm=String(d.getUTCHours()).padStart(2,"0")+":"+String(d.getUTCMinutes()).padStart(2,"0");
+ return loc+" ("+utcHm+" UTC)";
+}
+
+function fmtDurSec(s){
+ if(typeof s!=="number"||!Number.isFinite(s))return "—";
+ const m=Math.floor(s/60),r=Math.floor(s%60);
+ return m>0?(m+"分"+String(r).padStart(2,"0")+"秒"):(r+"秒");
+}
+
+function tick5mClock(){
+ if(!$("diag5m-win-main"))return;
+ const nowMs=Date.now();
+ const floorMs=Math.floor(nowMs/300000)*300000;
+ const elapsedSec=Math.max(0,(nowMs-floorMs)/1000);
+ const remSec=Math.max(0,300-elapsedSec);
+ const d=new Date(floorMs);
+ const locHm=String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");
+ const utcHm=String(d.getUTCHours()).padStart(2,"0")+":"+String(d.getUTCMinutes()).padStart(2,"0");
+ if(elapsedSec<=20){
+  $("diag5m-win-main").textContent="⚡ "+locHm+" 窗定检期 (T+"+elapsedSec.toFixed(0)+"s / 20s)";
+  $("diag5m-win-sub").textContent="UTC "+utcHm+" · K线闭合采集与七流瀑布流定检黄金窗";
+ }else{
+  $("diag5m-win-main").textContent=locHm+" 窗 · 距下窗 "+fmtDurSec(remSec);
+  $("diag5m-win-sub").textContent="UTC "+utcHm+" 已过 "+fmtDurSec(elapsedSec)+" · 下一定检整点倒计时中";
+ }
+}
+
+function render5mTimelineRows(){
+ const tb=$("diag5m-tbody");
+ if(!tb)return;
+ tb.replaceChildren();
+ const all=diag5mState.timeline||[];
+ const flt=diag5mState.filter||"ALL";
+ const filtered=flt==="ALL"?all:all.filter(x=>x.category===flt);
+ const limit=diag5mState.expanded?144:12;
+ const rows=filtered.slice(0,limit);
+ if($("diag5m-expand-btn")){
+  $("diag5m-expand-btn").textContent=diag5mState.expanded?"收起至最近 12 窗 (1h)":"展开最近 "+Math.min(all.length||144,144)+" 窗 (12h)";
+ }
+ if(!rows.length){
+  const r=elem("tr");
+  cell(r,"—");
+  cell(r,"当前筛选下无记录");
+  cell(r,"—");
+  cell(r,"—");
+  cell(r,"切换上方筛选按钮可查看全部 5 分钟窗口定检记录","diag5m-detail");
+  tb.append(r);
+  return;
+ }
+ for(const item of rows){
+  const r=elem("tr");
+  cell(r,fmtCohortLabel(item.cohort));
+  const stTd=elem("td");
+  stTd.append(elem("span",item.badge_text||item.category||"—","cat-pill cat-"+(item.category||"WARMUP")));
+  r.append(stTd);
+  const dur=item.duration_seconds;
+  cell(r,typeof dur==="number"&&Number.isFinite(dur)?("T+"+dur.toFixed(2)+"s"):(item.category==="IN_PROGRESS"?"执行中…":"—"));
+  const pOrds=item.paper_orders||[];
+  const lOrds=item.live_orders||[];
+  let actText="无下单";
+  let actCls="";
+  if(pOrds.length||lOrds.length){
+   const pSum=pOrds.reduce((acc,o)=>acc+Number(o.total_cost_usd||0),0);
+   const lFilled=lOrds.filter(o=>Number(((o.live_execution||{}).filled_quantity)||0)>0);
+   const lSum=lFilled.reduce((acc,o)=>acc+Number(((o.live_execution||{}).total_spent_usdc)||0),0);
+   const streams=[...new Set([...pOrds.map(o=>(o.stream||"")+" "+(o.outcome||"")),...lOrds.map(o=>(o.stream||"")+" "+(o.outcome||""))])].filter(Boolean).join(",");
+   actText=streams+" · 模拟 "+(pOrds.length?money(pSum):"0")+(lOrds.length?(" / 实盘 "+(lFilled.length?money(lSum):(lOrds[0].live_execution||{}).clob_status||"未成")):"");
+   actCls="pnl-pos";
+  }
+  cell(r,actText,actCls);
+  cell(r,item.summary_text||"—","diag5m-detail");
+  tb.append(r);
+ }
+}
+
+function render5mDiagnostics(statusRes,liveRes){
+ const src=(liveRes&&liveRes.cohort_timeline&&liveRes.cohort_timeline.length)?liveRes:statusRes;
+ if(!src||!$("diag5m-section"))return;
+ const live5m=src.status_5m_live||statusRes.status_5m_live||{};
+ const sum=src.cohort_summary||statusRes.cohort_summary||{};
+ diag5mState.timeline=src.cohort_timeline||statusRes.cohort_timeline||[];
+ diag5mState.summary=sum;
+ diag5mState.live5m=live5m;
+
+ const ov=live5m.overall_state||"HEALTHY";
+ const pillClsMap={HEALTHY:"diag-pill diag-healthy",IN_WINDOW:"diag-pill diag-inwin",DATA_MISMATCH:"diag-pill diag-warn",RATE_LIMIT:"diag-pill diag-warn",STUCK:"diag-pill diag-err",WARMUP:"diag-pill diag-muted"};
+ if($("diag5m-badge")){
+  $("diag5m-badge").className=pillClsMap[ov]||"diag-pill diag-healthy";
+  $("diag5m-badge").textContent=live5m.overall_badge||"运行中";
+ }
+ if($("diag5m-headline")){
+  $("diag5m-headline").textContent=live5m.headline||"—";
+ }
+
+ const hb=live5m.heartbeat||{},clk=live5m.clock||{},da=live5m.data_alignment||{},lf=live5m.latest_finished_window;
+ const hbAge=hb.pipeline_age_seconds;
+ const stalled=Boolean(hb.is_stalled)||ov==="STUCK";
+ if($("diag5m-card-hb"))$("diag5m-card-hb").className="diag5m-card"+(stalled?" alert-err":"");
+ if($("diag5m-hb-main")){
+  $("diag5m-hb-main").textContent=stalled
+   ?"🔴 异常 / 阻塞告警"
+   :("🟢 正常无卡死"+(typeof hbAge==="number"?"（心跳 "+hbAge.toFixed(1)+"s）":""));
+ }
+ if($("diag5m-hb-sub")){
+  const ph=(hb.active_phases||[])[0];
+  const clkTxt=clk.status==="CALIBRATED"?("时钟已校准 ±"+Number(clk.uncertainty_seconds||0).toFixed(2)+"s"):("时钟状态 "+clk.status);
+  $("diag5m-hb-sub").textContent=ph?("当前阶段 "+ph.worker+":"+ph.phase+" ("+Number(ph.elapsed_seconds||0).toFixed(1)+"s) · "+clkTxt):(clkTxt+" · 工作线程空闲守候");
+ }
+
+ tick5mClock();
+
+ const dataBad=da.state==="MISMATCH"||da.state==="RATE_LIMIT";
+ if($("diag5m-card-data"))$("diag5m-card-data").className="diag5m-card"+(dataBad?" alert-warn":"");
+ if($("diag5m-data-main"))$("diag5m-data-main").textContent=da.label||"—";
+ if($("diag5m-data-sub"))$("diag5m-data-sub").textContent=da.detail||"—";
+
+ if($("diag5m-last-main")){
+  if(lf){
+   const tHm=new Date(lf.cohort).toLocaleTimeString("zh-CN",{hour:"2-digit",minute:"2-digit",hour12:false});
+   $("diag5m-last-main").textContent=tHm+" 窗 · "+(lf.badge_text||lf.category);
+   $("diag5m-last-sub").textContent=(typeof lf.duration_seconds==="number"?"开窗 T+"+lf.duration_seconds.toFixed(2)+"s 完成 · ":"")+(lf.summary_text||"").slice(0,86);
+  }else{
+   $("diag5m-last-main").textContent="等待首个窗口";
+   $("diag5m-last-sub").textContent="尚无已完成定检窗口";
+  }
+ }
+
+ const setCnt=(id,lbl,n)=>{const b=$(id);if(b)b.textContent=lbl+" ("+Number(n||0)+")";};
+ setCnt("flt-all","全部窗口",sum.total_cohorts);
+ setCnt("flt-nosig","🔵 正常无信号",sum.no_signal_cohorts);
+ setCnt("flt-traded","🟢 已成交",sum.traded_cohorts);
+ setCnt("flt-risk","🛡️ 风控拦截",sum.risk_guard_cohorts);
+ setCnt("flt-data","🟠 数据对不上",sum.data_mismatch_cohorts);
+ setCnt("flt-stuck","🔴 卡死/限流/时钟异常",sum.stuck_error_cohorts);
+
+ render5mTimelineRows();
+}
+
+function init5mControls(){
+ const wrap=$("diag5m-filters");
+ if(wrap){
+  wrap.addEventListener("click",ev=>{
+   const btn=ev.target.closest("button[data-filter]");
+   if(!btn)return;
+   diag5mState.filter=btn.getAttribute("data-filter")||"ALL";
+   for(const b of wrap.querySelectorAll(".flt-btn"))b.classList.toggle("active",b===btn);
+   render5mTimelineRows();
+  });
+ }
+ const expBtn=$("diag5m-expand-btn");
+ if(expBtn){
+  expBtn.addEventListener("click",()=>{
+   diag5mState.expanded=!diag5mState.expanded;
+   render5mTimelineRows();
+  });
+ }
+ tick5mClock();
+ setInterval(tick5mClock,1000);
+}
+
 async function refresh(){
  try{
-  const results=await Promise.all(["status","ledger","equity"].map(p=>fetch("/api/"+p,{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP");return r.json();})));
-  renderEngineering(results[0]);render(results[0]);drawChart(results[2]);
-  const tradeEvents=((results[0].account||{}).trade_events)||[];
-  const rawRows=Array.isArray(results[1])?results[1]:(results[1].events||results[1].ledger||[]);
+  const [statusRes,ledgerRes,equityRes,liveRes]=await Promise.all([
+   fetch("/api/status",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP");return r.json();}),
+   fetch("/api/ledger",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP");return r.json();}),
+   fetch("/api/equity",{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("HTTP");return r.json();}),
+   fetch("/api/live_dashboard",{cache:"no-store"}).then(r=>r.ok?r.json():null).catch(()=>null)
+  ]);
+  render5mDiagnostics(statusRes,liveRes);
+  if(liveRes)renderLive(liveRes);
+  renderEngineering(statusRes);render(statusRes);drawChart(equityRes);
+  const tradeEvents=((statusRes.account||{}).trade_events)||[];
+  const rawRows=Array.isArray(ledgerRes)?ledgerRes:(ledgerRes.events||ledgerRes.ledger||[]);
   const rows=tradeEvents.length?tradeEvents:rawRows;
   const body=$("ledger");body.replaceChildren();
   if(!rows.length){const r=elem("tr");cell(r,"—");cell(r,"暂无交易");cell(r,"模型未接通期间，账户不产生模拟成交或利润。");body.append(r);}
@@ -221,6 +566,17 @@ async function refresh(){
   $("connection").className="banner offline";
   $("connection").textContent="本地服务未连接，以下为上次读取状态，不代表当前实时数据。";
   $("observing").textContent="断线 / 未知";
+  if($("diag5m-badge")){
+   $("diag5m-badge").className="diag-pill diag-err";
+   $("diag5m-badge").textContent="🔴 本地监控服务已断线 / 未响应";
+  }
+  if($("diag5m-headline")){
+   $("diag5m-headline").textContent="告警：无法连接 http://127.0.0.1:8897/api/status，本地 Python 模拟/看板进程可能已停止或卡死！";
+  }
+  if($("diag5m-card-hb"))$("diag5m-card-hb").className="diag5m-card alert-err";
+  if($("diag5m-hb-main"))$("diag5m-hb-main").textContent="🔴 服务断线 / 无响应";
  }
 }
-refresh();setInterval(refresh,10000);
+initTabs();
+init5mControls();
+refresh();setInterval(refresh,5000);

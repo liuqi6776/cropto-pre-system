@@ -179,7 +179,7 @@ def test_fast_queue_waits_for_durable_backoff_and_restart_cannot_bypass(tmp_path
     assert pd.Timestamp(shared["blocked_until_utc"]) == now+pd.Timedelta(seconds=135)
 
 
-@pytest.mark.parametrize("spacing", [True, False, -.1, 0., .249, float("nan"), float("inf"), 61])
+@pytest.mark.parametrize("spacing", [True, False, -.1, 0., .049, float("nan"), float("inf"), 61])
 def test_runtime_spacing_is_explicit_and_bounded(tmp_path, spacing):
     with pytest.raises(ValueError, match="spacing"):
         online.OnlineInputs(tmp_path, http_min_spacing_seconds=spacing)

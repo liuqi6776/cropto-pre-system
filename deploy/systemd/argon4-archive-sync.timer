@@ -1,0 +1,10 @@
+[Unit]
+Description=Run ARGON-4 Tiered Archive & Google Drive Sync Every 48 Hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=48h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

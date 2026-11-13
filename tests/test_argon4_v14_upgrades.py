@@ -371,7 +371,7 @@ def test_correction5_and_6_production_policy_preserves_verified_v13r2_parameters
         "SOL_5m",
     ]
     from tools.argon4_forward import runtime_profile
-    assert runtime_profile.revision_fastpath_profile(policy)["profile"] == "argon4-aged-revision-v13"
+    assert runtime_profile.revision_fastpath_profile(policy)["profile"] == "argon4-aged-revision-v14"
 
 
 def test_monitor_audit_logger_records_no_trade_and_stall_events(tmp_path):
@@ -1604,11 +1604,14 @@ def test_v14r12_audit_remediations_bleed_cap_stream_max_order_1h_retry_and_fast_
     }
     eng = engineering_profile(policy)
     assert eng["enabled"] is True
-    assert eng["window_poll_interval_seconds"] == pytest.approx(0.25)
+    assert policy["input_http_min_spacing_seconds"] == pytest.approx(0.05)
+    assert policy["min_decision_delay_seconds"] == pytest.approx(1.8)
+    assert eng["window_poll_interval_seconds"] == pytest.approx(0.1)
+    assert eng["minimum_decision_delay_seconds"] == pytest.approx(1.8)
     assert eng["input_deadline_after_boundary_seconds"] == pytest.approx(16.5)
-    assert eng["input_ready_retry_interval_seconds"] == pytest.approx(0.35)
-    assert eng["prefetch_lead_seconds"] == pytest.approx(25.0)
-    assert eng["prefetch_budget_seconds"] == pytest.approx(8.0)
+    assert eng["input_ready_retry_interval_seconds"] == pytest.approx(0.15)
+    assert eng["prefetch_lead_seconds"] == pytest.approx(9.5)
+    assert eng["prefetch_budget_seconds"] == pytest.approx(6.5)
 
     # Issue 7: Step 1 ($200 capital, 0.08 single / 0.16 tick / 0.16 daily_loss) passes _policy_risk_limits
     step1_policy = {
@@ -2431,6 +2434,225 @@ def test_v14r16_time_segmented_playbook_us_close_sunday_reopen_weekend_rv12_and_
             st_15m, pred, ex_ante_rv12_bps=3.5, guard_config=vg, cohort_time="2026-11-14T12:00:00+00:00"
         )
         assert r_wknd_15m["selected"] is True
+
+
+def test_v14r17_hourly_fastpath_and_skewed_clock_retry_budget(tmp_path, monkeypatch):
+    """v14r17: aged futures/mark 1h conflicts reconcile via fastpath v14; skewed host clock keeps retry budget."""
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from tools.argon4_forward import pipeline, revisions, runtime_profile
+    from test_argon4_forward_mark_revisions import (
+        FUTURES_ENDPOINT,
+        MARK_ENDPOINT,
+        NEW_MARK,
+        OLD_MARK,
+        OPEN,
+        _error,
+        _receipt,
+        _row,
+        bar,
+    )
+
+    # 1. Policy exposes argon4-aged-revision-v14
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    fp = runtime_profile.revision_fastpath_profile(policy)
+    assert fp["enabled"] is True
+    assert fp["profile"] == "argon4-aged-revision-v14"
+
+    # 2. Build offline runtime with aged 1h mark & 1h futures bars (OPEN=08:00Z, closed 09:00Z <= cohort 10:00Z - 1h)
+    rt = tmp_path / "rt_v14r17"
+    (rt / "features/raw_data/auxiliary").mkdir(parents=True)
+    with sqlite3.connect(rt / "features/http_receipts.sqlite3") as con:
+        con.execute(
+            "CREATE TABLE receipts(id INTEGER PRIMARY KEY, url TEXT NOT NULL, requested_at TEXT NOT NULL, "
+            "received_at TEXT NOT NULL, sha256 TEXT NOT NULL, http_status INTEGER NOT NULL, raw BLOB NOT NULL, "
+            "time_basis TEXT, clock_evidence_sha256 TEXT)"
+        )
+    with sqlite3.connect(rt / "observations.sqlite3") as con:
+        con.execute("CREATE TABLE snapshots(id INTEGER PRIMARY KEY, kind TEXT, saved_at TEXT, payload TEXT)")
+
+    old_fut_1h = bar(OPEN, 60, mark=False)
+    new_fut_1h = dict_copy = list(old_fut_1h)
+    new_fut_1h[4], new_fut_1h[8] = "2225.56431783", 25
+
+    orig_mark_rec = _receipt(rt, OLD_MARK, pd.Timestamp("2026-11-06T09:00:02Z"), endpoint=MARK_ENDPOINT)
+    orig_fut_rec = _receipt(rt, old_fut_1h, pd.Timestamp("2026-11-06T09:00:02Z"), endpoint=FUTURES_ENDPOINT)
+
+    mark_pq = rt / "features/raw_data/auxiliary/ETHUSDT_1h_mark.parquet"
+    fut_pq = rt / "features/raw_data/auxiliary/ETHUSDT_1h_futures.parquet"
+    pd.DataFrame([_row(OLD_MARK, orig_mark_rec)]).to_parquet(mark_pq, index=False)
+    pd.DataFrame([_row(old_fut_1h, orig_fut_rec)]).to_parquet(fut_pq, index=False)
+
+    reg_path = rt / "mark_candle_registry.json"
+    reg_doc = {
+        "research_references": [
+            {
+                "dataset_id": "argon4_local_v4_online_mark_ETHUSDT_20261106",
+                "pair": "ETH/USDT:USDT",
+                "timeframe": "1h",
+                "candle_type": "mark",
+                "local_path": str(mark_pq.resolve()),
+                "extension": "parquet",
+                "sha256": revisions._sha(mark_pq),
+                "rows": 1,
+                "first_utc": "2026-11-06T08:00:00+00:00",
+                "last_utc": "2026-11-06T08:00:00+00:00",
+                "verification_status": "VERIFIED_PERPETUAL_LABEL",
+                "installed": False,
+                "research_only": True,
+                "gate_effect": "NONE",
+                "source_endpoint": MARK_ENDPOINT,
+                "source_receipt_sha256": [orig_mark_rec["sha256"]],
+            }
+        ]
+    }
+    reg_path.write_text(json.dumps(reg_doc, indent=2), encoding="utf-8")
+
+    cohort_10 = pd.Timestamp("2026-11-06T10:00:00Z")
+    errors = [_error("mark:ETHUSDT:1h"), _error("futures:ETHUSDT:1h")]
+    guard_fn = lambda: {"eligible": True, "clock_evidence_sha256": "d" * 64, "policy_sha256": "e" * 64}
+
+    # Receipt 1 at +2.0s after top-of-hour -> WAITING_CONFIRMATION with fast_confirmation_eligible=True under v14
+    _receipt(rt, NEW_MARK, cohort_10 + pd.Timedelta(seconds=2.0), endpoint=MARK_ENDPOINT, requested=cohort_10 + pd.Timedelta(seconds=1.6))
+    _receipt(rt, new_fut_1h, cohort_10 + pd.Timedelta(seconds=2.0), endpoint=FUTURES_ENDPOINT, requested=cohort_10 + pd.Timedelta(seconds=1.6))
+
+    ctx_v14 = {
+        "profile": revisions.FAST_V14_PROFILE,
+        "cohort": cohort_10.isoformat(),
+        "deadline": (cohort_10 + pd.Timedelta(seconds=18.0)).isoformat(),
+        "minimum_spacing_seconds": 1.2,
+        "clock_evidence_sha256": "d" * 64,
+    }
+    wait_res = revisions.reconcile_confirmed_price_revisions(
+        rt, errors,
+        now=lambda: cohort_10 + pd.Timedelta(seconds=2.2),
+        cutover_now=lambda: cohort_10 + pd.Timedelta(seconds=2.3),
+        mark_registry_path=reg_path,
+        fast_context=ctx_v14,
+        cohort_guard=guard_fn,
+    )
+    assert wait_res["status"] == "WAITING_CONFIRMATION"
+    assert wait_res["fast_confirmation_eligible"] is True
+
+    # Receipt 2 requested >= 1.2s after Receipt 1 -> COMMITTED with same_cohort_eligible=True!
+    _receipt(rt, NEW_MARK, cohort_10 + pd.Timedelta(seconds=3.8), endpoint=MARK_ENDPOINT, requested=cohort_10 + pd.Timedelta(seconds=3.4))
+    _receipt(rt, new_fut_1h, cohort_10 + pd.Timedelta(seconds=3.8), endpoint=FUTURES_ENDPOINT, requested=cohort_10 + pd.Timedelta(seconds=3.4))
+
+    commit_res = revisions.reconcile_confirmed_price_revisions(
+        rt, errors,
+        now=lambda: cohort_10 + pd.Timedelta(seconds=4.0),
+        cutover_now=lambda: cohort_10 + pd.Timedelta(seconds=4.5),
+        mark_registry_path=reg_path,
+        fast_context=ctx_v14,
+        cohort_guard=guard_fn,
+    )
+    assert commit_res["status"] == "COMMITTED", commit_res
+    assert commit_res["same_cohort_eligible"] is True
+
+    # Young 1h bar (cohort=09:05Z -> OPEN 08:00Z closed at 09:00Z > 09:05Z - 1h = 08:05Z) MUST stay fail-closed!
+    rt_young = tmp_path / "rt_young"
+    (rt_young / "features/raw_data/auxiliary").mkdir(parents=True)
+    with sqlite3.connect(rt_young / "features/http_receipts.sqlite3") as con:
+        con.execute(
+            "CREATE TABLE receipts(id INTEGER PRIMARY KEY, url TEXT NOT NULL, requested_at TEXT NOT NULL, "
+            "received_at TEXT NOT NULL, sha256 TEXT NOT NULL, http_status INTEGER NOT NULL, raw BLOB NOT NULL, "
+            "time_basis TEXT, clock_evidence_sha256 TEXT)"
+        )
+    with sqlite3.connect(rt_young / "observations.sqlite3") as con:
+        con.execute("CREATE TABLE snapshots(id INTEGER PRIMARY KEY, kind TEXT, saved_at TEXT, payload TEXT)")
+    orig_young_rec = _receipt(rt_young, OLD_MARK, pd.Timestamp("2026-11-06T09:00:02Z"), endpoint=MARK_ENDPOINT)
+    young_mark_pq = rt_young / "features/raw_data/auxiliary/ETHUSDT_1h_mark.parquet"
+    pd.DataFrame([_row(OLD_MARK, orig_young_rec)]).to_parquet(young_mark_pq, index=False)
+    young_reg_path = rt_young / "mark_candle_registry.json"
+    young_reg_doc = {
+        "research_references": [
+            {
+                **reg_doc["research_references"][0],
+                "local_path": str(young_mark_pq.resolve()),
+                "sha256": revisions._sha(young_mark_pq),
+                "source_receipt_sha256": [orig_young_rec["sha256"]],
+            }
+        ]
+    }
+    young_reg_path.write_text(json.dumps(young_reg_doc, indent=2), encoding="utf-8")
+
+    cohort_young = pd.Timestamp("2026-11-06T09:05:00Z")
+    ctx_young = {
+        "profile": revisions.FAST_V14_PROFILE,
+        "cohort": cohort_young.isoformat(),
+        "deadline": (cohort_young + pd.Timedelta(seconds=18.0)).isoformat(),
+        "minimum_spacing_seconds": 1.2,
+        "clock_evidence_sha256": "d" * 64,
+    }
+    _receipt(rt_young, NEW_MARK, cohort_young + pd.Timedelta(seconds=2.0), endpoint=MARK_ENDPOINT, requested=cohort_young + pd.Timedelta(seconds=1.6))
+    young_res = revisions.reconcile_confirmed_price_revisions(
+        rt_young, [_error("mark:ETHUSDT:1h")],
+        now=lambda: cohort_young + pd.Timedelta(seconds=2.2),
+        cutover_now=lambda: cohort_young + pd.Timedelta(seconds=2.3),
+        mark_registry_path=young_reg_path,
+        fast_context=ctx_young,
+        cohort_guard=guard_fn,
+    )
+    assert young_res["status"] == "WAITING_CONFIRMATION"
+    assert young_res["fast_confirmation_eligible"] is False
+
+    # 3. Skewed host clock (-11.3s behind real UTC) does NOT starve uncalibrated retry budget to 0.5s
+    saved = []
+    p = pipeline.ForwardPipeline(None, tmp_path / "rt_clk", SimpleNamespace(save=lambda k, d: saved.append((k, d))))
+    try:
+        p._revision_fastpath = {"enabled": True, "profile": "argon4-aged-revision-v14"}
+        p._worker_engineering = dict(runtime_profile.V12_ENGINEERING)
+        mono = {"t": 1000.0}
+        # Real UTC is 12:05:08.0 (inside 0..12s decision window!), while host clock is 12:04:56.7 (-11.3s slow!)
+        real_utc = datetime(2026, 11, 12, 12, 5, 8, tzinfo=timezone.utc)
+        host_utc = real_utc - timedelta(seconds=11.3)
+
+        class FakeDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return host_utc if tz else host_utc.replace(tzinfo=None)
+
+        monkeypatch.setattr(pipeline.time, "monotonic", lambda: mono["t"])
+        monkeypatch.setattr(pipeline, "datetime", FakeDT)
+        calls = []
+
+        def fake_calibrate(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return {
+                    "status": "CALIBRATED",
+                    "calibrated_monotonic": mono["t"],
+                    "server_minus_local_seconds": 11.3,
+                }
+            if len(calls) == 2:
+                return {"status": "UNCALIBRATED", "error": "RequestException"}
+            return {
+                "status": "CALIBRATED",
+                "calibrated_monotonic": mono["t"],
+                "server_minus_local_seconds": 11.3,
+            }
+
+        monkeypatch.setattr(pipeline, "calibrate", fake_calibrate)
+        # First call calibrates and records _last_known_clock_offset = +11.3s
+        p.update_clock()
+        assert p._last_known_clock_offset == pytest.approx(11.3)
+
+        # Expire calibration (>40s) and fail once -> UNCALIBRATED
+        mono["t"] = 1045.0
+        monkeypatch.setattr(pipeline, "calibrated_now", lambda c, upper=True: real_utc - timedelta(seconds=20))
+        with pytest.raises(ValueError, match="clock uncertainty"):
+            p.update_clock()
+
+        # Retry 1.2s later while real UTC is 12:05:08 (host clock 12:04:56.7!):
+        # Must use +11.3s offset -> recognizes 0..12s window and grants 4.5s budget (NOT 0.5s!)
+        mono["t"] = 1046.2
+        p.update_clock()
+        budget_used = calls[-1]["budget_monotonic"] - mono["t"]
+        assert budget_used == pytest.approx(4.5)
+        assert calls[-1]["retry_borderline"] is True
+    finally:
+        p.close()
+
 
 
 

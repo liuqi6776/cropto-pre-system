@@ -41,8 +41,8 @@ ENDPOINTS = {
     "dvol": ("https://www.deribit.com", "/api/v2/public/get_volatility_index_data"),
     "book_ticker": ("https://fapi.binance.com", "/fapi/v1/ticker/bookTicker"),
 }
-STEPS = {"5m": pd.Timedelta(minutes=5), "1h": pd.Timedelta(hours=1),
-         "4h": pd.Timedelta(hours=4), "1D": pd.Timedelta(days=1)}
+STEPS = {"1m": pd.Timedelta(minutes=1), "5m": pd.Timedelta(minutes=5),
+         "1h": pd.Timedelta(hours=1), "4h": pd.Timedelta(hours=4), "1D": pd.Timedelta(days=1)}
 PROVENANCE = ("first_received_at", "receipt_sha256", "receipt_time_basis", "clock_evidence_sha256")
 
 
@@ -110,7 +110,8 @@ def _parameters(kind, params):
     else:
         if params["symbol"] not in ALL_SYMBOLS:
             raise ValueError("Unsupported symbol")
-        if kind != "funding" and params["interval"] not in ("5m", "1h", "4h"):
+        allowed_intervals = ("1m", "5m", "1h", "4h") if kind == "spot" else ("5m", "1h", "4h")
+        if kind != "funding" and params["interval"] not in allowed_intervals:
             raise ValueError("Unsupported interval")
         if isinstance(params["limit"], bool) or not 1 <= params["limit"] <= 1000:
             raise ValueError("Unsupported page size")
@@ -497,8 +498,8 @@ class OnlineInputs:
         if not 15 <= window_days <= 60:
             raise ValueError("Online warmup requires 15 to 60 days")
         if (isinstance(http_min_spacing_seconds, bool) or not math.isfinite(http_min_spacing_seconds)
-                or not .25 <= http_min_spacing_seconds <= 60):
-            raise ValueError("Online HTTP spacing must be finite and within 0.25 to 60 seconds")
+                or not .05 <= http_min_spacing_seconds <= 60):
+            raise ValueError("Online HTTP spacing must be finite and within 0.05 to 60 seconds")
         symbols = tuple(symbols)
         if not symbols or any(symbol not in ALL_SYMBOLS for symbol in symbols):
             raise ValueError("Unsupported online input symbols")
@@ -1053,6 +1054,78 @@ class OnlineInputs:
             "clock_evidence_sha256": receipt.get("clock_evidence_sha256", self.clock_evidence_sha256),
             "as_of": _iso(cutoff),
             "tickers": tickers,
+        }
+
+    def capture_spot_1m_twap60(self, symbol, boundary_utc=None, *, cohort_id=None, deadline_monotonic=None):
+        """Capture closed [T-1m, T) Binance spot 1m bar for Chainlink TWAP60 start-handicap guard."""
+        if symbol not in ALL_SYMBOLS:
+            raise ValueError("Unsupported symbol")
+        now_ts = _utc(self.clock())
+        bound_ts = _utc(boundary_utc).floor("1min") if boundary_utc is not None else now_ts.floor("1min")
+        if bound_ts > now_ts:
+            raise ValueError("Requested 1m spot bar is not yet closed")
+        bar_open = bound_ts - STEPS["1m"]
+        params = {
+            "symbol": symbol,
+            "interval": "1m",
+            "startTime": _ms(bar_open),
+            "endTime": _ms(bound_ts),
+            "limit": 2,
+        }
+        if isinstance(self.client, PublicInputsHTTP):
+            payload, receipt = self.client.get(
+                "spot",
+                params,
+                deadline_monotonic=deadline_monotonic,
+                cohort_id=cohort_id,
+                receipt_clock=self.clock,
+                receipt_time_basis=self.time_basis,
+                receipt_clock_evidence=self.clock_evidence_sha256,
+            )
+        else:
+            payload, receipt = self.client.get("spot", params)
+        rows = payload if isinstance(payload, list) else []
+        target_ms = _ms(bar_open)
+        matched = None
+        for row in rows:
+            if isinstance(row, (list, tuple)) and len(row) >= 5:
+                try:
+                    open_ms = int(row[0])
+                except (TypeError, ValueError):
+                    continue
+                if open_ms == target_ms:
+                    matched = row
+                    break
+        if matched is None:
+            return {
+                "status": "MISSING_BAR",
+                "symbol": symbol,
+                "bar_open": _iso(bar_open),
+                "bound_ts": _iso(bound_ts),
+                "cohort_id": cohort_id,
+                "receipt_sha256": receipt.get("sha256"),
+                "received_at": receipt.get("received_at"),
+            }
+        o, h, l, c = float(matched[1]), float(matched[2]), float(matched[3]), float(matched[4])
+        if not np.isfinite([o, h, l, c]).all() or min(o, h, l, c) <= 0 or h < max(o, l, c) or l > min(o, h, c):
+            raise ValueError("INVALID_SPOT_1M_OHLC")
+        twap60 = 0.25 * (o + h + l + c)
+        return {
+            "status": "OBSERVED",
+            "symbol": symbol,
+            "bar_open": _iso(bar_open),
+            "bound_ts": _iso(bound_ts),
+            "open": o,
+            "high": h,
+            "low": l,
+            "spot_close": c,
+            "twap60": twap60,
+            "cohort_id": cohort_id,
+            "requested_at": receipt.get("requested_at"),
+            "received_at": receipt.get("received_at"),
+            "receipt_sha256": receipt.get("sha256"),
+            "time_basis": receipt.get("time_basis", self.time_basis),
+            "clock_evidence_sha256": receipt.get("clock_evidence_sha256", self.clock_evidence_sha256),
         }
 
     def _source_specs(self):

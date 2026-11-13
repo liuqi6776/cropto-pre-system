@@ -1,0 +1,15 @@
+[Unit]
+Description=ARGON-4 Read-Only Loopback Panel Bridge (127.0.0.1:18897 -> 127.0.0.1:8897)
+After=argon4-forward.service
+
+[Service]
+Type=simple
+User=liuqi
+Group=liuqi
+WorkingDirectory=/data/crypto-predict_system
+ExecStart=/data/crypto-predict_system/.venv/bin/python -B /data/crypto-predict_system/scripts/panel_tunnel_bridge.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+# Credentials & Secrets (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*secret*
+
+# Virtual Environment & Python Cache
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime Audit Databases & Logs
+runtime/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.jsonl
+*.log

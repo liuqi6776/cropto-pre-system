@@ -1,7 +1,212 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ARGON · 七流模拟盘</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ARGON · 实盘与模拟盘监控看板</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
 <body><main>
-<header><div><span class="eyebrow">ARGON / FORWARD PAPER</span><h1>七流阶梯模拟盘</h1><p id="header-subtitle">Polymarket · 共享本金 $1,000（打法 B：单笔 $40 / 窗口 $80） · 从账户创建时刻开始</p></div><div class="private">仅本机可见<br><span>真实下单未启用</span></div></header>
+<header>
+  <div>
+    <span class="eyebrow">ARGON / SEVEN-STREAM DUAL DASHBOARD</span>
+    <h1>七流阶梯 · 实盘与模拟盘看板</h1>
+    <p id="header-subtitle">Polymarket · 共享本金 $1,269（单笔上限 $240 / 窗口 $380 / 总敞口 $650） · 模拟盘与外部实盘双轨监控</p>
+  </div>
+  <div class="private" id="header-badge">仅本机可见<br><span id="header-live-state">双面板实时同步</span></div>
+</header>
+
+<nav class="tab-bar" role="tablist" aria-label="监控面板切换">
+  <button type="button" class="tab-btn active" id="tab-btn-live" data-tab="live" role="tab" aria-selected="true">
+    <span>⚡ 实盘看板 (Live)</span>
+    <em class="tab-pill" id="tab-badge-live">读取中…</em>
+  </button>
+  <button type="button" class="tab-btn" id="tab-btn-monitor" data-tab="monitor" role="tab" aria-selected="false">
+    <span>📊 模拟盘监控 (Monitor)</span>
+    <em class="tab-pill" id="tab-badge-monitor">读取中…</em>
+  </button>
+</nav>
+
+<!-- ==================== 全局 5 分钟引擎健康与逐窗状态看板 ==================== -->
+<section class="panel diag5m-panel" id="diag5m-section">
+  <div class="diag5m-header">
+    <div>
+      <h2>⏱️ 5 分钟窗口实时诊断 · 无信号 / 数据对齐 / 防卡死监测</h2>
+      <p class="hint" id="diag5m-headline">正在读取 5 分钟窗口定检与引擎心跳状态…</p>
+    </div>
+    <span class="diag-pill diag-healthy" id="diag5m-badge">读取中…</span>
+  </div>
+
+  <div class="diag5m-grid">
+    <div class="diag5m-card" id="diag5m-card-hb">
+      <span>① 引擎心跳 · 是否卡死</span>
+      <strong id="diag5m-hb-main">—</strong>
+      <small id="diag5m-hb-sub">等待工作线程心跳</small>
+    </div>
+    <div class="diag5m-card" id="diag5m-card-win">
+      <span>② 当前 5m 窗口进度</span>
+      <strong id="diag5m-win-main">—</strong>
+      <small id="diag5m-win-sub">每 5 分钟整点（:00/:05/…）触发定检</small>
+    </div>
+    <div class="diag5m-card" id="diag5m-card-data">
+      <span>③ 行情与 K 线数据对齐</span>
+      <strong id="diag5m-data-main">—</strong>
+      <small id="diag5m-data-sub">核对 BTC / ETH / SOL / BNB 现货与合约</small>
+    </div>
+    <div class="diag5m-card" id="diag5m-card-last">
+      <span>④ 最近已检 5m 窗口结论</span>
+      <strong id="diag5m-last-main">—</strong>
+      <small id="diag5m-last-sub">等待首个窗口定检</small>
+    </div>
+  </div>
+
+  <div class="diag5m-toolbar">
+    <div class="diag5m-filters" id="diag5m-filters">
+      <button type="button" class="flt-btn active" data-filter="ALL" id="flt-all">全部窗口</button>
+      <button type="button" class="flt-btn" data-filter="NO_SIGNAL" id="flt-nosig">🔵 正常无信号</button>
+      <button type="button" class="flt-btn" data-filter="TRADED" id="flt-traded">🟢 已成交</button>
+      <button type="button" class="flt-btn" data-filter="RISK_GUARD" id="flt-risk">🛡️ 风控拦截</button>
+      <button type="button" class="flt-btn" data-filter="DATA_MISMATCH" id="flt-data">🟠 数据对不上</button>
+      <button type="button" class="flt-btn" data-filter="STUCK_OR_ERROR" id="flt-stuck">🔴 卡死/限流/时钟异常</button>
+    </div>
+    <button type="button" class="flt-btn" id="diag5m-expand-btn">展开最近 144 窗 (12h)</button>
+  </div>
+
+  <div class="table-wrap diag5m-table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>5m 窗口时间</th>
+          <th>5m 状态判定</th>
+          <th>开窗完成耗时</th>
+          <th>模拟 / 实盘动作</th>
+          <th>七流定检分数 (|z|/阈值) 与具体原因说明</th>
+        </tr>
+      </thead>
+      <tbody id="diag5m-tbody"></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ==================== TAB 1: 实盘看板 (LIVE) ==================== -->
+<div id="tab-panel-live" class="tab-panel">
+  <div class="banner" id="live-banner">正在读取外部实盘执行器 (C:\Users\liuqi\Order) 状态…</div>
+
+  <section class="cards">
+    <article>
+      <span>链上可用余额 / USDC (pUSD)</span>
+      <strong id="live-free-usdc">—</strong>
+      <small id="live-allowance-note">等待读取钱包快照</small>
+    </article>
+    <article>
+      <span>实盘已用 / 剩余总风险额度</span>
+      <strong id="live-open-risk">—</strong>
+      <small id="live-remaining-quota">—</small>
+    </article>
+    <article>
+      <span>实盘已实现净盈亏</span>
+      <strong id="live-pnl">—</strong>
+      <small id="live-winrate">已结算 0 胜 / 0 负</small>
+    </article>
+    <article>
+      <span>实盘成交 / 信号总数</span>
+      <strong id="live-fills-count">—</strong>
+      <small id="live-latency-note">等待首笔实盘信号</small>
+    </article>
+  </section>
+
+  <div class="split">
+    <section class="panel">
+      <div class="section-title">
+        <h2>实盘风险额度与资金分布</h2>
+        <span id="live-quota-time">—</span>
+      </div>
+      <dl class="status-list">
+        <dt>进行中窗口锁定</dt><dd id="live-lock-active">—</dd>
+        <dt>到期等待官方结算</dt><dd id="live-lock-expired">—</dd>
+        <dt>已赢待 Relayer 赎回</dt><dd id="live-lock-unredeemed">—</dd>
+        <dt>在途预留 (In-Flight)</dt><dd id="live-lock-inflight">—</dd>
+        <dt>当前窗口剩余预算</dt><dd id="live-rem-cohort">—</dd>
+        <dt>实盘缩放规格对照</dt><dd id="live-scaled-caps">—</dd>
+      </dl>
+      <div class="table-wrap" style="margin-top:14px">
+        <table>
+          <thead><tr><th>标的 (Underlying)</th><th>实盘单币上限</th><th>实盘当前剩余可用额度</th></tr></thead>
+          <tbody id="live-underlying-quotas"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-title">
+        <h2>实盘执行器进程与安全状态</h2>
+        <span id="live-pid-badge">—</span>
+      </div>
+      <dl class="status-list">
+        <dt>进程运行状态</dt><dd id="live-proc-status">—</dd>
+        <dt>启动时间</dt><dd id="live-started-at">—</dd>
+        <dt>执行模式 / 订单锁</dt><dd id="live-mode-info">—</dd>
+        <dt>仓位缩放比例</dt><dd id="live-scale-info">—</dd>
+        <dt>Polymarket 代理钱包</dt><dd id="live-wallet-addr" class="mono-addr">—</dd>
+        <dt>提现权限硬锁</dt><dd id="live-withdraw-lock">—</dd>
+        <dt>模拟盘实时镜像</dt><dd id="live-paper-mirror">—</dd>
+      </dl>
+      <p class="hint" style="margin-top:14px">实盘执行器独立运行于 <code>C:\Users\liuqi\Order</code>，通过 50ms 极速只读监听模拟盘信号，本地完成 EIP-712 签名并发送 FAK 买单。</p>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="section-title">
+      <h2>实盘 vs 模拟盘 逐笔下单与成交对比 (live_orders.jsonl)</h2>
+      <span id="live-orders-summary">最近 50 笔记录</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>预测流 / 方向</th>
+            <th>模拟盘基准 (均价 / 股数 / 总额)</th>
+            <th>实盘请求 (限价 / 股数 / 预算)</th>
+            <th>实盘真实成交 (状态 / 均价 / 股数 / 实付)</th>
+            <th>滑点与延迟 (滑点 / 检测 / RTT)</th>
+            <th>仓位状态 / 链上确认</th>
+          </tr>
+        </thead>
+        <tbody id="live-orders-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="section-title">
+      <h2>官方结算与 Relayer 免 Gas 自动赎回流水 (live_settlements.jsonl)</h2>
+      <span id="live-settlements-summary">已累计赎回 $0.00</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>结算时间</th>
+            <th>市场 ID</th>
+            <th>官方结果</th>
+            <th>模拟盘返还</th>
+            <th>实盘应返还</th>
+            <th>实盘已赎回 (USDC)</th>
+            <th>实盘净盈亏</th>
+            <th>Relayer 赎回状态 / Tx Hash</th>
+          </tr>
+        </thead>
+        <tbody id="live-settlements-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="section-title">
+      <h2>实盘后台进程实时日志 (live_executor.stderr.log)</h2>
+      <span>最新 25 行</span>
+    </div>
+    <pre id="live-logs-box" class="log-box">正在读取日志…</pre>
+  </section>
+</div>
+
+<!-- ==================== TAB 2: 模拟盘监控 (MONITOR) ==================== -->
+<div id="tab-panel-monitor" class="tab-panel" hidden>
 <div class="banner" id="connection">正在连接本地账户…</div>
 <section class="cards"><article><span>模拟权益 / USD</span><strong id="equity">—</strong><small id="valuation">等待账户</small></article><article><span>已实现收益</span><strong id="pnl">—</strong><small id="return">—</small></article><article><span>可用现金</span><strong id="cash">—</strong><small id="locked">—</small></article><article><span>已结算胜 / 负</span><strong id="wins">—</strong><small id="winrate">无交易不计算胜率</small></article></section>
 <div class="split"><section class="panel"><div class="section-title"><h2>从现在起的账户曲线</h2><span id="since">—</span></div><svg id="chart" viewBox="0 0 760 200" role="img" aria-label="实际记录的模拟账户权益"></svg><p class="hint" id="chartnote">只显示已保存账户记录，不导入历史回测收益。</p></section><section class="panel"><h2>当前运行状态</h2><div id="blockers"></div><p class="hint" id="lastdecision">等待下一次实时预测</p><dl class="status-list"><dt>行情与市场观察</dt><dd id="observing">—</dd><dt>自动模拟下单</dt><dd id="paperstate">未启动 · 本地模型准备中</dd><dt>真实钱包 / 实盘</dt><dd>未连接 / 关闭</dd><dt>最后观察</dt><dd id="lastcycle">—</dd></dl></section></div>
@@ -12,6 +217,8 @@
 <section class="panel"><div class="section-title"><h2>参考标的行情</h2><span>Binance USDⓈ-M · 不作为预测市场成交或结算价</span></div><div id="quotes" class="quotes"></div></section>
 <section class="panel"><div class="section-title"><h2>模拟成交与单笔收益明细</h2><span id="tradesummary">实时汇总全部模拟订单与官方结算盈亏</span></div><div class="table-wrap"><table><thead><tr><th>序号</th><th>下单时间</th><th>预测流</th><th>方向</th><th>份额</th><th>总成本（含手续费）</th><th>状态</th><th>结算返还</th><th>单笔净收益</th><th>累计净收益（账户净值）</th></tr></thead><tbody id="tradeorders"></tbody></table></div></section>
 <section class="panel"><div class="section-title"><h2>账户流水</h2><span>实际保存的模拟记录</span></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>事件</th><th>内容</th></tr></thead><tbody id="ledger"></tbody></table></div></section>
-<section class="panel"><h2>系统结构与交付边界</h2><div class="architecture"><div class="node done"><b>公开行情与盘口</b><span>只读采集 · 来源与接收时间</span></div><div class="arrow">→</div><div class="node done"><b>七流模型</b><span>本地训练 · 独立 V4 专家</span></div><div class="arrow">→</div><div class="node done"><b>阶梯分配与风控</b><span>优先级 → 容量 → 剩余预算</span></div><div class="arrow">→</div><div class="node done"><b>独立模拟账本</b><span>真实盘口约束 · 虚拟资金</span></div></div><div class="architecture"><div class="node done"><b>本地收益看板</b><span>现金 · 仓位 · 结算 · 审计</span></div><div class="arrow">←</div><div class="node done"><b>官方结算事件</b><span>终局结果 · 逐笔资金核对</span></div><div class="arrow">←</div><div class="node disabled"><b>未来实盘执行器</b><span>未实现 / 未启用</span></div><div class="arrow">←</div><div class="node disabled"><b>独立签名与交易钱包</b><span>未连接 · 主钱包不交给策略</span></div></div></section>
-<footer>状态每 10 秒刷新 · 公共数据约每 60 秒采集 · 主机休眠、断网时明确显示缺口 · 这不是已验证收益承诺</footer>
+<section class="panel"><h2>系统结构与交付边界</h2><div class="architecture"><div class="node done"><b>公开行情与盘口</b><span>只读采集 · 来源与接收时间</span></div><div class="arrow">→</div><div class="node done"><b>七流模型</b><span>本地训练 · 独立 V4 专家</span></div><div class="arrow">→</div><div class="node done"><b>阶梯分配与风控</b><span>优先级 → 容量 → 剩余预算</span></div><div class="arrow">→</div><div class="node done"><b>独立模拟账本</b><span>真实盘口约束 · 虚拟资金</span></div></div><div class="architecture"><div class="node done"><b>本地收益看板</b><span>现金 · 仓位 · 结算 · 审计</span></div><div class="arrow">←</div><div class="node done"><b>官方结算事件</b><span>终局结果 · 逐笔资金核对</span></div><div class="arrow">←</div><div class="node done"><b>外部实盘执行器</b><span>Order 独立进程跟单</span></div><div class="arrow">←</div><div class="node done"><b>独立签名与代理钱包</b><span>本地签名 · 提现硬锁</span></div></div></section>
+</div>
+
+<footer>状态每 5 秒自动刷新 · 模拟盘与外部实盘双轨物理隔离 · 这不是已验证收益承诺</footer>
 </main></body></html>

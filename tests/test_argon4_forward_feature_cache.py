@@ -212,3 +212,25 @@ def test_snapshot_cannot_be_reused_with_different_root_or_cutoff_or_after_close(
     snapshot.close()
     with pytest.raises(reference.ModelInputError, match="already closed"):
         snapshot.build("BTCUSDT")
+
+
+def test_concurrent_three_symbol_builds_are_byte_identical(raw_fixture):
+    from concurrent.futures import ThreadPoolExecutor
+    from threadpoolctl import threadpool_limits
+    root, idx = raw_fixture
+    cutoff = idx[-1] + pd.Timedelta(minutes=5)
+    symbols = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+    with cache.FeatureSnapshot(root, as_of=cutoff) as serial_snap:
+        serial = {s: serial_snap.build(s, tail_rows=1) for s in symbols}
+        assert serial_snap.stats["builds"] == 3
+    modules_before = set(sys.modules)
+    with cache.FeatureSnapshot(root, as_of=cutoff) as conc_snap:
+        with threadpool_limits(limits=1):
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futs = {s: pool.submit(conc_snap.build, s, tail_rows=1) for s in symbols}
+                concurrent = {s: futs[s].result() for s in symbols}
+        assert conc_snap.stats["builds"] == 3
+        assert conc_snap.stats["parquet_decodes"] == 18
+        for s in symbols:
+            _equal(serial[s], concurrent[s])
+    assert not any(n.startswith("argon4_cohort_features_") for n in set(sys.modules) - modules_before)

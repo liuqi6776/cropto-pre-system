@@ -49,18 +49,31 @@ def build_feature_frames_v14(data_root=None, symbol="BTCUSDT", *, as_of=None, ta
 
 
 def load_model_bundle_v14(stream, phase="deployment_q4", *, expected_manifest_sha256=None):
-    if stream in model.STREAMS or model.load_model_bundle is not _ORIGINAL_LOAD_MODEL_BUNDLE:
+    if (stream in model.STREAMS and phase in model.FOLDS) or model.load_model_bundle is not _ORIGINAL_LOAD_MODEL_BUNDLE:
         if phase == "deployment_q4":
             return model.load_model_bundle(stream, expected_manifest_sha256=expected_manifest_sha256)
         return model.load_model_bundle(stream, phase=phase, expected_manifest_sha256=expected_manifest_sha256)
-    if stream not in ALL_STREAMS:
+    if stream not in ALL_STREAMS or not phase or "/" in str(phase) or "\\" in str(phase) or ".." in str(phase):
         raise model.ModelInputError("unknown stream or phase")
     tree = ast.parse(inspect.getsource(_ORIGINAL_LOAD_MODEL_BUNDLE))
     namespace = dict(vars(model))
-    namespace.update(STREAMS=ALL_STREAMS, MODEL_ROOT=model.MODEL_ROOT)
+    namespace.update(STREAMS=ALL_STREAMS, FOLDS={**model.FOLDS, phase: {}}, MODEL_ROOT=model.MODEL_ROOT)
     ast.fix_missing_locations(tree)
     exec(compile(tree, "argon4_v14_load_bundle_adapter", "exec"), namespace)
     return namespace["load_model_bundle"](stream, phase=phase, expected_manifest_sha256=expected_manifest_sha256)
+
+
+def compute_twap60_handicap_bps(twap60_t, spot_close_t, side):
+    """Compute ex-ante Chainlink Start-TWAP handicap in bps relative to predicted direction."""
+    if twap60_t is None or spot_close_t is None:
+        return None
+    tw = float(twap60_t)
+    sp = float(spot_close_t)
+    side_u = str(side or "").upper()
+    if not (np.isfinite(tw) and np.isfinite(sp)) or tw <= 0 or sp <= 0 or side_u not in ("UP", "DOWN"):
+        return None
+    sgn = 1.0 if side_u == "UP" else -1.0
+    return float(((tw - sp) / sp * 10000.0) * sgn)
 
 
 def _resolve_5m_frame(data_root=None, symbol="BTCUSDT", *, as_of=None, snapshot=None, raw_frame=None, min_rows=12):
@@ -236,6 +249,9 @@ def apply_volatility_regime_guard(
     own_ret_1h_pct=None,
     own_ret_15m_bps=None,
     own_streak_3bar=None,
+    spot_twap60_t=None,
+    spot_close_t=None,
+    ex_ante_twap60_handicap_bps=None,
 ):
     """Attach ex_ante_rv12_bps / macro returns and apply volatility, time-segmented blackouts & macro trend guards."""
     res = dict(prediction)
@@ -255,6 +271,14 @@ def apply_volatility_regime_guard(
         res["ex_ante_own_ret_15m_bps"] = float(own_ret_15m_bps)
     if own_streak_3bar is not None:
         res["ex_ante_own_streak_3bar"] = int(own_streak_3bar)
+    if spot_twap60_t is not None:
+        res["ex_ante_spot_twap60_t"] = float(spot_twap60_t)
+    if spot_close_t is not None:
+        res["ex_ante_spot_close_t"] = float(spot_close_t)
+    if ex_ante_twap60_handicap_bps is None and spot_twap60_t is not None and spot_close_t is not None:
+        ex_ante_twap60_handicap_bps = compute_twap60_handicap_bps(spot_twap60_t, spot_close_t, res.get("side"))
+    if ex_ante_twap60_handicap_bps is not None:
+        res["ex_ante_twap60_handicap_bps"] = float(ex_ante_twap60_handicap_bps)
     if not (isinstance(guard_config, dict) and guard_config.get("enabled") is True):
         return res
 
@@ -432,6 +456,25 @@ def apply_volatility_regime_guard(
                     res["selected"] = False
                 return res
 
+    hcap_guard = guard_config.get("twap60_handicap_guard")
+    if isinstance(hcap_guard, dict) and hcap_guard.get("enabled") is True and res.get("selected") is True:
+        max_map = hcap_guard.get("max_handicap_bps")
+        max_hcap = max_map.get(stream) if isinstance(max_map, dict) else None
+        if max_hcap is None:
+            if str(stream).endswith("_5m") and hcap_guard.get("max_5m_handicap_bps") is not None:
+                max_hcap = float(hcap_guard["max_5m_handicap_bps"])
+            elif str(stream).endswith("_15m") and hcap_guard.get("max_15m_handicap_bps") is not None:
+                max_hcap = float(hcap_guard["max_15m_handicap_bps"])
+        if max_hcap is not None and ex_ante_twap60_handicap_bps is not None:
+            if float(ex_ante_twap60_handicap_bps) > float(max_hcap):
+                res["volatility_regime_guarded"] = True
+                res["volatility_regime_reason"] = "TWAP60_START_HANDICAP_GUARD"
+                res["volatility_regime_action"] = action
+                res["twap60_max_handicap_bps"] = float(max_hcap)
+                if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                    res["selected"] = False
+                return res
+
     tiered_cfg = guard_config.get("confidence_tiered_max_buy_price")
     if isinstance(tiered_cfg, dict) and tiered_cfg.get("enabled") is True and res.get("selected") is True:
         side = str(res.get("side", "")).upper()
@@ -495,8 +538,11 @@ def predict_stream_v14(
     own_ret_1h_pct=None,
     own_ret_15m_bps=None,
     own_streak_3bar=None,
+    spot_twap60_t=None,
+    spot_close_t=None,
+    ex_ante_twap60_handicap_bps=None,
 ):
-    if stream in model.STREAMS or model.predict_stream is not _ORIGINAL_PREDICT_STREAM:
+    if (stream in model.STREAMS and phase in model.FOLDS) or model.predict_stream is not _ORIGINAL_PREDICT_STREAM:
         if phase == "deployment_q4":
             res = model.predict_stream(stream, base_frame, v4_frame, decision_time, bundle=bundle)
         else:
@@ -504,7 +550,7 @@ def predict_stream_v14(
     elif stream in ALL_STREAMS:
         tree = ast.parse(inspect.getsource(_ORIGINAL_PREDICT_STREAM))
         namespace = dict(vars(model))
-        namespace.update(STREAMS=ALL_STREAMS, load_model_bundle=load_model_bundle_v14)
+        namespace.update(STREAMS=ALL_STREAMS, FOLDS={**model.FOLDS, phase: {}}, load_model_bundle=load_model_bundle_v14)
         ast.fix_missing_locations(tree)
         exec(compile(tree, "argon4_v14_predict_adapter", "exec"), namespace)
         res = namespace["predict_stream"](stream, base_frame, v4_frame, decision_time, bundle=bundle, phase=phase)
@@ -527,6 +573,9 @@ def predict_stream_v14(
             own_ret_1h_pct,
             own_ret_15m_bps,
             own_streak_3bar,
+            spot_twap60_t,
+            spot_close_t,
+            ex_ante_twap60_handicap_bps,
         )
     ):
         res = apply_volatility_regime_guard(
@@ -542,5 +591,8 @@ def predict_stream_v14(
             own_ret_1h_pct=own_ret_1h_pct,
             own_ret_15m_bps=own_ret_15m_bps,
             own_streak_3bar=own_streak_3bar,
+            spot_twap60_t=spot_twap60_t,
+            spot_close_t=spot_close_t,
+            ex_ante_twap60_handicap_bps=ex_ante_twap60_handicap_bps,
         )
     return res

@@ -1,0 +1,20 @@
+[Unit]
+Description=ARGON-4 Forward Prediction & Paper Engine (Read-Only Local Panel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=liuqi
+Group=liuqi
+WorkingDirectory=/data/crypto-predict_system
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="ARGON4_ORDER_ROOT=/data/Order"
+ExecStart=/data/crypto-predict_system/.venv/bin/python -B -u scripts/argon4_forward_server.py --enable-paper --port 8897 --runtime-dir /data/crypto-predict_system/paper_runtime/argon4_forward_20261105
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

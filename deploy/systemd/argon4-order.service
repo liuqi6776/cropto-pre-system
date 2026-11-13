@@ -1,0 +1,19 @@
+[Unit]
+Description=ARGON-4 External Polymarket Executor (User-Managed Credentials)
+After=network-online.target argon4-forward.service
+Requires=argon4-forward.service
+
+[Service]
+Type=simple
+User=liuqi
+Group=liuqi
+WorkingDirectory=/data/Order
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+ExecStart=/data/Order/.venv/bin/python -B scripts/run_live_executor.py --config /data/Order/config/live_config.json --env-file /data/Order/.env
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
