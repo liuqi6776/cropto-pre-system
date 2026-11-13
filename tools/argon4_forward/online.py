@@ -298,14 +298,21 @@ class PublicInputsHTTP:
     def _save(self, receipt, raw):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._receipt_lock(), sqlite3.connect(self.path, timeout=self._sqlite_timeout()) as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS receipts(id INTEGER PRIMARY KEY, "
-                         "url TEXT NOT NULL, requested_at TEXT NOT NULL, received_at TEXT NOT NULL, "
-                         "sha256 TEXT NOT NULL, http_status INTEGER NOT NULL, raw BLOB NOT NULL)")
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(receipts)")}
-            for name in ("requested_at_local", "received_at_local", "time_basis", "clock_evidence_sha256",
-                         "generation_id", "cohort_id"):
-                if name not in columns:
-                    conn.execute("ALTER TABLE receipts ADD COLUMN " + name + " TEXT")
+            try:
+                st_sig = (str(self.path), self.path.stat().st_ino)
+            except OSError:
+                st_sig = None
+            if st_sig is None or getattr(self, "_verified_receipt_db", None) != st_sig:
+                conn.execute("CREATE TABLE IF NOT EXISTS receipts(id INTEGER PRIMARY KEY, "
+                             "url TEXT NOT NULL, requested_at TEXT NOT NULL, received_at TEXT NOT NULL, "
+                             "sha256 TEXT NOT NULL, http_status INTEGER NOT NULL, raw BLOB NOT NULL)")
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(receipts)")}
+                for name in ("requested_at_local", "received_at_local", "time_basis", "clock_evidence_sha256",
+                             "generation_id", "cohort_id"):
+                    if name not in columns:
+                        conn.execute("ALTER TABLE receipts ADD COLUMN " + name + " TEXT")
+                if st_sig is not None and st_sig[1] != 0:
+                    self._verified_receipt_db = st_sig
             conn.execute("INSERT INTO receipts(url,requested_at,received_at,sha256,http_status,raw,"
                          "requested_at_local,received_at_local,time_basis,clock_evidence_sha256,generation_id,cohort_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                          (receipt["url"], receipt["requested_at"], receipt["received_at"],
@@ -533,6 +540,8 @@ class OnlineInputs:
         self._funding_cache = {}
         self._cached_clock = None
         self._basis_fingerprint = None
+        self._frame_cache = {}
+        self._frame_cache_lock = threading.Lock()
 
     def close(self):
         """Retire workers without waiting on blocked sockets or publications."""
@@ -583,11 +592,21 @@ class OnlineInputs:
         temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
             frame.to_parquet(temporary, index=index)
+            raw_written = temporary.read_bytes()
+            digest = hashlib.sha256(raw_written).hexdigest()
+            cached_copy = frame.copy()
+            if not cached_copy.empty:
+                if "receipt_time_basis" not in cached_copy:
+                    cached_copy["receipt_time_basis"] = "SYSTEM_UTC"
+                if "clock_evidence_sha256" not in cached_copy:
+                    cached_copy["clock_evidence_sha256"] = None
             # Generation verification and the actual replace are one atomic
             # publication gate. A retired worker cannot overwrite a new view.
             with self._publication_lock:
                 self._guard_generation()
                 temporary.replace(path)
+                with self._frame_cache_lock:
+                    self._frame_cache[str(path.resolve())] = (digest, cached_copy)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -602,14 +621,30 @@ class OnlineInputs:
             name = f"{symbol}_{interval}_{kind}.parquet"
         return self.data_root / ("intraday" if interval == "5m" else "auxiliary") / name
 
-    def _read(self, path):
+    def _read_with_digest(self, path):
         self._guard_generation()
-        frame = pd.read_parquet(path) if path.exists() else pd.DataFrame()
+        if not path.exists():
+            return pd.DataFrame(), None
+        raw = path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        key = str(path.resolve())
+        with self._frame_cache_lock:
+            hit = self._frame_cache.get(key)
+            if hit is not None and hit[0] == digest:
+                return hit[1].copy(), digest
+        import io
+        frame = pd.read_parquet(io.BytesIO(raw))
         if not frame.empty:
             if "receipt_time_basis" not in frame:
                 frame["receipt_time_basis"] = "SYSTEM_UTC"
             if "clock_evidence_sha256" not in frame:
                 frame["clock_evidence_sha256"] = None
+        with self._frame_cache_lock:
+            self._frame_cache[key] = (digest, frame.copy())
+        return frame, digest
+
+    def _read(self, path):
+        frame, _ = self._read_with_digest(path)
         return frame
 
     def _receipt_fields(self, receipt):
@@ -811,10 +846,23 @@ class OnlineInputs:
         return merged
 
     def _basis(self):
+        path = self._path("basis")
+        leg_frames = {}
+        leg_digests = []
+        for symbol in BASIS_SYMBOLS:
+            fut_df, fut_sha = self._read_with_digest(self._path("futures", symbol, "4h"))
+            spot_df, spot_sha = self._read_with_digest(self._path("spot", symbol, "4h"))
+            leg_frames[symbol] = (fut_df, spot_df)
+            leg_digests.append((symbol, fut_sha, spot_sha))
+        basis_old, basis_sha = self._read_with_digest(path)
+        fp = (tuple(leg_digests), basis_sha)
+        if basis_sha is not None and not basis_old.empty and self._basis_fingerprint == fp:
+            return
         parts, receipts, bases, calibrations = [], [], [], []
         for symbol in BASIS_SYMBOLS:
-            futures = self._read(self._path("futures", symbol, "4h")).set_index("date")
-            spot = self._read(self._path("spot", symbol, "4h")).set_index("date")
+            fut_raw, spot_raw = leg_frames[symbol]
+            futures = fut_raw.set_index("date")
+            spot = spot_raw.set_index("date")
             if not futures.index.equals(spot.index):
                 raise ValueError("BASIS_LEG_COVERAGE_MISMATCH")
             parts.append(((futures.close - spot.close) / spot.close).rename(symbol))
@@ -825,14 +873,20 @@ class OnlineInputs:
         if frame.isna().any().any():
             raise ValueError("BASIS_SYMBOL_COVERAGE_MISMATCH")
         frame["first_received_at"] = pd.concat(receipts, axis=1).max(axis=1)
-        frame["receipt_time_basis"] = pd.concat(bases, axis=1).apply(
-            lambda row: row.iloc[0] if row.nunique() == 1 else "MIXED_RECEIPT_CLOCKS", axis=1)
-        frame["clock_evidence_sha256"] = pd.concat(calibrations, axis=1).apply(
-            lambda row: row.iloc[0] if row.notna().all() and row.nunique() == 1 else None, axis=1)
+        bases_df = pd.concat(bases, axis=1)
+        b_arr = bases_df.to_numpy(dtype=object)
+        same_basis = (b_arr == b_arr[:, :1]).all(axis=1)
+        frame["receipt_time_basis"] = np.where(same_basis, b_arr[:, 0], "MIXED_RECEIPT_CLOCKS")
+        cal_df = pd.concat(calibrations, axis=1)
+        c_arr = cal_df.to_numpy(dtype=object)
+        not_na = cal_df.notna().to_numpy().all(axis=1)
+        same_cal = not_na & (c_arr == c_arr[:, :1]).all(axis=1)
+        frame["clock_evidence_sha256"] = np.where(same_cal, c_arr[:, 0], None)
         frame.index.name = "date"
         # The legacy basis reader requires an open-time DatetimeIndex.
-        path = self._path("basis")
         self._publish_frame(frame, path, index=True)
+        _, new_basis_sha = self._read_with_digest(path)
+        self._basis_fingerprint = (tuple(leg_digests), new_basis_sha)
 
     def _check_clock(self):
         errors = []
@@ -853,10 +907,16 @@ class OnlineInputs:
         return {"status": "UNAVAILABLE", "errors": errors, "skew_seconds": None}
 
     def _dvol(self, cutoff):
-        old = self._read(self._path("dvol"))
+        dvol_path = self._path("dvol")
+        old, old_sha = self._read_with_digest(dvol_path)
+        expected_last = (cutoff - pd.Timedelta(minutes=5)).floor("D") - STEPS["1D"]
+        if (old_sha is not None and not old.empty
+                and all(self._closed_cache_complete(old[old.symbol == s], "bucket_utc", STEPS["1D"], expected_last, min_rows=10)
+                        for s in ("BTC", "ETH"))):
+            return
         parts = [self._dvol_one(s, cutoff, old[old.symbol == s] if not old.empty else old)
                  for s in ("BTC", "ETH")]
-        self._publish_frame(pd.concat(parts, ignore_index=True), self._path("dvol"))
+        self._publish_frame(pd.concat(parts, ignore_index=True), dvol_path)
 
     def _blocked(self, cutoff, reason, *, generation=None, cohort_id=None):
         return {"status": "BLOCKED", "mode": "PUBLIC_INPUTS_ONLY", "data_root": str(self.data_root),
@@ -1154,8 +1214,8 @@ class OnlineInputs:
                         "source_doc": DVOL_DOC if symbol else SPOT_DOC if ":spot:" in name else BINANCE_DOC}
                 sources[name] = info
                 try:
-                    frame = self._read(path)
-                    if frame.empty:
+                    frame, file_digest = self._read_with_digest(path)
+                    if frame.empty or file_digest is None:
                         raise ValueError("SOURCE_ABSENT")
                     if key not in frame and frame.index.name == key:
                         frame = frame.reset_index()
@@ -1178,7 +1238,7 @@ class OnlineInputs:
                     info.update(rows=len(frame), first_open=_iso(dates[0]), latest_closed=_iso(latest),
                                 first_received_at=_iso(first_received), latest_received_at=_iso(last_received),
                                 age_seconds=(now - latest).total_seconds(),
-                                sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+                                sha256=file_digest)
                     info["receipt_time_bases"] = sorted(frame.receipt_time_basis.dropna().unique().tolist())
                     check = self.state.get("checks", {}).get(name)
                     if check and _utc(check["received_at"]) <= now:

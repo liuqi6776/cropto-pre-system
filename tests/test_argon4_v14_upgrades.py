@@ -1613,9 +1613,9 @@ def test_v14r12_audit_remediations_bleed_cap_stream_max_order_1h_retry_and_fast_
     eng = engineering_profile(policy)
     assert eng["enabled"] is True
     assert policy["input_http_min_spacing_seconds"] == pytest.approx(0.05)
-    assert policy["min_decision_delay_seconds"] == pytest.approx(1.8)
+    assert policy["min_decision_delay_seconds"] == pytest.approx(1.1)
     assert eng["window_poll_interval_seconds"] == pytest.approx(0.1)
-    assert eng["minimum_decision_delay_seconds"] == pytest.approx(1.8)
+    assert eng["minimum_decision_delay_seconds"] == pytest.approx(1.1)
     assert eng["input_deadline_after_boundary_seconds"] == pytest.approx(16.5)
     assert eng["input_ready_retry_interval_seconds"] == pytest.approx(0.15)
     assert eng["prefetch_lead_seconds"] == pytest.approx(9.5)
@@ -2682,7 +2682,7 @@ def test_v14r18_precision_guards_nyse_holiday_and_policy_hygiene():
         return seen
 
     policy = json.loads(raw_policy_text, object_pairs_hook=_reject_dup_keys)
-    assert policy["min_decision_delay_seconds"] == pytest.approx(1.8)
+    assert policy["min_decision_delay_seconds"] == pytest.approx(1.1)
     vg = policy["volatility_regime_guard"]
     assert vg["max_rv12_bps"]["SOL_15m"] == pytest.approx(42.0)
     assert vg["max_rv12_bps"]["SOL_5m"] == pytest.approx(42.0)
@@ -2755,6 +2755,72 @@ def test_v14r18_precision_guards_nyse_holiday_and_policy_hygiene():
         "BTC_5m", base_pred, ex_ante_rv12_bps=3.5, guard_config=vg, cohort_time="2026-11-24T18:05:00+00:00"
     )
     assert norm_tue_5m["selected"] is True
+
+
+def test_v14r19_sub4s_latency_online_sha256_cache_transport_pool_and_live_config(tmp_path, monkeypatch):
+    """Verify v14r19 latency optimizations:
+    1. OnlineInputs._read_with_digest caches parsed DataFrames by SHA256 (0 redundant PyArrow decodes on unchanged bytes,
+       immediate invalidation when bytes change on disk).
+    2. ForwardPipeline uses PublicPolymarketTransport(pool_size=4) for parallel multi-stream CLOB/Gamma fetches.
+    3. Order/config/live_config.json sets poll_interval_ms=15 and fresh_observed_book_max_age_seconds=2.5.
+    """
+    from types import SimpleNamespace
+    from tools.argon4_forward import online, pipeline
+
+    live_cfg_path = next(
+        (cand for cand in (Path("Order/config/live_config.json"), Path("../Order/config/live_config.json")) if cand.is_file()),
+        None,
+    )
+    assert live_cfg_path is not None
+    live_cfg = json.loads(live_cfg_path.read_text(encoding="utf-8"))
+    assert live_cfg["upstream"]["poll_interval_ms"] == 15
+    assert live_cfg["order_execution"]["fresh_observed_book_max_age_seconds"] == pytest.approx(2.5)
+
+    p = pipeline.ForwardPipeline(None, tmp_path / "rt_pool", SimpleNamespace(save=lambda *a, **k: None))
+    try:
+        assert p.public_transport.pool_size == 4
+    finally:
+        p.close()
+
+    inp = online.OnlineInputs(tmp_path / "rt_cache")
+    try:
+        pq = tmp_path / "rt_cache/features/raw_data/intraday/BTCUSDT_5m_futures.parquet"
+        pq.parent.mkdir(parents=True, exist_ok=True)
+        df1 = pd.DataFrame(
+            {
+                "date": pd.date_range("2026-11-13T00:00:00Z", periods=3, freq="5min"),
+                "open": [100.0, 101.0, 102.0],
+                "high": [101.0, 102.0, 103.0],
+                "low": [99.0, 100.0, 101.0],
+                "close": [100.5, 101.5, 102.5],
+                "volume": [10.0, 11.0, 12.0],
+            }
+        )
+        df1.to_parquet(pq, index=False)
+
+        decode_calls = []
+        orig_read_pq = pd.read_parquet
+        monkeypatch.setattr(pd, "read_parquet", lambda *a, **kw: (decode_calls.append(1), orig_read_pq(*a, **kw))[1])
+
+        f_a, sha_a = inp._read_with_digest(pq)
+        assert len(decode_calls) == 1
+        assert len(f_a) == 3
+
+        # Second read on unchanged bytes hits SHA256 cache -> 0 new pd.read_parquet decodes!
+        f_b, sha_b = inp._read_with_digest(pq)
+        assert len(decode_calls) == 1
+        assert sha_b == sha_a
+        pd.testing.assert_frame_equal(f_a, f_b)
+
+        # Mutating file on disk changes SHA256 -> cache immediately invalidates and re-decodes!
+        df2 = df1.iloc[:2].copy()
+        df2.to_parquet(pq, index=False)
+        f_c, sha_c = inp._read_with_digest(pq)
+        assert len(decode_calls) == 2
+        assert sha_c != sha_a
+        assert len(f_c) == 2
+    finally:
+        inp.close()
 
 
 

@@ -15,7 +15,7 @@
     "policy_path": "/data/crypto-predict_system/config/argon4_forward_policy.json",
     "http_base_url": "http://127.0.0.1:8897",
     "required_host_header": "127.0.0.1:8897",
-    "poll_interval_ms": 50,
+    "poll_interval_ms": 15,
     "settlement_poll_interval_seconds": 15.0,
     "token_cache_prewarm_interval_seconds": 60.0
   },
@@ -47,7 +47,7 @@
     "neg_risk": false,
     "min_order_shares": 0.01,
     "hard_deadline_after_cohort_seconds": 20.0,
-    "fresh_observed_book_max_age_seconds": 1.5,
+    "fresh_observed_book_max_age_seconds": 2.5,
     "fak_no_match_max_retries": 2,
     "fak_no_match_retry_interval_seconds": 1.2,
     "fak_no_match_min_remaining_seconds": 1.8,

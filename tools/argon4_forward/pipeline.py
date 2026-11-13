@@ -163,9 +163,9 @@ class ForwardPipeline:
         from .storage_janitor import StorageJanitor
         self.janitor = StorageJanitor(self.runtime, monitor_log=self.monitor_log)
         from .polymarket_transport import PublicPolymarketTransport
-        # Clock calibration keeps this CLOB connection warm without additional
-        # requests. Background discovery has its own bounded connection pool.
-        self.public_transport = PublicPolymarketTransport(pool_size=1)
+        # Keep up to four persistent CLOB/Gamma TLS sessions warm for parallel
+        # multi-stream book & market refreshes. Background discovery uses its own pool.
+        self.public_transport = PublicPolymarketTransport(pool_size=4)
 
     def finish_timing(self, status, error=None):
         timing = self._pending_timing
@@ -1168,15 +1168,60 @@ class ForwardPipeline:
             raise ValueError("EXECUTION_CLOCK_CHANGED")
         return calibrated_now(clock)
 
-    def execute_prepared(self, policy, inputs, models, cohort, decisions, clock, prior_fills=None):
+    def execute_prepared(self, policy, inputs, models, cohort, decisions, clock, prior_fills=None, prefetched_markets=None):
         """Reuse the exact score and clock within one live cohort; never rescore."""
         from .execution import PaperExecutor
         started = time.perf_counter()
+        markets_snap = self.observations.latest("polymarket")
+        if prefetched_markets:
+            base_streams = dict((markets_snap or {}).get("streams") or {}) if isinstance(markets_snap, dict) else {}
+            for st_key, mkt_val in prefetched_markets.items():
+                base_streams[st_key] = {"status": "VERIFIED_MARKET", "current": mkt_val, "next": None, "errors": []}
+            markets_snap = {**(markets_snap if isinstance(markets_snap, dict) else {}), "streams": base_streams}
+
+        prefetched_books = {}
+        is_v5 = policy.get("waterfall_semantics") == "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1"
+        if is_v5 and not prior_fills and isinstance(markets_snap, dict):
+            sig_book_jobs = []
+            for st_name in policy.get("order", ()):
+                dec_obj = decisions.get(st_name)
+                if not (isinstance(dec_obj, dict) and dec_obj.get("status") == "SIGNAL"):
+                    continue
+                sig_obj = dec_obj.get("signal") or {}
+                side = sig_obj.get("outcome")
+                try:
+                    mkt_obj = PaperExecutor._market(markets_snap, st_name, cohort)
+                except Exception:
+                    mkt_obj = None
+                if isinstance(mkt_obj, dict) and side in (mkt_obj.get("outcome_ids") or {}):
+                    key = (mkt_obj["market_id"], side)
+                    if key not in {j[0] for j in sig_book_jobs}:
+                        sig_book_jobs.append((key, mkt_obj, side))
+            if len(sig_book_jobs) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+
+                def _fetch_one_book(job):
+                    k_pair, m_obj, sd = job
+                    return k_pair, self.refresh_book(m_obj, sd)
+
+                try:
+                    with ThreadPoolExecutor(max_workers=min(4, len(sig_book_jobs)), thread_name_prefix="argon4-book") as bpool:
+                        for k_pair, b_val in bpool.map(_fetch_one_book, sig_book_jobs):
+                            prefetched_books[k_pair] = b_val
+                except Exception:
+                    prefetched_books.clear()
+
+        def _fast_book_refresh(market, outcome):
+            hit = prefetched_books.pop((market.get("market_id"), outcome), None)
+            if hit is not None:
+                return hit
+            return self.refresh_book(market, outcome)
+
         with self.monitor_log.phase("pipeline", "execute_priority_waterfall",
                                     cohort=cohort.isoformat(), slow_warn_seconds=5.0):
             outcome = PaperExecutor(self.account, policy).process_cohort(
-                cohort.isoformat(), decisions, self.observations.latest("polymarket"),
-                now=lambda: self.execution_now(clock), book_refresh=self.refresh_book,
+                cohort.isoformat(), decisions, markets_snap,
+                now=lambda: self.execution_now(clock), book_refresh=_fast_book_refresh,
                 clock=clock, market_refresh=self.refresh_market)
         self._pending_timing["execution_seconds"] = self._pending_timing.get("execution_seconds", 0)+time.perf_counter()-started
         self._pending_timing["execution_passes"] = self._pending_timing.get("execution_passes", 0)+1
@@ -1187,11 +1232,7 @@ class ForwardPipeline:
         outcome["fills"] = list(fills.values())
         if outcome["status"] == "BLOCKED" and fills:
             outcome["status"] = "PARTIAL_BLOCKED"
-        self.observations.save("paper_execution", {
-            "cohort": cohort.isoformat(), "policy_version": policy["version"],
-            "waterfall_semantics": policy.get("waterfall_semantics", "LEGACY_CAPACITY_GATE"),
-            "clock_evidence_sha256": clock["receipt_sha256"],
-            "completed_at": calibrated_now(clock).isoformat(), "result": outcome})
+        completed_iso = calibrated_now(clock).isoformat()
         waiting = outcome.get("status") == "WAITING_PRICE_RECHECK"
         if waiting:
             self._pending_execution = deepcopy({"policy": policy, "inputs": inputs, "models": models,
@@ -1206,12 +1247,19 @@ class ForwardPipeline:
                 self._same_cohort_revision["completed"] = True
             timing = self.finish_timing(outcome.get("status", "COMPLETE"))
         self._last_logged_block_key = None
-        self.monitor_log.log_cohort_execution(cohort.isoformat(), policy, decisions, outcome, timing)
+        # Publish pipeline_state.json FIRST so external live Order executor wakes up
+        # within ~7.5ms while SQLite observation & audit logs flush afterwards.
         self.publish(status="PAPER_WAITING_PRICE_RECHECK" if waiting else "PAPER_CYCLE_COMPLETE",
             active=True, reason="当前优先流价格未达限价，等待本窗口内重检；下层暂不占预算" if waiting else None,
             models=models, inputs=inputs, revision=None, decisions=decisions,
             last_cohort=cohort.isoformat(), last_attempt_cohort=cohort.isoformat(),
             execution=outcome, timing=timing)
+        self.observations.save("paper_execution", {
+            "cohort": cohort.isoformat(), "policy_version": policy["version"],
+            "waterfall_semantics": policy.get("waterfall_semantics", "LEGACY_CAPACITY_GATE"),
+            "clock_evidence_sha256": clock["receipt_sha256"],
+            "completed_at": completed_iso, "result": outcome})
+        self.monitor_log.log_cohort_execution(cohort.isoformat(), policy, decisions, outcome, timing)
 
     def resume_prepared(self, policy):
         pending = self._pending_execution
@@ -1581,16 +1629,66 @@ class ForwardPipeline:
                                     cohort=cohort.isoformat(), slow_warn_seconds=5.0):
             decisions = self.prepare_decisions(policy, inputs, cohort)
         self._pending_timing["decisions_seconds"] = time.perf_counter()-started
-        self.observations.save("prediction_decisions", {"cohort": cohort.isoformat(), "decisions": decisions})
-        # The observation worker discovers current AND next contracts. Reuse its
-        # identity/fee evidence within the executor's 90-second metadata limit;
-        # refresh executable books immediately through the isolated callback.
-        started = time.perf_counter()
-        if self.stop.wait(2*self.clock["uncertainty_seconds"]+.01):
-            self.finish_timing("STOPPED_BEFORE_EXECUTION")
+        is_v5 = policy.get("waterfall_semantics") == "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1"
+        if not is_v5:
+            self.observations.save("prediction_decisions", {"cohort": cohort.isoformat(), "decisions": decisions})
+            started = time.perf_counter()
+            if self.stop.wait(2*self.clock["uncertainty_seconds"]+.01):
+                self.finish_timing("STOPPED_BEFORE_EXECUTION")
+                return
+            self._pending_timing["causal_wait_seconds"] = time.perf_counter()-started
+            self.execute_prepared(policy, inputs, models, cohort, decisions, dict(self.clock))
             return
-        self._pending_timing["causal_wait_seconds"] = time.perf_counter()-started
-        self.execute_prepared(policy, inputs, models, cohort, decisions, dict(self.clock))
+
+        causal_started = time.perf_counter()
+        self.observations.save("prediction_decisions", {"cohort": cohort.isoformat(), "decisions": decisions})
+        signal_streams = [
+            st_k for st_k in policy.get("order", ())
+            if isinstance(decisions.get(st_k), dict) and decisions[st_k].get("status") == "SIGNAL"
+        ]
+        prefetched_markets = {}
+        if len(signal_streams) > 1:
+            from .execution import PaperExecutor
+            obs_mkts = self.observations.latest("polymarket")
+            now_chk = calibrated_now(self.clock)
+            missing_mkts = []
+            for st_k in signal_streams:
+                try:
+                    m_cur = PaperExecutor._market(obs_mkts or {}, st_k, cohort)
+                    meta_at = PaperExecutor._received_upper(
+                        m_cur.get("metadata_received_at_local", m_cur.get("metadata_received_at")), self.clock
+                    )
+                    if (now_chk - meta_at).total_seconds() > 90:
+                        missing_mkts.append(st_k)
+                except Exception:
+                    missing_mkts.append(st_k)
+            if len(missing_mkts) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+
+                def _refresh_one_mkt(st_name):
+                    return st_name, self.refresh_market(st_name, cohort)
+
+                try:
+                    with ThreadPoolExecutor(max_workers=min(4, len(missing_mkts)), thread_name_prefix="argon4-mkt") as mpool:
+                        for st_name, m_val in mpool.map(_refresh_one_mkt, missing_mkts):
+                            prefetched_markets[st_name] = m_val
+                except Exception:
+                    prefetched_markets.clear()
+        if signal_streams:
+            max_dec_at = max(
+                datetime.fromisoformat(decisions[st_k]["signal"]["decision_at"].replace("Z", "+00:00"))
+                for st_k in signal_streams
+            )
+            causal_target_utc = max_dec_at + timedelta(seconds=2 * float(self.clock["uncertainty_seconds"]) + 0.01)
+            rem_causal = (causal_target_utc - calibrated_now(self.clock)).total_seconds()
+            if rem_causal > 0 and self.stop.wait(rem_causal):
+                self.finish_timing("STOPPED_BEFORE_EXECUTION")
+                return
+        self._pending_timing["causal_wait_seconds"] = time.perf_counter()-causal_started
+        self.execute_prepared(
+            policy, inputs, models, cohort, decisions, dict(self.clock),
+            prefetched_markets=prefetched_markets or None,
+        )
 
     def worker(self):
         self.monitor_log.start_watchdog()

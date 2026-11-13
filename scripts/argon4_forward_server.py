@@ -1077,10 +1077,33 @@ class Application:
 
     def worker(self, interval):
         self.monitor_log.start_watchdog()
+        last_prewarm_bucket = None
         try:
             while not self.stop.is_set():
+                if self.pipeline is not None:
+                    elapsed = datetime.now(timezone.utc).timestamp() % 300.0
+                    # Yield during [-4s, +19s] around 5m trading boundaries to eliminate SQLite & network contention
+                    if elapsed >= 296.0 or elapsed <= 19.0:
+                        wait_s = (300.0 - elapsed + 19.2) if elapsed >= 296.0 else (19.2 - elapsed)
+                        if self.stop.wait(min(max(0.2, wait_s), float(interval))):
+                            break
+                        continue
                 self.cycle()
-                self.stop.wait(interval)
+                if self.pipeline is not None:
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    cur_bucket = int(now_ts // 300)
+                    elapsed = now_ts % 300.0
+                    if elapsed < 276.0:
+                        until_prewarm = 276.0 - elapsed
+                        sleep_s = min(float(interval), until_prewarm)
+                    elif last_prewarm_bucket != cur_bucket and elapsed <= 290.0:
+                        last_prewarm_bucket = cur_bucket
+                        continue
+                    else:
+                        sleep_s = min(float(interval), max(1.0, 300.0 - elapsed + 19.5))
+                    self.stop.wait(sleep_s)
+                else:
+                    self.stop.wait(interval)
         finally:
             self.monitor_log.close()
             self.market_transport.close()
