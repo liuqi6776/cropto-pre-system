@@ -14,7 +14,7 @@
     "BNB_15m"
   ],
   "allocation_policy": "RANKED_CAPACITY_WATERFALL",
-  "capacity_policy": "Fresh verified signal-side executable ask depth within 0.515; explicit valid no-signal/not-due or verified price-limit failures skip; missing/stale/invalid evidence blocks",
+  "capacity_policy": "Fresh verified signal-side executable ask depth within 0.485; explicit valid no-signal/not-due or verified price-limit failures skip; missing/stale/invalid evidence blocks",
   "unlock_policy": "Next eligible rank is released only after actual paper fills reach the current rank approved risk-capped budget; verified skips consume no budget",
   "execution_policy": "Persist each stream skip, approved target, observed depth and actual fill; partial or unfilled approved targets block lower ranks; never replay old cohorts",
   "initial_capital_usd": 1269,
@@ -26,15 +26,15 @@
   "max_open_risk_usd": 650,
   "max_underlying_active_risk_usd": 300,
   "max_underlying_open_risk_usd": 450,
-  "max_buy_price": 0.515,
-  "min_buy_price": 0.415,
+  "max_buy_price": 0.485,
+  "min_buy_price": 0.445,
   "stream_min_buy_price": {
-    "BTC_5m": 0.425,
-    "ETH_5m": 0.425,
-    "SOL_5m": 0.425,
-    "BTC_15m": 0.415,
-    "ETH_15m": 0.415,
-    "SOL_15m": 0.415
+    "BTC_5m": 0.445,
+    "ETH_5m": 0.445,
+    "SOL_5m": 0.445,
+    "BTC_15m": 0.445,
+    "ETH_15m": 0.445,
+    "SOL_15m": 0.445
   },
   "stream_max_order_usd": {
     "BTC_15m": 240,
@@ -266,13 +266,13 @@
       }
     ]
   },
-  "min_decision_delay_seconds": 2.3,
+  "min_decision_delay_seconds": 0.8,
   "input_http_min_spacing_seconds": 0.05,
   "engineering": {
     "enabled": true,
     "profile": "argon4-latency-v12",
     "window_poll_interval_seconds": 0.1,
-    "minimum_decision_delay_seconds": 2.3,
+    "minimum_decision_delay_seconds": 0.8,
     "input_deadline_after_boundary_seconds": 16.5,
     "input_ready_retry_interval_seconds": 0.15,
     "auxiliary_prefetch": true,
@@ -283,7 +283,7 @@
     "telemetry_sampling_profile": "clock_center_v12"
   },
   "execution": {
-    "multi_look_ioc": true,
+    "multi_look_ioc": false,
     "max_price_rechecks": 3,
     "price_recheck_interval_seconds": 2.5,
     "minimum_recheck_remaining_seconds": 3.0,
@@ -370,7 +370,7 @@
       "enabled": true,
       "timezone": "America/New_York",
       "local_start_minute": 570,
-      "local_end_minute": 660,
+      "local_end_minute": 720,
       "weekdays_only": true,
       "skip_streams": [
         "BTC_15m",
@@ -382,7 +382,7 @@
       ]
     },
     "us_close_blackout": {
-      "enabled": true,
+      "enabled": false,
       "timezone": "America/New_York",
       "local_start_minute": 900,
       "local_end_minute": 960,
@@ -463,7 +463,7 @@
       "max_5m_handicap_bps": 1.0,
       "max_15m_handicap_bps": 2.0,
       "timeout_seconds": 1.2,
-      "on_unavailable": "PASS_WITH_WARNING"
+      "on_unavailable": "FAIL_CLOSED"
     },
     "action": "SKIP_OR_HALF_STAKE"
   },

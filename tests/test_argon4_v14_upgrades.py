@@ -10,6 +10,7 @@ import time
 import pandas as pd
 import pytest
 
+from test_argon4_forward_model import raw_fixture
 from test_argon4_forward_revisions import NEW, NOW, _add_receipt, _error, no_network, runtime
 from tools.argon4_forward import (
     account,
@@ -346,9 +347,9 @@ def test_correction3_revision_archive_hash_cache_and_observations_hardlink(runti
 
 
 def test_correction5_and_6_production_policy_preserves_verified_v13r2_parameters():
-    """Correction 5 & 6: production policy keeps verified v13r2 execution parameters and fastpath profile."""
+    """Correction 5 & 6: production policy keeps verified execution parameters and fastpath profile."""
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["max_buy_price"] == 0.515
+    assert policy["max_buy_price"] == 0.485
     assert "high_confidence_max_buy_price" not in policy
     assert "high_confidence_thresholds" not in policy
     assert "partial_fill_remainder_cascade" not in policy
@@ -727,7 +728,7 @@ def test_v14r4_snapshots_only_large_observations_hardlink_chained_delta_and_acti
 
     # Verify production policy has both empirical guards enabled and MonitorAuditLogger formats both
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == 0.415
+    assert policy["min_buy_price"] == 0.445
     assert policy["volatility_regime_guard"]["enabled"] is True
     assert policy["volatility_regime_guard"]["min_rv12_bps"]["BTC_5m"] == 3.0
 
@@ -776,8 +777,9 @@ def test_v14r5_multilevel_orderbook_adverse_selection_guard_and_immediate_skip_w
     from tools.argon4_forward.execution import PaperExecutor
 
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == 0.415
-    assert policy["execution"]["multi_look_ioc"] is True
+    assert policy["min_buy_price"] == 0.445
+    assert policy["max_buy_price"] == 0.485
+    assert policy["execution"]["multi_look_ioc"] is False
 
     market_btc = {
         "status": "VERIFIED_MARKET",
@@ -1436,18 +1438,18 @@ def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_p
     """
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
     assert policy["stream_min_buy_price"] == {
-        "BTC_5m": 0.425,
-        "ETH_5m": 0.425,
-        "SOL_5m": 0.425,
-        "BTC_15m": 0.415,
-        "ETH_15m": 0.415,
-        "SOL_15m": 0.415,
+        "BTC_5m": 0.445,
+        "ETH_5m": 0.445,
+        "SOL_5m": 0.445,
+        "BTC_15m": 0.445,
+        "ETH_15m": 0.445,
+        "SOL_15m": 0.445,
     }
     vg = policy["volatility_regime_guard"]
     assert vg["us_open_blackout"]["enabled"] is True
     assert vg["us_open_blackout"]["timezone"] == "America/New_York"
     assert vg["us_open_blackout"]["local_start_minute"] == 570
-    assert vg["us_open_blackout"]["local_end_minute"] == 660
+    assert vg["us_open_blackout"]["local_end_minute"] == 720
     assert vg["us_open_blackout"]["weekdays_only"] is True
     assert set(vg["us_open_blackout"]["skip_streams"]) == {
         "BTC_15m",
@@ -1512,13 +1514,25 @@ def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_p
     )
     assert res_eth_sun["selected"] is True
 
-    # Weekday 16:00 UTC (minute=960, end of 90m blackout): ETH_5m resumes!
-    res_eth_after = model_v14.apply_volatility_regime_guard(
+    # Weekday 16:00 UTC (11:00 EST) remains blocked inside extended 09:30-12:00 ET window; 17:00 UTC (12:00 EST) resumes!
+    res_eth_11et = model_v14.apply_volatility_regime_guard(
         "ETH_5m",
         base_pred,
         ex_ante_rv12_bps=10.0,
         guard_config=vg,
         cohort_time="2026-11-09T16:00:00+00:00",
+        btc_ret_1h_pct=0.45,
+        btc_ret_4h_pct=0.80,
+    )
+    assert res_eth_11et["selected"] is False
+    assert res_eth_11et["volatility_regime_reason"] == "US_OPEN_BLACKOUT"
+
+    res_eth_after = model_v14.apply_volatility_regime_guard(
+        "ETH_5m",
+        base_pred,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-09T17:00:00+00:00",
         btc_ret_1h_pct=0.45,
         btc_ret_4h_pct=0.80,
     )
@@ -1599,9 +1613,9 @@ def test_v14r12_audit_remediations_bleed_cap_stream_max_order_1h_retry_and_fast_
     from tools.argon4_forward.runtime_profile import engineering_profile
 
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == pytest.approx(0.415)
-    assert policy["stream_min_buy_price"]["BTC_15m"] == pytest.approx(0.415)
-    assert policy["stream_min_buy_price"]["SOL_15m"] == pytest.approx(0.415)
+    assert policy["min_buy_price"] == pytest.approx(0.445)
+    assert policy["stream_min_buy_price"]["BTC_15m"] == pytest.approx(0.445)
+    assert policy["stream_min_buy_price"]["SOL_15m"] == pytest.approx(0.445)
     assert policy["stream_max_order_usd"] == {
         "BTC_15m": 240,
         "BTC_5m": 220,
@@ -1613,9 +1627,9 @@ def test_v14r12_audit_remediations_bleed_cap_stream_max_order_1h_retry_and_fast_
     eng = engineering_profile(policy)
     assert eng["enabled"] is True
     assert policy["input_http_min_spacing_seconds"] == pytest.approx(0.05)
-    assert policy["min_decision_delay_seconds"] == pytest.approx(2.3)
+    assert policy["min_decision_delay_seconds"] == pytest.approx(0.8)
     assert eng["window_poll_interval_seconds"] == pytest.approx(0.1)
-    assert eng["minimum_decision_delay_seconds"] == pytest.approx(2.3)
+    assert eng["minimum_decision_delay_seconds"] == pytest.approx(0.8)
     assert eng["input_deadline_after_boundary_seconds"] == pytest.approx(16.5)
     assert eng["input_ready_retry_interval_seconds"] == pytest.approx(0.15)
     assert eng["prefetch_lead_seconds"] == pytest.approx(9.5)
@@ -1883,13 +1897,13 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         "z_v4": 1.5944,
         "threshold_frozen": 1.5204,
     }
-    # Under production v14r15 black-swan thresholds, normal oversold bounce (-2.18% 1h / -163.2 bps 15m) outside US Open is preserved
+    # Under production black-swan thresholds, normal oversold bounce (-2.18% 1h / -163.2 bps 15m) at 12:10 EST (17:10 UTC) is preserved
     res_sol_prod = model_v14.apply_volatility_regime_guard(
         "SOL_5m",
         sol_pred,
         ex_ante_rv12_bps=18.2,
         guard_config=vg,
-        cohort_time="2026-11-10T16:40:00+00:00",
+        cohort_time="2026-11-10T17:10:00+00:00",
         btc_ret_1h_pct=-0.41,
         btc_ret_4h_pct=-1.50,
         own_ret_1h_pct=-2.18,
@@ -1905,7 +1919,7 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         sol_pred,
         ex_ante_rv12_bps=18.2,
         guard_config=vg,
-        cohort_time="2026-11-10T16:40:00+00:00",
+        cohort_time="2026-11-10T17:10:00+00:00",
         btc_ret_1h_pct=-0.41,
         btc_ret_4h_pct=-1.50,
         own_ret_1h_pct=-4.25,
@@ -1926,7 +1940,7 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         sol_pred,
         ex_ante_rv12_bps=18.2,
         guard_config=vg_unit,
-        cohort_time="2026-11-10T16:40:00+00:00",
+        cohort_time="2026-11-10T17:10:00+00:00",
         btc_ret_1h_pct=-0.41,
         btc_ret_4h_pct=-1.50,
         own_ret_1h_pct=-2.18,
@@ -1941,7 +1955,7 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         sol_pred,
         ex_ante_rv12_bps=18.2,
         guard_config=vg_unit,
-        cohort_time="2026-11-10T16:40:00+00:00",
+        cohort_time="2026-11-10T17:10:00+00:00",
         btc_ret_1h_pct=-0.41,
         btc_ret_4h_pct=-1.50,
         own_ret_1h_pct=-1.10,
@@ -2015,7 +2029,7 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         "stream_min_buy_price": policy["stream_min_buy_price"],
         "stream_max_order_usd": policy["stream_max_order_usd"],
         "engineering": {"profile": "argon4-latency-v12"},
-        "execution": deepcopy(policy["execution"]),
+        "execution": {**deepcopy(policy["execution"]), "multi_look_ioc": True},
     }
     ledger = Account(tmp_path / "min_depth.sqlite3", initial_capital=1269, started_at=BOUNDARY - timedelta(seconds=1))
     executor = PaperExecutor(ledger, exec_policy)
@@ -2173,7 +2187,7 @@ def test_v14r15_final_look_depth_fill_low_cap_no_starve_and_capital_sync(tmp_pat
         "stream_min_buy_price": policy["stream_min_buy_price"],
         "stream_max_order_usd": policy["stream_max_order_usd"],
         "engineering": {"profile": "argon4-latency-v12"},
-        "execution": deepcopy(policy["execution"]),
+        "execution": {**deepcopy(policy["execution"]), "multi_look_ioc": True},
     }
 
     # --- 1A. Final look ($18.50 >= $8.00) fills Rank 1 AND unlocks Rank 2 in the same cohort ---
@@ -2338,7 +2352,7 @@ def test_v14r16_time_segmented_playbook_us_close_sunday_reopen_weekend_rv12_and_
     six_streams = ["BTC_15m", "ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m"]
 
     assert vg["weekend_min_rv12_bps"] == {"BTC_5m": 4.0, "ETH_5m": 4.0, "SOL_5m": 4.0}
-    assert vg["us_close_blackout"]["enabled"] is True
+    assert vg["us_close_blackout"]["enabled"] is False
     assert vg["us_close_blackout"]["timezone"] == "America/New_York"
     assert vg["us_close_blackout"]["local_start_minute"] == 900
     assert vg["us_close_blackout"]["local_end_minute"] == 960
@@ -2350,17 +2364,23 @@ def test_v14r16_time_segmented_playbook_us_close_sunday_reopen_weekend_rv12_and_
 
     pred = {"selected": True, "side": "DOWN", "z_v4": -2.05, "threshold_frozen": 1.72}
 
-    # --- 1. US Close MOC Blackout (15:00-16:00 ET) in Winter EST (20:00-21:00 UTC) & Summer EDT (19:00-20:00 UTC) ---
+    # --- 1. Live policy unblocks 15:00-16:00 ET; enabling us_close_blackout still blocks EST/EDT ---
+    vg_close_enabled = {**vg, "us_close_blackout": {**vg["us_close_blackout"], "enabled": True}}
     for st in six_streams:
-        r_est = model_v14.apply_volatility_regime_guard(
+        r_live_est = model_v14.apply_volatility_regime_guard(
             st, pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time="2026-11-11T20:15:00+00:00"
+        )
+        assert r_live_est["selected"] is True
+
+        r_est = model_v14.apply_volatility_regime_guard(
+            st, pred, ex_ante_rv12_bps=12.0, guard_config=vg_close_enabled, cohort_time="2026-11-11T20:15:00+00:00"
         )
         assert r_est["selected"] is False
         assert r_est["volatility_regime_reason"] == "US_CLOSE_BLACKOUT"
         assert r_est["us_close_blackout_minute_local"] == 915
 
         r_edt = model_v14.apply_volatility_regime_guard(
-            st, pred, ex_ante_rv12_bps=12.0, guard_config=vg, cohort_time="2026-07-15T19:30:00+00:00"
+            st, pred, ex_ante_rv12_bps=12.0, guard_config=vg_close_enabled, cohort_time="2026-07-15T19:30:00+00:00"
         )
         assert r_edt["selected"] is False
         assert r_edt["volatility_regime_reason"] == "US_CLOSE_BLACKOUT"
@@ -2682,7 +2702,7 @@ def test_v14r18_precision_guards_nyse_holiday_and_policy_hygiene():
         return seen
 
     policy = json.loads(raw_policy_text, object_pairs_hook=_reject_dup_keys)
-    assert policy["min_decision_delay_seconds"] == pytest.approx(2.3)
+    assert policy["min_decision_delay_seconds"] == pytest.approx(0.8)
     vg = policy["volatility_regime_guard"]
     assert vg["max_rv12_bps"]["SOL_15m"] == pytest.approx(42.0)
     assert vg["max_rv12_bps"]["SOL_5m"] == pytest.approx(42.0)
@@ -2897,7 +2917,8 @@ def test_v14r19_multi_signal_multi_look_never_blocks_with_response_precedes_requ
 
     cohort = datetime(2026, 11, 13, 12, 50, 0, tzinfo=timezone.utc)
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["execution"]["multi_look_ioc"] is True
+    assert policy["execution"]["multi_look_ioc"] is False
+    policy = {**policy, "max_buy_price": 0.515, "execution": {**policy["execution"], "multi_look_ioc": True}}
 
     # Real advancing clock: every read advances by +15ms, and each network book GET advances by +120ms!
     cur_utc = {"t": cohort + timedelta(seconds=6.5)}
@@ -3032,7 +3053,7 @@ def test_v14r19_multi_signal_multi_look_never_blocks_with_response_precedes_requ
 
         obs.save("polymarket", {"streams": streams_snap})
 
-        ask_price = {"p": 0.50}
+        ask_price = {"p": 0.47}
 
         def _fake_refresh_book(market, outcome):
             # Simulate real 120ms London RTT AFTER begin_book_look was recorded
@@ -3300,6 +3321,222 @@ def test_v14r20_autonomous_retrain_gatekeeper_promotion_and_systemd_hygiene(tmp_
     assert updated_pol["previous_deployment_manifest_sha256"]["BTC_15m"] == "old_sha_1"
     assert updated_pol["deployment_manifest_sha256"] == promo["deployment_manifest_sha256"]
     assert Path(promo["backup_dir"], "BTC_15m.manifest.json").is_file()
+
+
+def test_v14r24_four_structural_alpha_laws_and_midwindow_settle_reconciler(tmp_path, monkeypatch, raw_fixture):
+    """v14r24: Verify the 4 structural alpha & latency laws, anti-overfitting non-changes,
+    lock-free FeatureSnapshot.prewarm_validated, and maintenance:settle: mid-window reconciler.
+    """
+    from datetime import datetime, timedelta, timezone
+    import hashlib
+    from types import SimpleNamespace
+    import numpy as np
+    from tools.argon4_forward import account, feature_cache, online, pipeline
+
+    # 1. Policy assertions: all 4 structural laws + anti-overfitting non-changes
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    assert policy["min_buy_price"] == pytest.approx(0.445)
+    assert policy["max_buy_price"] == pytest.approx(0.485)
+    assert all(
+        policy["stream_min_buy_price"][st] == pytest.approx(0.445)
+        for st in ("BTC_15m", "ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m")
+    )
+    assert policy["execution_stage"]["enabled_streams"] == [
+        "BTC_15m", "ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m"
+    ]
+    assert policy["execution"]["multi_look_ioc"] is False
+    assert policy["min_decision_delay_seconds"] == pytest.approx(0.8)
+    assert policy["engineering"]["minimum_decision_delay_seconds"] == pytest.approx(0.8)
+    vg = policy["volatility_regime_guard"]
+    assert vg["twap60_handicap_guard"]["on_unavailable"] == "FAIL_CLOSED"
+    assert vg["us_open_blackout"]["enabled"] is True
+    assert vg["us_open_blackout"]["local_start_minute"] == 570
+    assert vg["us_open_blackout"]["local_end_minute"] == 720
+    assert vg["us_close_blackout"]["enabled"] is False
+    assert vg["max_rv12_bps"] == {
+        "BTC_15m": 28.0, "BTC_5m": 28.0,
+        "ETH_5m": 35.0, "ETH_15m": 35.0,
+        "SOL_15m": 42.0, "SOL_5m": 42.0,
+    }
+    assert "max_delta_z" not in vg
+
+    # Confirm high-confidence delta_z > 0.45 is NOT suppressed
+    strong_up = {"selected": True, "side": "UP", "z_v4": 2.40, "threshold_frozen": 1.65}
+    res_hi_dz = model_v14.apply_volatility_regime_guard(
+        "BTC_5m",
+        strong_up,
+        ex_ante_rv12_bps=12.0,
+        guard_config=vg,
+        cohort_time="2026-11-11T17:15:00+00:00",  # 12:15 EST
+        spot_twap60_t=90000.0,
+        spot_close_t=90000.0,
+    )
+    assert res_hi_dz["selected"] is True
+
+    # Confirm US open 11:45 EST is blocked while 15:15 EST is open
+    res_1145_est = model_v14.apply_volatility_regime_guard(
+        "ETH_5m", strong_up, ex_ante_rv12_bps=12.0, guard_config=vg,
+        cohort_time="2026-11-11T16:45:00+00:00", spot_twap60_t=3000.0, spot_close_t=3000.0,
+    )
+    assert res_1145_est["selected"] is False and res_1145_est["volatility_regime_reason"] == "US_OPEN_BLACKOUT"
+    res_1515_est = model_v14.apply_volatility_regime_guard(
+        "ETH_5m", strong_up, ex_ante_rv12_bps=12.0, guard_config=vg,
+        cohort_time="2026-11-11T20:15:00+00:00", spot_twap60_t=3000.0, spot_close_t=3000.0,
+    )
+    assert res_1515_est["selected"] is True
+
+    # 2. online._candles maintenance:settle: refreshes 5m & boundary 1h across Attempt 1 & 2,
+    #    skips disk rewrite when unchanged (len(merged)==len(old)), and skips 1h at T+330s (00:05).
+    rt_on = tmp_path / "on_settle"
+    n_5m = int(pd.Timedelta(days=16) // pd.Timedelta(minutes=5))
+    end_5m = pd.Timestamp("2026-11-14T00:00:00Z")
+    t5 = pd.date_range(end=end_5m - pd.Timedelta(minutes=5), periods=n_5m, freq="5min")
+    df_5m = pd.DataFrame({
+        "date": t5, "open_time": t5,
+        "open": [100.0] * n_5m, "high": [101.0] * n_5m, "low": [99.0] * n_5m, "close": [100.5] * n_5m,
+        "volume": [10.0] * n_5m, "close_time": t5 + pd.Timedelta(minutes=5) - pd.Timedelta(milliseconds=1),
+        "quote_volume": [1005.0] * n_5m, "count": [50.0] * n_5m,
+        "taker_buy_base_volume": [5.0] * n_5m, "taker_buy_quote_volume": [502.5] * n_5m,
+        "first_received_at": [pd.Timestamp("2026-11-14T00:00:01Z")] * n_5m,
+        "receipt_sha256": ["a" * 64] * n_5m,
+        "receipt_time_basis": ["SYSTEM_UTC"] * n_5m,
+        "clock_evidence_sha256": [None] * n_5m,
+    })
+    n_1h = int(pd.Timedelta(days=16) // pd.Timedelta(hours=1))
+    t1h = pd.date_range(end=end_5m - pd.Timedelta(hours=1), periods=n_1h, freq="1h")
+    df_1h = pd.DataFrame({
+        "date": t1h, "open_time": t1h,
+        "open": [100.0] * n_1h, "high": [101.0] * n_1h, "low": [99.0] * n_1h, "close": [100.5] * n_1h,
+        "volume": [10.0] * n_1h, "close_time": t1h + pd.Timedelta(hours=1) - pd.Timedelta(milliseconds=1),
+        "quote_volume": [1005.0] * n_1h, "count": [50.0] * n_1h,
+        "taker_buy_base_volume": [5.0] * n_1h, "taker_buy_quote_volume": [502.5] * n_1h,
+        "first_received_at": [pd.Timestamp("2026-11-14T00:00:01Z")] * n_1h,
+        "receipt_sha256": ["b" * 64] * n_1h,
+        "receipt_time_basis": ["SYSTEM_UTC"] * n_1h,
+        "clock_evidence_sha256": [None] * n_1h,
+    })
+    fetches = []
+    fake_now = {"t": pd.Timestamp("2026-11-14T00:00:30Z")}
+
+    def _rows_for(frame_tail):
+        out = []
+        for _, r in frame_tail.iterrows():
+            out.append([
+                int(pd.Timestamp(r["open_time"]).timestamp() * 1000),
+                str(r["open"]), str(r["high"]), str(r["low"]), str(r["close"]), str(r["volume"]),
+                int(pd.Timestamp(r["close_time"]).timestamp() * 1000),
+                str(r["quote_volume"]), int(r["count"]),
+                str(r["taker_buy_base_volume"]), str(r["taker_buy_quote_volume"]), "0",
+            ])
+        return out
+
+    class _FakeCandleClient:
+        def get(self, kind, params=None):
+            fetches.append((kind, params["interval"]))
+            df_src = df_5m if params["interval"] == "5m" else df_1h
+            t_s = pd.to_datetime(params["startTime"], unit="ms", utc=True)
+            t_e = pd.to_datetime(params["endTime"], unit="ms", utc=True)
+            raw_rows = _rows_for(df_src[(df_src["open_time"] >= t_s) & (df_src["open_time"] <= t_e)])
+            body = json.dumps(raw_rows).encode()
+            return raw_rows, {
+                "requested_at": fake_now["t"].isoformat(),
+                "received_at": fake_now["t"].isoformat(),
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "http_status": 200,
+                "url": f"http://fixture/{kind}",
+            }
+
+    inp = online.OnlineInputs(rt_on, client=_FakeCandleClient(), clock=lambda: fake_now["t"])
+    p5 = inp._path("futures", "BTCUSDT", "5m")
+    p1h = inp._path("futures", "BTCUSDT", "1h")
+    p5.parent.mkdir(parents=True, exist_ok=True)
+    p1h.parent.mkdir(parents=True, exist_ok=True)
+    df_5m.to_parquet(p5, index=False)
+    df_1h.to_parquet(p1h, index=False)
+    publish_calls = 0
+    orig_pub = inp._publish_frame
+
+    def _count_pub(frame, path):
+        nonlocal publish_calls
+        publish_calls += 1
+        return orig_pub(frame, path)
+
+    inp._publish_frame = _count_pub
+
+    def _call_candles(cohort_id_arg, interval_arg):
+        ctx = (inp._active_generation, None, cohort_id_arg, inp.clock, inp.time_basis, inp.clock_evidence_sha256)
+        return inp._run_job(ctx, inp._candles, ("futures", "BTCUSDT", interval_arg, fake_now["t"]))
+
+    # Attempt 1 at T+30s: BOTH 5m and 1h re-fetch, unchanged len -> 0 parquet rewrites
+    _call_candles("maintenance:settle:2026-11-14T00:00:00+00:00:1", "5m")
+    _call_candles("maintenance:settle:2026-11-14T00:00:00+00:00:1", "1h")
+    assert ("futures", "5m") in fetches and ("futures", "1h") in fetches
+    assert publish_calls == 0
+
+    # Attempt 2 at T+92s: 1h STILL within [00:00, 00:05), so 1h still re-fetches for 60s confirmation!
+    fetches.clear()
+    fake_now["t"] = pd.Timestamp("2026-11-14T00:01:32Z")
+    _call_candles("maintenance:settle:2026-11-14T00:00:00+00:00:2", "1h")
+    assert fetches == [("futures", "1h")]
+
+    # Next 5m cohort at 00:05:30Z: 1h age >= 5m -> skipped!
+    fetches.clear()
+    fake_now["t"] = pd.Timestamp("2026-11-14T00:05:30Z")
+    _call_candles("maintenance:settle:2026-11-14T00:05:00+00:00:1", "1h")
+    assert fetches == []
+
+    # 3. FeatureSnapshot.prewarm_validated concurrent decode idempotency & maintain_completed_cohort_settlements trigger
+    synth_root, idx_rf = raw_fixture
+    as_of_ts = idx_rf[-1] + pd.Timedelta(minutes=5)
+    snap = feature_cache.FeatureSnapshot(synth_root, as_of=as_of_ts)
+    try:
+        snap.prewarm_validated(max_workers=4)
+        assert snap.stats["parquet_decodes"] == 18
+        f_btc = snap.build("BTCUSDT", tail_rows=1)
+        assert snap.stats["parquet_decodes"] == 18
+        assert len(f_btc["base"]) == 1
+    finally:
+        snap.close()
+
+    # Mid-window reconciler skips safely before T+28s and invokes inputs.refresh once in T+30s..T+225s
+    cohort_m = datetime(2026, 11, 14, 0, 10, 0, tzinfo=timezone.utc)
+    rt_m = tmp_path / "rt_proactive"
+    rt_m.mkdir(parents=True, exist_ok=True)
+    acc_m = account.Account(rt_m / "paper.sqlite3", initial_capital=1000, started_at=cohort_m - timedelta(minutes=5))
+    obs_m_data = {}
+    obs_m = SimpleNamespace(save=lambda k, v: obs_m_data.__setitem__(k, v), path=str(rt_m / "obs.sqlite3"))
+    pipe_m = pipeline.ForwardPipeline(acc_m, rt_m, obs_m)
+    try:
+        cur_m = {"t": cohort_m + timedelta(seconds=15)}
+        monkeypatch.setattr(pipeline, "calibrated_now", lambda c, upper=True: cur_m["t"])
+        pipe_m.clock = {
+            "status": "CALIBRATED", "uncertainty_seconds": 0.1, "server_minus_local_seconds": 0.0,
+            "calibrated_monotonic": 1e9, "observed_at": cohort_m.isoformat(), "receipt_sha256": "d" * 64,
+        }
+        pipe_m._revision_fastpath = {"enabled": True, "profile": "argon4-aged-revision-v14"}
+        pipe_m.last_cohort = cohort_m
+        refresh_calls = []
+        pipe_m.inputs = SimpleNamespace(
+            data_root=rt_m / "features/raw",
+            _lock=inp._lock,
+            clock=lambda: cur_m["t"],
+            clock_evidence_sha256="d" * 64,
+            client=SimpleNamespace(clock=lambda: cur_m["t"], clock_evidence_sha256="d" * 64),
+            refresh=lambda **kw: refresh_calls.append(kw) or {"status": "READY", "errors": [], "gaps": []},
+        )
+        # Before T+28s -> False
+        assert pipe_m.maintain_completed_cohort_settlements(policy, cohort_m) is False
+        assert len(refresh_calls) == 0
+        # Inside [T+28s, T+225s) -> triggers once cleanly then marks done
+        cur_m["t"] = cohort_m + timedelta(seconds=32)
+        assert pipe_m.maintain_completed_cohort_settlements(policy, cohort_m) is True
+        assert len(refresh_calls) == 1
+        assert refresh_calls[0]["cohort_id"] == f"maintenance:settle:{cohort_m.isoformat()}:1"
+        assert pipe_m.maintain_completed_cohort_settlements(policy, cohort_m) is False
+        assert len(refresh_calls) == 1
+    finally:
+        pipe_m.close()
+
 
 
 

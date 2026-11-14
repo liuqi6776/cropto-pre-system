@@ -60,6 +60,8 @@ from py_clob_client_v2.order_utils.model.signature_type_v2 import SignatureTypeV
 
 from .math_utils import (
     HARD_WINDOW_DEADLINE_SECONDS,
+    MAX_BUY_PRICE_CEILING,
+    MIN_BUY_PRICE_FLOOR,
     USD_MICRO,
     check_hard_deadline,
     compute_fee_per_share,
@@ -897,13 +899,25 @@ class ClobExecutor:
         order_version = 3 if is_v2_mkt else 2
         self._seed_client_local_caches(tid, tick_size, clob_fee_bps, neg_risk=effective_neg_risk)
 
+        min_p = to_decimal(min_buy_price, "min_buy_price") if min_buy_price is not None else self.min_buy_price
+        max_p = to_decimal(max_buy_price, "max_buy_price") if max_buy_price is not None else self.max_buy_price
+        effective_tick_limits = dict(self.tick_size_limit_prices)
+        if MIN_BUY_PRICE_FLOOR <= max_p <= MAX_BUY_PRICE_CEILING:
+            for tk_key, lim_val in list(effective_tick_limits.items()):
+                tk_dec = to_decimal(tk_key, "tick_size").normalize()
+                lim_dec = to_decimal(lim_val, "limit_price")
+                if lim_dec > max_p:
+                    floored = (max_p // tk_dec) * tk_dec
+                    if floored >= MIN_BUY_PRICE_FLOOR:
+                        effective_tick_limits[tk_key] = floored
+
         sizing = compute_live_order_sizing(
             approved_stake_usd=approved_stake_usd,
             live_scale_factor=live_scale_factor,
             fee_rate=fee_rate,
             tick_size=tick_size,
             quota_cap_usd=quota_cap_usd,
-            tick_size_limit_prices=self.tick_size_limit_prices,
+            tick_size_limit_prices=effective_tick_limits,
         )
 
         # Polymarket CLOB FAK (market buy) requires makerAmount (size * limit_price) to have at most 2 decimals ($0.01)
@@ -1009,9 +1023,7 @@ class ClobExecutor:
                 clock_projection=clock_projection,
             )
 
-        # Enforce min_buy_price (0.37) and max_buy_price (0.515) floor/ceiling before signing & sending
-        min_p = to_decimal(min_buy_price, "min_buy_price") if min_buy_price is not None else self.min_buy_price
-        max_p = to_decimal(max_buy_price, "max_buy_price") if max_buy_price is not None else self.max_buy_price
+        # Enforce min_buy_price and max_buy_price floor/ceiling before signing & sending
         limit_p = sizing["limit_price_dec"]
         if limit_p < min_p:
             return self._build_aborted_result(
@@ -1142,6 +1154,15 @@ class ClobExecutor:
                     order_type_str=order_type_str,
                     clob_status="ABORTED_BELOW_MIN_BUY_PRICE",
                     error_code=f"{label.upper()}_BELOW_MIN_BUY_PRICE:{p_val}<{min_p}",
+                    live_signed_at=now_dt,
+                    clock_projection=clock_projection,
+                )
+            if p_val > max_p:
+                return self._build_aborted_result(
+                    sizing=sizing,
+                    order_type_str=order_type_str,
+                    clob_status="ABORTED_ABOVE_MAX_BUY_PRICE",
+                    error_code=f"{label.upper()}_ABOVE_MAX_BUY_PRICE:{p_val}>{max_p}",
                     live_signed_at=now_dt,
                     clock_projection=clock_projection,
                 )

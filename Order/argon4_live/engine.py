@@ -467,6 +467,22 @@ class LiveExecutionEngine:
             },
         }
 
+    def _default_limit_price(self) -> float:
+        """Resolve configured tick-aligned limit price (capped by `max_buy_price`) for abort records."""
+        tick = str(getattr(self.clob, "default_tick_size", "0.01"))
+        mapping = getattr(self.clob, "tick_size_limit_prices", None) or {}
+        val = float(mapping[tick]) if tick in mapping else float(mapping.get("0.01", 0.48))
+        max_p = getattr(self.clob, "max_buy_price", None)
+        if max_p is not None and val > float(max_p):
+            try:
+                tk_dec = to_decimal(tick, "tick_size").normalize()
+                floored = float((to_decimal(max_p, "max_buy_price") // tk_dec) * tk_dec)
+                if floored > 0:
+                    val = floored
+            except ValueError:
+                pass
+        return val
+
     def _wait_retry_interval(self, seconds: float) -> bool:
         """Sleep up to `seconds` between bounded FAK retries; returns True if `stop_event` interrupted."""
         return bool(self.stop_event.wait(max(0.0, float(seconds))))
@@ -679,7 +695,7 @@ class LiveExecutionEngine:
                 live_exec = {
                     "live_scale_factor": float(scale_dec),
                     "order_type": "FAK",
-                    "limit_price": 0.51,
+                    "limit_price": self._default_limit_price(),
                     "requested_stake_usd": float(desired_stake_usd),
                     "requested_quantity": "0.00",
                     "clob_order_id": None,
@@ -764,7 +780,7 @@ class LiveExecutionEngine:
                     live_exec = {
                         "live_scale_factor": float(scale_dec),
                         "order_type": "FAK",
-                        "limit_price": 0.51,
+                        "limit_price": self._default_limit_price(),
                         "requested_stake_usd": float(desired_stake_usd),
                         "requested_quantity": "0.00",
                         "clob_order_id": None,
@@ -901,7 +917,7 @@ class LiveExecutionEngine:
                 live_exec = {
                     "live_scale_factor": float(eff_scale_dec),
                     "order_type": "FAK",
-                    "limit_price": 0.51,
+                    "limit_price": self._default_limit_price(),
                     "requested_stake_usd": float(desired_stake_usd),
                     "requested_quantity": "0.00",
                     "clob_order_id": None,
@@ -1059,7 +1075,7 @@ class LiveExecutionEngine:
                         "live_execution": {
                             "live_scale_factor": float(eff_scale_dec),
                             "order_type": "FAK",
-                            "limit_price": 0.51,
+                            "limit_price": self._default_limit_price(),
                             "requested_stake_usd": float(quota_cap),
                             "requested_quantity": "0.00",
                             "clob_order_id": None,
@@ -1342,7 +1358,7 @@ class LiveExecutionEngine:
                 paper_bench = {
                     "approved_stake_usd": float(row.get("requested_stake_usd") or 0.0),
                     "paper_filled_quantity": float(row.get("requested_quantity") or 0.0),
-                    "avg_fill_price": float(row.get("limit_price") or 0.51),
+                    "avg_fill_price": float(row.get("limit_price") or self._default_limit_price()),
                     "cost_usd": 0.0,
                     "fee_usd": 0.0,
                     "total_spent_usd": float(row.get("requested_stake_usd") or 0.0),

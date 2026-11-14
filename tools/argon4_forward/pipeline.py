@@ -160,6 +160,7 @@ class ForwardPipeline:
         self._revision_fastpath = {"enabled": False}
         self._same_cohort_revision = None
         self._blocked_input_maintenance = None
+        self._proactive_settle_state = None
         from .storage_janitor import StorageJanitor
         self.janitor = StorageJanitor(self.runtime, monitor_log=self.monitor_log)
         from .polymarket_transport import PublicPolymarketTransport
@@ -665,11 +666,13 @@ class ForwardPipeline:
     def _score_decisions(self, policy, inputs, cohort, profile, now_lower,
                          available, frames, decisions, snapshot,
                          build_feature_frames, predict_stream):
+        import os
         from .model_v14 import (
             apply_volatility_regime_guard,
             compute_ex_ante_btc_macro_returns_pct,
             compute_ex_ante_rv12_bps,
             compute_ex_ante_symbol_returns,
+            is_twap60_fail_closed,
         )
         vol_guard = (policy.get("volatility_regime_guard")
                      if isinstance(policy.get("volatility_regime_guard"), dict) else None)
@@ -681,10 +684,25 @@ class ForwardPipeline:
         rv12_cache = {}
         own_rets_cache = {}
         spot_1m_cache = {}
-        btc_macro_rets = compute_ex_ante_btc_macro_returns_pct(
-            inputs.get("data_root"), as_of=now_lower, snapshot=snapshot)
+        self._decision_timing.setdefault("features_seconds", {})
+        self._decision_timing.setdefault("inference_seconds", {})
+
+        def _capture_one_s1(sym):
+            timeout_s = float(hcap_guard_cfg.get("timeout_seconds", 1.2))
+            rem_win = (cohort + timedelta(seconds=18.5) - calibrated_now(self.clock)).total_seconds()
+            if rem_win <= 0.15:
+                return {"status": "DEADLINE_SKIPPED", "symbol": sym, "cohort_id": cohort.isoformat()}
+            dl_mono = time.monotonic() + min(timeout_s, rem_win)
+            try:
+                return self.inputs.capture_spot_1m_twap60(
+                    sym, cohort, cohort_id=cohort.isoformat(), deadline_monotonic=dl_mono
+                )
+            except Exception as exc:
+                return {"status": "ERROR", "symbol": sym, "cohort_id": cohort.isoformat(),
+                        "error": f"{type(exc).__name__}:{str(exc)[:120]}"}
+
+        due_symbols = []
         if snapshot is not None:
-            due_symbols = []
             for stream in policy["order"]:
                 if stream in profile["disabled_streams"]:
                     continue
@@ -694,9 +712,21 @@ class ForwardPipeline:
                 sym = underlying + "USDT"
                 if sym not in frames and sym not in due_symbols:
                     due_symbols.append(sym)
-            if len(due_symbols) > 1:
-                import os
-            if len(due_symbols) > 1 and (os.cpu_count() or 1) >= 4:
+
+        s1_pool = None
+        s1_futs = {}
+        s1_started = None
+        if snapshot is not None and due_symbols and hcap_guard_enabled and hasattr(self.inputs, "capture_spot_1m_twap60"):
+            from concurrent.futures import ThreadPoolExecutor
+            s1_started = time.perf_counter()
+            s1_pool = ThreadPoolExecutor(max_workers=min(3, len(due_symbols)), thread_name_prefix="argon4-s1")
+            s1_futs = {sym: s1_pool.submit(_capture_one_s1, sym) for sym in due_symbols}
+        try:
+            if snapshot is not None and hasattr(snapshot, "prewarm_validated") and (os.cpu_count() or 1) >= 2:
+                snapshot.prewarm_validated(max_workers=4)
+            btc_macro_rets = compute_ex_ante_btc_macro_returns_pct(
+                inputs.get("data_root"), as_of=now_lower, snapshot=snapshot)
+            if snapshot is not None and len(due_symbols) > 1 and (os.cpu_count() or 1) >= 4:
                 if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
                     raise ValueError("missed feature decision window")
                 from concurrent.futures import ThreadPoolExecutor
@@ -713,6 +743,15 @@ class ForwardPipeline:
                         for sym in due_symbols:
                             frames[sym], self._decision_timing["features_seconds"][sym] = fut_map[sym].result()
                 self._decision_timing["features_parallel_wall_seconds"] = time.perf_counter() - wall_t0
+        finally:
+            if s1_pool is not None:
+                try:
+                    for sym, fut in s1_futs.items():
+                        spot_1m_cache[sym] = fut.result()
+                    if s1_started is not None:
+                        self._decision_timing["spot_1m_parallel_wall_seconds"] = time.perf_counter() - s1_started
+                finally:
+                    s1_pool.shutdown(wait=True)
         staged = []
         for stream in policy["order"]:
             decisions.setdefault(stream, None)
@@ -780,37 +819,22 @@ class ForwardPipeline:
                 if sc.get("selected") is True and sym not in needed_s1_syms and sym not in spot_1m_cache:
                     needed_s1_syms.append(sym)
             if needed_s1_syms:
-                timeout_s = float(hcap_guard_cfg.get("timeout_seconds", 1.2))
-
-                def _capture_one_s1(sym):
-                    rem_win = (cohort + timedelta(seconds=18.5) - calibrated_now(self.clock)).total_seconds()
-                    if rem_win <= 0.15:
-                        return {"status": "DEADLINE_SKIPPED", "symbol": sym, "cohort_id": cohort.isoformat()}
-                    dl_mono = time.monotonic() + min(timeout_s, rem_win)
-                    try:
-                        return self.inputs.capture_spot_1m_twap60(
-                            sym, cohort, cohort_id=cohort.isoformat(), deadline_monotonic=dl_mono
-                        )
-                    except Exception as exc:
-                        return {"status": "ERROR", "symbol": sym, "cohort_id": cohort.isoformat(),
-                                "error": f"{type(exc).__name__}:{str(exc)[:120]}"}
-
                 if len(needed_s1_syms) == 1:
                     spot_1m_cache[needed_s1_syms[0]] = _capture_one_s1(needed_s1_syms[0])
                 else:
                     from concurrent.futures import ThreadPoolExecutor
                     s1_t0 = time.perf_counter()
                     with ThreadPoolExecutor(max_workers=min(3, len(needed_s1_syms)), thread_name_prefix="argon4-s1") as pool:
-                        s1_futs = {sym: pool.submit(_capture_one_s1, sym) for sym in needed_s1_syms}
+                        s1_futs_rem = {sym: pool.submit(_capture_one_s1, sym) for sym in needed_s1_syms}
                         for sym in needed_s1_syms:
-                            spot_1m_cache[sym] = s1_futs[sym].result()
+                            spot_1m_cache[sym] = s1_futs_rem[sym].result()
                     self._decision_timing["spot_1m_parallel_wall_seconds"] = time.perf_counter() - s1_t0
 
         for stream, underlying, duration, symbol, raw_score, score in staged:
-            if hcap_guard_enabled and score.get("selected") is True and symbol in spot_1m_cache:
-                s1_obs = spot_1m_cache[symbol]
+            if hcap_guard_enabled and score.get("selected") is True:
+                s1_obs = spot_1m_cache.get(symbol)
                 own_rets = own_rets_cache.get(symbol) or {}
-                if s1_obs.get("status") == "OBSERVED":
+                if isinstance(s1_obs, dict) and s1_obs.get("status") == "OBSERVED":
                     t_re = time.perf_counter()
                     score = apply_volatility_regime_guard(
                         stream,
@@ -827,16 +851,18 @@ class ForwardPipeline:
                         own_ret_1h_pct=own_rets.get("own_ret_1h_pct"),
                         own_ret_15m_bps=own_rets.get("own_ret_15m_bps"),
                         own_streak_3bar=own_rets.get("own_streak_3bar"),
-                        spot_twap60_t=s1_obs["twap60"],
-                        spot_close_t=s1_obs["spot_close"],
+                        spot_twap60_t=s1_obs.get("twap60"),
+                        spot_close_t=s1_obs.get("spot_close"),
+                        twap60_unavailable=True,
                     )
                     score["spot_1m_receipt_sha256"] = s1_obs.get("receipt_sha256")
                     self._decision_timing["inference_seconds"][stream] += time.perf_counter() - t_re
-                elif str(hcap_guard_cfg.get("on_unavailable", "PASS_WITH_WARNING")).upper() == "SKIP":
+                elif is_twap60_fail_closed(hcap_guard_cfg):
                     score = {
                         **score,
                         "volatility_regime_guarded": True,
                         "volatility_regime_reason": "TWAP60_SPOT_1M_UNAVAILABLE",
+                        "volatility_regime_action": str((vol_guard or {}).get("action", "SKIP_OR_HALF_STAKE")).upper(),
                         "selected": False,
                     }
             if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
@@ -1034,6 +1060,87 @@ class ForwardPipeline:
         self.publish(status="PAPER_INPUT_MAINTENANCE", active=True, models=models, maintenance=observation,
                      reason=label+"；本窗口不补单，下个完整窗口重新核验")
         return True
+
+    def maintain_completed_cohort_settlements(self, policy, cohort):
+        """Proactively settle finalized closed Binance bars in mid-window [28s, 225s] for future cohorts."""
+        if (
+            not self._revision_fastpath.get("enabled")
+            or self.last_cohort != cohort
+            or self._pending_execution is not None
+            or self._blocked_input_maintenance is not None
+            or not isinstance(getattr(self.inputs, "data_root", None), Path)
+            or not hasattr(self.inputs, "_lock")
+            or self.stop.is_set()
+            or (self.runtime / "verification_pause.json").exists()
+            or (self.runtime / "maintenance_pause.json").exists()
+        ):
+            return False
+        state = self._proactive_settle_state
+        if not isinstance(state, dict) or state.get("cohort") != cohort:
+            state = {"cohort": cohort, "attempts": 0, "done": False, "next_eligible_at": None}
+            self._proactive_settle_state = state
+        if state["done"] or state["attempts"] >= 2:
+            return False
+        lower, upper = calibrated_now(self.clock, upper=False), calibrated_now(self.clock)
+        if (
+            cohort_at(lower) != cohort
+            or cohort_at(upper) != cohort
+            or lower < cohort + timedelta(seconds=28)
+            or upper >= cohort + timedelta(seconds=225)
+            or (state["next_eligible_at"] is not None and lower < state["next_eligible_at"])
+        ):
+            return False
+        deadline = min(
+            time.monotonic() + 12.0,
+            time.monotonic() + (cohort + timedelta(seconds=230) - upper).total_seconds(),
+        )
+        if deadline <= time.monotonic():
+            return False
+        from .revisions import ensure_view_committed
+        try:
+            ensure_view_committed(self.runtime)
+            self.set_input_clock()
+            state["attempts"] += 1
+            res_inp = self.inputs.refresh(
+                now=lower,
+                deadline_monotonic=deadline,
+                cohort_id=f"maintenance:settle:{cohort.isoformat()}:{state['attempts']}",
+            )
+            errors = res_inp.get("errors") or []
+            if (
+                res_inp.get("status") in ("READY", "COMPLETE", "OBSERVED")
+                and not errors
+                and not res_inp.get("gaps")
+            ):
+                state["done"] = True
+                return True
+            if any(
+                isinstance(e, dict) and "CONFLICTING_CLOSED_OBSERVATION" in str(e.get("error", ""))
+                for e in errors
+            ):
+                rev_res = self.reconcile_inputs(self.inputs, res_inp)
+                if getattr(self, "observations", None) is not None:
+                    self.observations.save(
+                        "proactive_settle_maintenance",
+                        {
+                            "cohort": cohort.isoformat(),
+                            "attempt": state["attempts"],
+                            "revision_status": (rev_res or {}).get("status"),
+                            "errors": errors,
+                        },
+                    )
+                if (rev_res or {}).get("status") == "WAITING_CONFIRMATION" and state["attempts"] < 2:
+                    next_at = calibrated_now(self.clock) + timedelta(seconds=61.0)
+                    state["next_eligible_at"] = next_at
+                    state["done"] = next_at >= cohort + timedelta(seconds=225)
+                else:
+                    state["done"] = True
+                return True
+            state["done"] = True
+            return False
+        except Exception:
+            state["done"] = True
+            return False
 
     def prefetch_inputs(self, engineering, now_lower):
         if not engineering["auxiliary_prefetch"]:
@@ -1519,6 +1626,7 @@ class ForwardPipeline:
         if not earliest <= elapsed <= 18 or self.last_cohort == cohort:
             if self.maintain_blocked_inputs(policy, models, cohort):
                 return
+            self.maintain_completed_cohort_settlements(policy, cohort)
             self.prefetch_inputs(engineering, now_lower)
             if getattr(self, "janitor", None) is not None and 95 <= elapsed <= 210:
                 try:
@@ -1531,6 +1639,7 @@ class ForwardPipeline:
             return
         self.last_cohort = cohort
         self._blocked_input_maintenance = None
+        self._proactive_settle_state = None
         self._same_cohort_revision = None
         self._decision_timing = {}
         self._pending_timing = {"cohort": cohort.isoformat(), "deadline_seconds": 20,
@@ -1616,6 +1725,8 @@ class ForwardPipeline:
         self._pending_timing["mark_registration_seconds"] = time.perf_counter()-started
         self._pending_timing["mark_registration"] = registered
         ticker_cfg = policy.get("early_window_book_ticker")
+        bktk_pool = None
+        bktk_fut = None
         if isinstance(ticker_cfg, dict) and ticker_cfg.get("enabled") is True:
             capture_fn = getattr(self.inputs, "capture_early_window_book_ticker", None)
             if callable(capture_fn):
@@ -1625,21 +1736,36 @@ class ForwardPipeline:
                     remaining_window = (cohort + timedelta(seconds=20) - now_upper).total_seconds()
                     max_budget = float(ticker_cfg.get("max_budget_seconds", 0.8))
                     if remaining_window > 6.5 and max_budget > 0:
+                        from concurrent.futures import ThreadPoolExecutor
                         ticker_deadline = time.monotonic() + min(max_budget, remaining_window - 6.0)
-                        snap = capture_fn(
-                            now=calibrated_now(self.clock, upper=False),
+                        bktk_now = calibrated_now(self.clock, upper=False)
+                        bktk_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="argon4-bktk")
+                        bktk_fut = bktk_pool.submit(
+                            capture_fn,
+                            now=bktk_now,
                             cohort_id=cohort.isoformat(),
                             deadline_monotonic=ticker_deadline,
                         )
-                        self.observations.save("early_window_book_ticker", snap)
                 except Exception as exc:
                     self.observations.save("early_window_book_ticker", {
                         "status": "ERROR", "cohort_id": cohort.isoformat(),
                         "error": f"{type(exc).__name__}:{str(exc)[:160]}"})
         started = time.perf_counter()
-        with self.monitor_log.phase("pipeline", "prepare_decisions",
-                                    cohort=cohort.isoformat(), slow_warn_seconds=5.0):
-            decisions = self.prepare_decisions(policy, inputs, cohort)
+        try:
+            with self.monitor_log.phase("pipeline", "prepare_decisions",
+                                        cohort=cohort.isoformat(), slow_warn_seconds=5.0):
+                decisions = self.prepare_decisions(policy, inputs, cohort)
+        finally:
+            if bktk_pool is not None:
+                try:
+                    if bktk_fut is not None:
+                        self.observations.save("early_window_book_ticker", bktk_fut.result())
+                except Exception as exc:
+                    self.observations.save("early_window_book_ticker", {
+                        "status": "ERROR", "cohort_id": cohort.isoformat(),
+                        "error": f"{type(exc).__name__}:{str(exc)[:160]}"})
+                finally:
+                    bktk_pool.shutdown(wait=True)
         self._pending_timing["decisions_seconds"] = time.perf_counter()-started
         is_v5 = policy.get("waterfall_semantics") == "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1"
         if not is_v5:

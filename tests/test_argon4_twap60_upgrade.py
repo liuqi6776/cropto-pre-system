@@ -156,6 +156,7 @@ def test_policy_twap60_handicap_guard_and_manifest_pins():
     assert hcap_cfg["enabled"] is True
     assert hcap_cfg["max_5m_handicap_bps"] == 1.0
     assert hcap_cfg["max_15m_handicap_bps"] == 2.0
+    assert hcap_cfg["on_unavailable"] == "FAIL_CLOSED"
     pins = policy["deployment_manifest_sha256"]
     assert len(pins) == 7
 
@@ -171,4 +172,130 @@ def test_policy_twap60_handicap_guard_and_manifest_pins():
         assert fold_meta["label_mode"] == "SPOT_TWAP60_BLEND"
         assert fold_meta["half_life_days"] == 270.0
         assert bundle["manifest"]["sample_weight_policy"] == "exponential_decay_half_life_270.0d"
+
+
+def test_twap60_handicap_guard_fail_closed_on_unavailable_and_pipeline_pass2(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from tools.argon4_forward import account, pipeline
+
+    guard_cfg = {
+        "enabled": True,
+        "action": "SKIP_OR_HALF_STAKE",
+        "twap60_handicap_guard": {
+            "enabled": True,
+            "max_5m_handicap_bps": 1.0,
+            "max_15m_handicap_bps": 2.0,
+            "on_unavailable": "FAIL_CLOSED",
+        },
+    }
+    pred = {"stream": "BTC_5m", "side": "UP", "selected": True, "z_v4": 1.95, "threshold_frozen": 1.70}
+
+    # Pass 1 offline call (no Spot 1m args, twap60_unavailable=False) stays unblocked for later Pass-2 check
+    res_pass1 = model_v14.apply_volatility_regime_guard(
+        "BTC_5m",
+        pred,
+        guard_config=guard_cfg,
+        cohort_time="2026-11-12T12:00:00+00:00",
+    )
+    assert res_pass1["selected"] is True
+
+    # Explicit unavailability, partial None, or NaN Spot 1m inputs must FAIL_CLOSED
+    for bad_kw in (
+        {"twap60_unavailable": True},
+        {"spot_twap60_t": 90000.0, "spot_close_t": None},
+        {"spot_twap60_t": float("nan"), "spot_close_t": 90000.0},
+        {"spot_twap60_t": 90000.0, "spot_close_t": -1.0},
+    ):
+        res_bad = model_v14.apply_volatility_regime_guard(
+            "BTC_5m",
+            pred,
+            guard_config=guard_cfg,
+            cohort_time="2026-11-12T12:00:00+00:00",
+            **bad_kw,
+        )
+        assert res_bad["selected"] is False
+        assert res_bad["volatility_regime_guarded"] is True
+        assert res_bad["volatility_regime_reason"] == "TWAP60_SPOT_1M_UNAVAILABLE"
+
+    # Pipeline Pass-2 check: missing capture_spot_1m_twap60 or non-OBSERVED statuses must block signal
+    cohort = datetime(2026, 11, 12, 12, 0, 0, tzinfo=timezone.utc)
+    now_t = cohort + pd.Timedelta(seconds=4)
+    rt = tmp_path / "rt_twap_failclosed"
+    rt.mkdir(parents=True, exist_ok=True)
+    acc = account.Account(rt / "paper.sqlite3", initial_capital=1000, started_at=cohort - pd.Timedelta(minutes=5))
+    obs_saved = {}
+    obs = SimpleNamespace(save=lambda k, v: obs_saved.__setitem__(k, v), path=str(rt / "obs.sqlite3"))
+    pipe = pipeline.ForwardPipeline(acc, rt, obs)
+    try:
+        pipe.clock = {
+            "status": "CALIBRATED",
+            "uncertainty_seconds": 0.1,
+            "server_minus_local_seconds": 0.0,
+            "calibrated_monotonic": 1e9,
+            "observed_at": cohort.isoformat(),
+            "receipt_sha256": "a" * 64,
+        }
+        monkeypatch.setattr(pipeline, "calibrated_now", lambda clock, upper=True: now_t)
+        base_policy = {
+            "order": ["BTC_5m"],
+            "volatility_regime_guard": guard_cfg,
+        }
+        profile = {"disabled_streams": set()}
+        idx_bar = pd.DatetimeIndex([cohort - pd.Timedelta(minutes=5)])
+        fake_frames = {
+            "BTCUSDT": {
+                "base": pd.DataFrame({"open": [90000.0], "close": [90010.0]}, index=idx_bar),
+                "expert": pd.DataFrame({"x": [1.0]}, index=idx_bar),
+            }
+        }
+        pipe.bundles = {"BTC_5m": {"bundle": "stub"}}
+        pred_fn = lambda s, b, e, dt, **kw: {
+            "stream": s,
+            "side": "UP",
+            "selected": True,
+            "z_v4": 2.0,
+            "threshold_frozen": 1.7,
+            "model_version": "m1",
+            "model_sha256": "b" * 64,
+        }
+
+        # 1) Legacy inputs object lacking capture_spot_1m_twap60 -> FAIL_CLOSED
+        pipe.inputs = SimpleNamespace()
+        d_missing_fn = pipe._score_decisions(
+            base_policy, {"data_root": None}, cohort, profile, now_t, now_t, dict(fake_frames), {}, None, None, pred_fn
+        )
+        assert d_missing_fn["BTC_5m"]["status"] == "NO_SIGNAL"
+        assert d_missing_fn["BTC_5m"]["prediction"]["volatility_regime_reason"] == "TWAP60_SPOT_1M_UNAVAILABLE"
+
+        # 2) capture_spot_1m_twap60 returns ERROR / MISSING_BAR / DEADLINE_SKIPPED -> FAIL_CLOSED
+        for bad_obs in (
+            {"status": "ERROR", "error": "timeout"},
+            {"status": "MISSING_BAR"},
+            {"status": "DEADLINE_SKIPPED"},
+        ):
+            pipe.inputs = SimpleNamespace(capture_spot_1m_twap60=lambda *a, _ret=bad_obs, **kw: dict(_ret))
+            d_bad = pipe._score_decisions(
+                base_policy, {"data_root": None}, cohort, profile, now_t, now_t, dict(fake_frames), {}, None, None, pred_fn
+            )
+            assert d_bad["BTC_5m"]["status"] == "NO_SIGNAL"
+            assert d_bad["BTC_5m"]["prediction"]["volatility_regime_reason"] == "TWAP60_SPOT_1M_UNAVAILABLE"
+
+        # 3) OBSERVED within <= 1.0 bps handicap -> produces SIGNAL
+        pipe.inputs = SimpleNamespace(
+            capture_spot_1m_twap60=lambda *a, **kw: {
+                "status": "OBSERVED",
+                "twap60": 90005.0,
+                "spot_close": 90000.0,
+                "receipt_sha256": "c" * 64,
+            }
+        )
+        d_ok = pipe._score_decisions(
+            base_policy, {"data_root": None}, cohort, profile, now_t, now_t, dict(fake_frames), {}, None, None, pred_fn
+        )
+        assert d_ok["BTC_5m"]["status"] == "SIGNAL"
+        assert d_ok["BTC_5m"]["prediction"]["spot_1m_receipt_sha256"] == "c" * 64
+    finally:
+        pipe.close()
+
 

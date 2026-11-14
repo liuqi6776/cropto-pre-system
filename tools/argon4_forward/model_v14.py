@@ -63,17 +63,35 @@ def load_model_bundle_v14(stream, phase="deployment_q4", *, expected_manifest_sh
     return namespace["load_model_bundle"](stream, phase=phase, expected_manifest_sha256=expected_manifest_sha256)
 
 
+def _safe_pos_float(val):
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(num) or num <= 0.0:
+        return None
+    return num
+
+
 def compute_twap60_handicap_bps(twap60_t, spot_close_t, side):
     """Compute ex-ante Chainlink Start-TWAP handicap in bps relative to predicted direction."""
-    if twap60_t is None or spot_close_t is None:
-        return None
-    tw = float(twap60_t)
-    sp = float(spot_close_t)
+    tw = _safe_pos_float(twap60_t)
+    sp = _safe_pos_float(spot_close_t)
     side_u = str(side or "").upper()
-    if not (np.isfinite(tw) and np.isfinite(sp)) or tw <= 0 or sp <= 0 or side_u not in ("UP", "DOWN"):
+    if tw is None or sp is None or side_u not in ("UP", "DOWN"):
         return None
     sgn = 1.0 if side_u == "UP" else -1.0
     return float(((tw - sp) / sp * 10000.0) * sgn)
+
+
+def is_twap60_fail_closed(hcap_guard) -> bool:
+    """Return True when twap60_handicap_guard must block on unavailable/invalid Spot 1m inputs."""
+    if not isinstance(hcap_guard, dict) or hcap_guard.get("enabled") is not True:
+        return False
+    mode = str(hcap_guard.get("on_unavailable", "FAIL_CLOSED")).strip().upper()
+    return mode in ("FAIL_CLOSED", "BLOCK", "SKIP")
 
 
 def _resolve_5m_frame(data_root=None, symbol="BTCUSDT", *, as_of=None, snapshot=None, raw_frame=None, min_rows=12):
@@ -346,6 +364,7 @@ def apply_volatility_regime_guard(
     spot_twap60_t=None,
     spot_close_t=None,
     ex_ante_twap60_handicap_bps=None,
+    twap60_unavailable=False,
 ):
     """Attach ex_ante_rv12_bps / macro returns and apply volatility, time-segmented blackouts & macro trend guards."""
     res = dict(prediction)
@@ -369,14 +388,29 @@ def apply_volatility_regime_guard(
         res["ex_ante_own_ret_15m_bps"] = float(own_ret_15m_bps)
     if own_streak_3bar is not None:
         res["ex_ante_own_streak_3bar"] = int(own_streak_3bar)
-    if spot_twap60_t is not None:
-        res["ex_ante_spot_twap60_t"] = float(spot_twap60_t)
-    if spot_close_t is not None:
-        res["ex_ante_spot_close_t"] = float(spot_close_t)
-    if ex_ante_twap60_handicap_bps is None and spot_twap60_t is not None and spot_close_t is not None:
-        ex_ante_twap60_handicap_bps = compute_twap60_handicap_bps(spot_twap60_t, spot_close_t, res.get("side"))
+    spot_inputs_supplied = (
+        spot_twap60_t is not None
+        or spot_close_t is not None
+        or ex_ante_twap60_handicap_bps is not None
+    )
+    tw_safe = _safe_pos_float(spot_twap60_t)
+    sc_safe = _safe_pos_float(spot_close_t)
+    if tw_safe is not None:
+        res["ex_ante_spot_twap60_t"] = tw_safe
+    if sc_safe is not None:
+        res["ex_ante_spot_close_t"] = sc_safe
+    if ex_ante_twap60_handicap_bps is None and tw_safe is not None and sc_safe is not None:
+        ex_ante_twap60_handicap_bps = compute_twap60_handicap_bps(tw_safe, sc_safe, res.get("side"))
     if ex_ante_twap60_handicap_bps is not None:
-        res["ex_ante_twap60_handicap_bps"] = float(ex_ante_twap60_handicap_bps)
+        try:
+            hcap_val = float(ex_ante_twap60_handicap_bps)
+        except (TypeError, ValueError):
+            hcap_val = float("nan")
+        if np.isfinite(hcap_val):
+            res["ex_ante_twap60_handicap_bps"] = hcap_val
+            ex_ante_twap60_handicap_bps = hcap_val
+        else:
+            ex_ante_twap60_handicap_bps = None
     if not (isinstance(guard_config, dict) and guard_config.get("enabled") is True):
         return res
 
@@ -623,6 +657,16 @@ def apply_volatility_regime_guard(
                 if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
                     res["selected"] = False
                 return res
+        elif (
+            ex_ante_twap60_handicap_bps is None
+            and (bool(twap60_unavailable) or spot_inputs_supplied)
+            and is_twap60_fail_closed(hcap_guard)
+        ):
+            res["volatility_regime_guarded"] = True
+            res["volatility_regime_reason"] = "TWAP60_SPOT_1M_UNAVAILABLE"
+            res["volatility_regime_action"] = action
+            res["selected"] = False
+            return res
 
     tiered_cfg = guard_config.get("confidence_tiered_max_buy_price")
     if isinstance(tiered_cfg, dict) and tiered_cfg.get("enabled") is True and res.get("selected") is True:
@@ -692,6 +736,7 @@ def predict_stream_v14(
     spot_twap60_t=None,
     spot_close_t=None,
     ex_ante_twap60_handicap_bps=None,
+    twap60_unavailable=False,
 ):
     if (stream in model.STREAMS and phase in model.FOLDS) or model.predict_stream is not _ORIGINAL_PREDICT_STREAM:
         if phase == "deployment_q4":
@@ -730,7 +775,7 @@ def predict_stream_v14(
             spot_close_t,
             ex_ante_twap60_handicap_bps,
         )
-    ):
+    ) or bool(twap60_unavailable):
         res = apply_volatility_regime_guard(
             stream,
             res,
@@ -749,5 +794,6 @@ def predict_stream_v14(
             spot_twap60_t=spot_twap60_t,
             spot_close_t=spot_close_t,
             ex_ante_twap60_handicap_bps=ex_ante_twap60_handicap_bps,
+            twap60_unavailable=bool(twap60_unavailable),
         )
     return res

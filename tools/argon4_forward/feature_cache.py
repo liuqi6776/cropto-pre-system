@@ -127,7 +127,7 @@ class FeatureSnapshot:
         self._symbols = tuple(symbols or reference.SYMBOLS)
         self._lock = threading.RLock()
         self._closed = False
-        self._raw, self._validated = {}, {}
+        self._raw, self._validated, self._inflight_decodes = {}, {}, {}
         self._stats = {"physical_reads": 0, "parquet_decodes": 0, "validated_cache_hits": 0,
                        "builds": 0, "input_history_truncated": False}
         expected = {}
@@ -175,6 +175,7 @@ class FeatureSnapshot:
             self._closed = True
             self._raw.clear()
             self._validated.clear()
+            self._inflight_decodes.clear()
 
     def __enter__(self):
         return self
@@ -184,18 +185,26 @@ class FeatureSnapshot:
 
     def _read_validated(self, path):
         p = Path(path).resolve()
-        with self._lock:
-            if self._closed:
-                raise reference.ModelInputError("feature snapshot already closed")
-            if p not in self._raw:
-                raise reference.ModelInputError("source not captured in this cohort snapshot")
-            if p in self._validated:
-                self._stats["validated_cache_hits"] += 1
-                frame, availability, fingerprint = self._validated[p]
-                return frame.copy(), deepcopy(availability), dict(fingerprint)
-            raw, digest = self._raw[p]
+        owner_event = None
+        while True:
+            with self._lock:
+                if self._closed:
+                    raise reference.ModelInputError("feature snapshot already closed")
+                if p not in self._raw:
+                    raise reference.ModelInputError("source not captured in this cohort snapshot")
+                if p in self._validated:
+                    self._stats["validated_cache_hits"] += 1
+                    frame, availability, fingerprint = self._validated[p]
+                    return frame.copy(), deepcopy(availability), dict(fingerprint)
+                wait_event = self._inflight_decodes.get(p)
+                if wait_event is None:
+                    owner_event = threading.Event()
+                    self._inflight_decodes[p] = owner_event
+                    raw, digest = self._raw[p]
+                    break
+            wait_event.wait()
+        try:
             frame = pd.read_parquet(io.BytesIO(raw))
-            self._stats["parquet_decodes"] += 1
             cutoff = self.cutoff
             received_field = "first_received_at" if "first_received_at" in frame.columns else "available_at" if "available_at" in frame.columns else None
             if received_field:
@@ -254,8 +263,34 @@ class FeatureSnapshot:
                     availability[f"DVOL_{coin}"] = {"last_available_time": str(dates.iloc[-1] + pd.Timedelta(days=1, minutes=5)), "rows": len(sub)}
             else:
                 raise reference.ModelInputError("unrecognized feature source")
-            self._validated[p] = (frame.copy(), deepcopy(availability), dict(fingerprint))
+            with self._lock:
+                if self._closed:
+                    raise reference.ModelInputError("feature snapshot already closed")
+                self._stats["parquet_decodes"] += 1
+                self._validated[p] = (frame.copy(), deepcopy(availability), dict(fingerprint))
             return frame, availability, fingerprint
+        finally:
+            with self._lock:
+                if self._inflight_decodes.get(p) is owner_event:
+                    self._inflight_decodes.pop(p, None)
+            if owner_event is not None:
+                owner_event.set()
+
+    def prewarm_validated(self, *, max_workers=4):
+        """Decode and validate all captured snapshot parquets in parallel before symbol builds."""
+        with self._lock:
+            if self._closed:
+                return
+            paths = [p for p in self._raw if p not in self._validated]
+        if len(paths) <= 1 or max_workers <= 1:
+            for p in paths:
+                self._read_validated(p)
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(int(max_workers), len(paths)), thread_name_prefix="argon4-pq") as pool:
+            futs = [pool.submit(self._read_validated, p) for p in paths]
+            for fut in futs:
+                fut.result()
 
     def build(self, symbol="BTCUSDT", *, tail_rows=1):
         if symbol not in self._symbols:

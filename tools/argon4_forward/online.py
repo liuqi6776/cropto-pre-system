@@ -682,9 +682,17 @@ class OnlineInputs:
         step = STEPS[interval]
         context = self._guard_generation()
         cohort_id = context[2] if context is not None else None
+        is_settle_maint = cohort_id is not None and str(cohort_id).startswith("maintenance:settle:")
+        skip_settle_refresh = not (
+            is_settle_maint
+            and (
+                interval == "5m"
+                or (interval in ("1h", "4h") and (cutoff - cutoff.floor(step)) < pd.Timedelta(minutes=5))
+            )
+        )
         if self._closed_cache_complete(
                 old, "date", step, cutoff.floor(step)-step,
-                min_rows=int(pd.Timedelta(days=15)/step)) and (
+                min_rows=int(pd.Timedelta(days=15)/step)) and skip_settle_refresh and (
                 interval != "5m" or (
                     cohort_id is not None
                     and not str(cohort_id).startswith("maintenance:")
@@ -745,6 +753,8 @@ class OnlineInputs:
         merged = _merge(old, new, ["date"])
         if merged.empty:
             raise ValueError("EMPTY_CANDLES")
+        if not old.empty and len(merged) == len(old):
+            return str(path)
         self._publish_frame(merged, path)
         return str(path)
 
