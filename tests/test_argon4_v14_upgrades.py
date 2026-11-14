@@ -349,7 +349,7 @@ def test_correction3_revision_archive_hash_cache_and_observations_hardlink(runti
 def test_correction5_and_6_production_policy_preserves_verified_v13r2_parameters():
     """Correction 5 & 6: production policy keeps verified execution parameters and fastpath profile."""
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["max_buy_price"] == 0.485
+    assert policy["max_buy_price"] == 0.525
     assert "high_confidence_max_buy_price" not in policy
     assert "high_confidence_thresholds" not in policy
     assert "partial_fill_remainder_cascade" not in policy
@@ -728,7 +728,7 @@ def test_v14r4_snapshots_only_large_observations_hardlink_chained_delta_and_acti
 
     # Verify production policy has both empirical guards enabled and MonitorAuditLogger formats both
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == 0.445
+    assert policy["min_buy_price"] == 0.47
     assert policy["volatility_regime_guard"]["enabled"] is True
     assert policy["volatility_regime_guard"]["min_rv12_bps"]["BTC_5m"] == 3.0
 
@@ -777,8 +777,8 @@ def test_v14r5_multilevel_orderbook_adverse_selection_guard_and_immediate_skip_w
     from tools.argon4_forward.execution import PaperExecutor
 
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == 0.445
-    assert policy["max_buy_price"] == 0.485
+    assert policy["min_buy_price"] == 0.47
+    assert policy["max_buy_price"] == 0.525
     assert policy["execution"]["multi_look_ioc"] is False
 
     market_btc = {
@@ -1438,12 +1438,12 @@ def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_p
     """
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
     assert policy["stream_min_buy_price"] == {
-        "BTC_5m": 0.445,
-        "ETH_5m": 0.445,
-        "SOL_5m": 0.445,
-        "BTC_15m": 0.445,
-        "ETH_15m": 0.445,
-        "SOL_15m": 0.445,
+        "BTC_5m": 0.47,
+        "ETH_5m": 0.47,
+        "SOL_5m": 0.47,
+        "BTC_15m": 0.47,
+        "ETH_15m": 0.47,
+        "SOL_15m": 0.47,
     }
     vg = policy["volatility_regime_guard"]
     assert vg["us_open_blackout"]["enabled"] is True
@@ -1613,9 +1613,9 @@ def test_v14r12_audit_remediations_bleed_cap_stream_max_order_1h_retry_and_fast_
     from tools.argon4_forward.runtime_profile import engineering_profile
 
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == pytest.approx(0.445)
-    assert policy["stream_min_buy_price"]["BTC_15m"] == pytest.approx(0.445)
-    assert policy["stream_min_buy_price"]["SOL_15m"] == pytest.approx(0.445)
+    assert policy["min_buy_price"] == pytest.approx(0.47)
+    assert policy["stream_min_buy_price"]["BTC_15m"] == pytest.approx(0.47)
+    assert policy["stream_min_buy_price"]["SOL_15m"] == pytest.approx(0.47)
     assert policy["stream_max_order_usd"] == {
         "BTC_15m": 240,
         "BTC_5m": 220,
@@ -1887,7 +1887,8 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         "SOL_15m": 250.0,
         "SOL_5m": 250.0,
     }
-    assert vg["confidence_tiered_max_buy_price"]["enabled"] is False
+    assert vg["confidence_tiered_max_buy_price"]["enabled"] is True
+    assert len(vg["confidence_tiered_max_buy_price"]["tiers"]) == 3
     assert policy["execution"]["min_executable_depth_usd"] == pytest.approx(25.0)
     assert policy["execution"]["final_look_min_executable_depth_usd"] == pytest.approx(8.0)
 
@@ -1911,7 +1912,8 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         own_streak_3bar=-3,
     )
     assert res_sol_prod["selected"] is True
-    assert "effective_max_buy_price" not in res_sol_prod
+    assert res_sol_prod["effective_max_buy_price"] == pytest.approx(0.475)
+    assert res_sol_prod["price_tier_reason"] == "MARGINAL_AGAINST_15M_STREAK"
 
     # True black-swan liquidation waterfall on SOL (-4.25% 1h or -260 bps 15m) is blocked by production vg
     res_sol_blackswan = model_v14.apply_volatility_regime_guard(
@@ -1929,11 +1931,13 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
     assert res_sol_blackswan["selected"] is False
     assert res_sol_blackswan["volatility_regime_reason"] == "OWN_ASSET_1H_WATERFALL_GUARD"
 
-    # Explicit unit guard dictionary to test tight waterfall & confidence-tiered cap branches offline
+    # Explicit unit guard dictionary to test tight waterfall & legacy 2-tier confidence-tiered cap branches offline
     vg_unit = deepcopy(vg)
     vg_unit["own_asset_crash_guard"]["max_own_1h_counter_return_pct"]["SOL_5m"] = 1.8
     vg_unit["own_asset_crash_guard"]["max_own_15m_counter_return_bps"]["SOL_5m"] = 135.0
     vg_unit["confidence_tiered_max_buy_price"]["enabled"] = True
+    vg_unit["confidence_tiered_max_buy_price"].pop("tiers", None)
+    vg_unit["confidence_tiered_max_buy_price"].pop("stream_top_tiers", None)
 
     res_sol_crash = model_v14.apply_volatility_regime_guard(
         "SOL_5m",
@@ -3248,11 +3252,11 @@ def test_v14r20_autonomous_retrain_gatekeeper_promotion_and_systemd_hygiene(tmp_
     assert "old_bal + 800.0" not in server_src
 
     # 2. Verify build_rolling_fold dynamic horizon
-    fold = ar.build_rolling_fold("2027-02-15T10:00:00Z", validation_days=60, valid_horizon_days=95)
+    fold = ar.build_rolling_fold("2027-02-15T10:00:00Z", validation_days=105, valid_horizon_days=95)
     assert pd.Timestamp(fold["train_end"]) < pd.Timestamp(fold["validation_start"])
     assert pd.Timestamp(fold["validation_start"]) < pd.Timestamp(fold["validation_end"])
     assert pd.Timestamp(fold["valid_until"]) >= pd.Timestamp("2027-05-20T00:00:00Z")
-    assert fold["label_mode"] == "SPOT_TWAP60_BLEND"
+    assert fold["label_mode"] == "SPOT_TO_TWAP60_PURE"
     assert fold["half_life_days"] == pytest.approx(270.0)
 
     # 3. Verify incremental runtime -> training parquet sync
@@ -3335,10 +3339,10 @@ def test_v14r24_four_structural_alpha_laws_and_midwindow_settle_reconciler(tmp_p
 
     # 1. Policy assertions: all 4 structural laws + anti-overfitting non-changes
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == pytest.approx(0.445)
-    assert policy["max_buy_price"] == pytest.approx(0.485)
+    assert policy["min_buy_price"] == pytest.approx(0.47)
+    assert policy["max_buy_price"] == pytest.approx(0.525)
     assert all(
-        policy["stream_min_buy_price"][st] == pytest.approx(0.445)
+        policy["stream_min_buy_price"][st] == pytest.approx(0.47)
         for st in ("BTC_15m", "ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m")
     )
     assert policy["execution_stage"]["enabled_streams"] == [
@@ -3536,6 +3540,164 @@ def test_v14r24_four_structural_alpha_laws_and_midwindow_settle_reconciler(tmp_p
         assert len(refresh_calls) == 1
     finally:
         pipe_m.close()
+
+
+def test_v15_confidence_tiers_freshness_veto_and_lookback_parity(tmp_path, monkeypatch, raw_fixture):
+    """v15r1:
+    1. Multi-tier delta_z max_buy_price (0.490/0.498, 0.502/0.510, 0.510/0.520 + BTC_15m >=1.00 -> 0.525).
+    2. PaperExecutor & Account support fills up to 0.525, attach book_snapshot onto fill_view, and enforce
+       EXECUTION_FRESHNESS_VETO (ADVERSE_SPOT_DRIFT_VETO & BOOK_FALLING_KNIFE_VETO) while unlocking lower ranks.
+    3. FeatureSnapshot.build(max_lookback_5m=3456) matches full-frame build bit-for-bit on the closed row.
+    4. ForwardPipeline prefetches auxiliary inputs for next_window even during REVISION_WAITING_FUTURE_WINDOW.
+    """
+    from copy import deepcopy
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    import numpy as np
+    from tools.argon4_forward import account, execution, feature_cache, online, pipeline, revisions
+    from test_argon4_forward_execution import BOUNDARY, clock as make_clock, fixture_inputs, no_signal, v5_policy
+
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    vg = policy["volatility_regime_guard"]
+    assert policy["live_enabled"] is False
+    assert policy["execution_freshness_guard"]["enabled"] is True
+
+    # 1. Verify 3-tier delta_z + BTC_15m top tier 0.525
+    cases = [
+        ("ETH_5m", 1.80, 1.70, 0.490, "CONFIDENCE_TIER_1_5M"),    # delta_z = 0.10
+        ("ETH_5m", 2.15, 1.70, 0.502, "CONFIDENCE_TIER_2_5M"),    # delta_z = 0.45
+        ("ETH_5m", 2.60, 1.70, 0.510, "CONFIDENCE_TIER_3_5M"),    # delta_z = 0.90
+        ("BTC_15m", 1.80, 1.70, 0.498, "CONFIDENCE_TIER_1_15M"),  # delta_z = 0.10
+        ("BTC_15m", 2.20, 1.70, 0.510, "CONFIDENCE_TIER_2_15M"),  # delta_z = 0.50
+        ("BTC_15m", 2.55, 1.70, 0.520, "CONFIDENCE_TIER_3_15M"),  # delta_z = 0.85
+        ("BTC_15m", 2.85, 1.70, 0.525, "CONFIDENCE_STREAM_TOP_TIER_BTC_15m"),  # delta_z = 1.15 >= 1.00
+    ]
+    for st, zv, th, exp_cap, exp_reason in cases:
+        out = model_v14.apply_volatility_regime_guard(
+            st,
+            {"selected": True, "side": "UP", "z_v4": zv, "threshold_frozen": th},
+            ex_ante_rv12_bps=10.0,
+            guard_config=vg,
+            cohort_time="2026-11-14T06:00:00+00:00",
+            spot_twap60_t=90000.0,
+            spot_close_t=90000.0,
+        )
+        assert out["selected"] is True
+        assert out["effective_max_buy_price"] == pytest.approx(exp_cap)
+        assert out["price_tier_reason"] == exp_reason
+
+    # 2. Verify PaperExecutor fills BTC_15m at 0.522 when effective_max_buy_price=0.525,
+    #    vetoes ETH_5m on ADVERSE_SPOT_DRIFT_VETO (-3.2 bps), vetoes ETH_15m on BOOK_FALLING_KNIFE_VETO (-0.045),
+    #    and unlocks BTC_5m cleanly!
+    test_pol = {
+        **v5_policy(),
+        "version": "v15-freshness-test",
+        "max_buy_price": 0.525,
+        "min_buy_price": 0.47,
+        "stream_min_buy_price": policy["stream_min_buy_price"],
+        "execution_freshness_guard": {
+            "enabled": True,
+            "max_5m_adverse_spot_drift_bps": 2.5,
+            "max_15m_adverse_spot_drift_bps": 3.5,
+            "max_book_ask_drop": 0.04,
+        },
+        "order": ["BTC_15m", "ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m", "BNB_15m"],
+    }
+    ledger = account.Account(tmp_path / "v15_acc.sqlite3", initial_capital=10000, started_at=BOUNDARY - timedelta(seconds=1))
+    exec_v15 = execution.PaperExecutor(ledger, test_pol)
+    decisions, markets = fixture_inputs(capacity=300, boundary=BOUNDARY)
+    # Set BTC_15m ask = 0.522 (requires 0.525 cap!), ETH_5m ask = 0.490, ETH_15m ask = 0.480 (down from early 0.525!)
+    decisions["BTC_15m"]["signal"]["effective_max_buy_price"] = 0.525
+    decisions["BTC_15m"]["signal"]["spot_close_t"] = 90000.0
+    decisions["ETH_5m"]["signal"]["effective_max_buy_price"] = 0.502
+    decisions["ETH_5m"]["signal"]["spot_close_t"] = 3000.0
+    decisions["ETH_15m"]["signal"]["effective_max_buy_price"] = 0.510
+    decisions["ETH_15m"]["signal"]["spot_close_t"] = 3000.0
+    decisions["BTC_5m"]["signal"]["effective_max_buy_price"] = 0.502
+    decisions["BTC_5m"]["signal"]["spot_close_t"] = 90000.0
+    for st_off in ("SOL_15m", "SOL_5m", "BNB_15m"):
+        decisions[st_off] = no_signal(st_off, BOUNDARY)
+
+    markets["BTC_15m"]["books"]["UP"]["asks"] = [{"price": 0.522, "size": 600}]
+    markets["ETH_5m"]["books"]["UP"]["asks"] = [{"price": 0.490, "size": 600}]
+    markets["ETH_15m"]["books"]["UP"]["asks"] = [{"price": 0.480, "size": 600}]
+    markets["BTC_5m"]["books"]["UP"]["asks"] = [{"price": 0.495, "size": 600}]
+
+    # BTC spot drifted +0.5 bps (favorable for UP), ETH spot drifted -3.2 bps (adverse > 2.5 bps for 5m!)
+    spot_mids = {"BTC": 90004.5, "ETH": 2999.04}
+    eth15_mid = markets["ETH_15m"]["market_id"]
+    early_asks = {(eth15_mid, "UP"): 0.525}  # 0.480 - 0.525 = -0.045 <= -0.04 -> BOOK_FALLING_KNIFE_VETO!
+    now_ts = BOUNDARY + timedelta(seconds=2)
+    res = exec_v15.process_cohort(
+        BOUNDARY.isoformat(),
+        decisions,
+        markets,
+        now=now_ts,
+        clock=make_clock(now_ts),
+        spot_mid_provider=lambda und: spot_mids.get(und),
+        early_best_asks=early_asks,
+    )
+    assert res["status"] == "PROCESSED", res
+    assert res["stream_results"]["BTC_15m"]["status"] == "FILLED_BUDGET"
+    assert res["stream_results"]["ETH_5m"]["status"] == "EXECUTION_FRESHNESS_VETO"
+    assert res["stream_results"]["ETH_5m"]["veto_reason"] == "ADVERSE_SPOT_DRIFT_VETO"
+    assert res["stream_results"]["ETH_15m"]["status"] == "EXECUTION_FRESHNESS_VETO"
+    assert res["stream_results"]["ETH_15m"]["veto_reason"] == "BOOK_FALLING_KNIFE_VETO"
+    assert res["stream_results"]["BTC_5m"]["status"] == "FILLED_BUDGET"
+    assert len(res["fills"]) == 2
+    assert res["fills"][0]["book_snapshot"]["best_ask"] == pytest.approx(0.522)
+    assert res["fills"][0]["limit_price"] == pytest.approx(0.525)
+
+    # 3. Verify FeatureSnapshot.build(max_lookback_5m=3456) bit-exact parity vs full build
+    fx_root, fx_idx = raw_fixture
+    as_of_f = fx_idx[-1] + pd.Timedelta(minutes=5)
+    snap_full = feature_cache.FeatureSnapshot(fx_root, as_of=as_of_f)
+    snap_fast = feature_cache.FeatureSnapshot(fx_root, as_of=as_of_f)
+    try:
+        f_full = snap_full.build("BTCUSDT", tail_rows=1)
+        f_fast = snap_fast.build("BTCUSDT", tail_rows=1, max_lookback_5m=3456)
+        assert f_full["base"].to_numpy().tobytes() == f_fast["base"].to_numpy().tobytes()
+        assert f_full["expert"].to_numpy().tobytes() == f_fast["expert"].to_numpy().tobytes()
+        assert snap_fast.stats["input_history_truncated"] is False
+    finally:
+        snap_full.close()
+        snap_fast.close()
+
+    # 4. Verify REVISION_WAITING_FUTURE_WINDOW runs prefetch_inputs ahead of next_window when warmup_complete
+    rt_p = tmp_path / "rt_rev_prefetch"
+    rt_p.mkdir(parents=True, exist_ok=True)
+    acc_p = account.Account(rt_p / "paper.sqlite3", initial_capital=1000, started_at=BOUNDARY - timedelta(minutes=5))
+    obs_p = SimpleNamespace(save=lambda *a, **k: None, latest=lambda *a, **k: None, path=str(rt_p / "obs.sqlite3"))
+    pipe_p = pipeline.ForwardPipeline(acc_p, rt_p, obs_p)
+    try:
+        t_pre = BOUNDARY + timedelta(seconds=294)  # 6s before next_window = BOUNDARY + 5m
+        monkeypatch.setattr(pipeline, "calibrated_now", lambda c, upper=True: t_pre)
+        monkeypatch.setattr(pipe_p, "load_ready", lambda: policy)
+        monkeypatch.setattr(pipe_p, "update_clock", lambda: pipe_p.clock)
+        monkeypatch.setattr(
+            revisions,
+            "ensure_view_committed",
+            lambda rt: {"status": "COMMITTED", "revision_id": "rev-1", "view_effective_at": (BOUNDARY + timedelta(seconds=100)).isoformat()},
+        )
+        pipe_p.clock = {
+            "status": "CALIBRATED", "uncertainty_seconds": 0.05, "server_minus_local_seconds": 0.0,
+            "calibrated_monotonic": 1e9, "observed_at": BOUNDARY.isoformat(), "receipt_sha256": "e" * 64,
+        }
+        pipe_p.warmup_complete = True
+        prefetched = []
+        pipe_p.inputs = SimpleNamespace(
+            clock=lambda: t_pre,
+            clock_evidence_sha256="e" * 64,
+            client=SimpleNamespace(clock=lambda: t_pre, clock_evidence_sha256="e" * 64),
+            prefetch_auxiliary=lambda **kw: prefetched.append(kw) or {"status": "PREFETCH_COMPLETE", "cohort_id": kw["cohort_id"]},
+        )
+        pipe_p.cycle()
+        assert pipe_p.status()["status"] == "REVISION_WAITING_FUTURE_WINDOW"
+        assert len(prefetched) == 1
+        assert prefetched[0]["cohort_id"] == "prefetch:" + (BOUNDARY + timedelta(minutes=5)).isoformat()
+    finally:
+        pipe_p.close()
+
 
 
 

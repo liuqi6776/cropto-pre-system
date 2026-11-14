@@ -260,8 +260,8 @@ class ClobExecutor:
 
         # In shadow mode without network, start with simulated balance; in live mode start unverified (0.0)
         if self.mode == "shadow":
-            self._cached_free_usdc: float = 1000.0
-            self._cached_allowance_usdc: float = 1000.0
+            self._cached_free_usdc: float = 1269.0
+            self._cached_allowance_usdc: float = 1000000.0
             self.balance_verified: bool = True
         else:
             self._cached_free_usdc = 0.0
@@ -1086,7 +1086,7 @@ class ClobExecutor:
             and (
                 skip_preflight_book_fetch
                 or (
-                    self.mode == "live"
+                    self.mode in ("live", "shadow")
                     and not self._has_custom_book_hook()
                     and obs_age_sec is not None
                     and -1.0 <= obs_age_sec <= self.fresh_observed_book_max_age_seconds
@@ -1967,8 +1967,11 @@ class ClobExecutor:
         verified_bal: Decimal | None = None
         verified_all: Decimal | None = None
 
+        client_balance_monkeypatched = (
+            self.client is not None and "get_balance_allowance" in getattr(self.client, "__dict__", {})
+        )
         if self.client is not None and (
-            self.has_l2_creds or "get_balance_allowance" in getattr(self.client, "__dict__", {})
+            (self.mode == "live" and self.has_l2_creds) or client_balance_monkeypatched
         ):
             try:
                 res = self.client.get_balance_allowance(
@@ -1999,7 +2002,8 @@ class ClobExecutor:
             except Exception as exc:
                 logger.warning("Failed to fetch CLOB balance/allowance: %s", exc)
 
-        if verified_bal is None and self.has_valid_funder:
+        erc20_monkeypatched = "_query_onchain_erc20_balance" in self.__dict__
+        if verified_bal is None and self.has_valid_funder and (self.mode == "live" or erc20_monkeypatched):
             verified_bal = self._query_onchain_erc20_balance(self.funder_address, self.pusd_collateral_address)
 
         if verified_bal is not None:

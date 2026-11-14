@@ -67,6 +67,12 @@ def test_build_twap60_labels_pure_and_blend_with_fallback():
     # Validation evaluation target must remain pure Chainlink TWAP60 return!
     assert np.isclose(ev_blend[1], expected_twap_r1)
 
+    tr_s2t, ev_s2t = twap60_retrain.build_twap60_labels(
+        raw, 1, index=idx, mode="SPOT_TO_TWAP60_PURE", spot_1m_frame=s1
+    )
+    assert np.isclose(tr_s2t[1], expected_s2t_r1)
+    assert np.isclose(ev_s2t[1], expected_twap_r1)
+
 
 def test_fit_family_weighted_produces_frozen_model_compatible_bundle():
     rng = np.random.default_rng(42)
@@ -168,8 +174,8 @@ def test_policy_twap60_handicap_guard_and_manifest_pins():
         bundle = model.load_model_bundle(stream, "deployment_q4", expected_manifest_sha256=expected_sha)
         assert bundle["manifest_sha256"] == expected_sha
         fold_meta = bundle["manifest"]["fold"]
-        assert pd.Timestamp(fold_meta["valid_until"]) >= pd.Timestamp("2027-03-01T00:00:00Z")
-        assert fold_meta["label_mode"] == "SPOT_TWAP60_BLEND"
+        assert pd.Timestamp(fold_meta["valid_until"]) >= pd.Timestamp("2027-02-01T00:00:00Z")
+        assert fold_meta["label_mode"] == "SPOT_TO_TWAP60_PURE"
         assert fold_meta["half_life_days"] == 270.0
         assert bundle["manifest"]["sample_weight_policy"] == "exponential_decay_half_life_270.0d"
 

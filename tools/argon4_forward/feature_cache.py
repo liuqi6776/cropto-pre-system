@@ -292,18 +292,29 @@ class FeatureSnapshot:
             for fut in futs:
                 fut.result()
 
-    def build(self, symbol="BTCUSDT", *, tail_rows=1):
+    def build(self, symbol="BTCUSDT", *, tail_rows=1, max_lookback_5m=None):
         if symbol not in self._symbols:
             raise reference.ModelInputError("unsupported local feature source or symbol")
         if self._closed:
             raise reference.ModelInputError("feature snapshot already closed")
         frames, availability, fingerprints = {}, {}, {}
+        lookback_5m = (
+            max(2304, int(max_lookback_5m))
+            if max_lookback_5m is not None and tail_rows is not None and int(tail_rows) <= 4
+            else None
+        )
+        lookback_1h = (lookback_5m // 12 + 240) if lookback_5m is not None else None
 
         def reader(path):
             p = Path(path).resolve()
             frame, meta, fingerprint = self._read_validated(p)
             availability.update(meta)
             fingerprints[str(p.relative_to(reference.ROOT))] = fingerprint
+            if lookback_5m is not None:
+                if p.parent.name == "intraday" and len(frame) > lookback_5m:
+                    frame = frame.iloc[-lookback_5m:]
+                elif "_1h_" in p.name and lookback_1h is not None and len(frame) > lookback_1h:
+                    frame = frame.iloc[-lookback_1h:]
             return frame
 
         intraday_paths = tuple(self._raw)[:len(self._symbols)]

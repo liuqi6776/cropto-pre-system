@@ -31,32 +31,32 @@ from threadpoolctl import threadpool_limits
 from . import model, model_v14
 
 FROZEN_MODEL_PY_SHA256 = "1d9629abf05c27eeec0ed6e63ae4b4fc65c4f2b904dca4de9549698cf1a009f7"
-LABEL_MODES = ("BINANCE_PERP_POINT", "SPOT_TWAP60", "SPOT_TWAP60_BLEND")
+LABEL_MODES = ("BINANCE_PERP_POINT", "SPOT_TWAP60", "SPOT_TWAP60_BLEND", "SPOT_TO_TWAP60_PURE")
 
 BIMONTHLY_FOLDS = {
     "deployment_q4": {
         "train_start": "2024-01-05T00:00:00Z",
-        "train_end": "2026-09-10T21:55:00Z",
-        "validation_start": "2026-09-11T00:00:00Z",
+        "train_end": "2026-07-28T21:55:00Z",
+        "validation_start": "2026-07-29T00:00:00Z",
         "validation_end": "2026-11-11T21:55:00Z",
         "test_start": None,
         "test_end": None,
         "valid_from": "2026-10-01T00:00:00Z",
         "valid_until": "2027-03-01T00:00:00Z",
         "half_life_days": 270.0,
-        "label_mode": "SPOT_TWAP60_BLEND",
+        "label_mode": "SPOT_TO_TWAP60_PURE",
     },
     "deployment_2027_q1": {
         "train_start": "2024-01-05T00:00:00Z",
-        "train_end": "2026-09-30T21:55:00Z",
-        "validation_start": "2026-10-01T00:00:00Z",
+        "train_end": "2026-08-17T21:55:00Z",
+        "validation_start": "2026-08-18T00:00:00Z",
         "validation_end": "2026-11-30T21:55:00Z",
         "test_start": None,
         "test_end": None,
         "valid_from": "2026-12-01T00:00:00Z",
         "valid_until": "2027-03-01T00:00:00Z",
         "half_life_days": 270.0,
-        "label_mode": "SPOT_TWAP60_BLEND",
+        "label_mode": "SPOT_TO_TWAP60_PURE",
     },
 }
 
@@ -140,7 +140,7 @@ def build_twap60_labels(
     o, c = raw["open"].to_numpy(dtype=np.float64), raw["close"].to_numpy(dtype=np.float64)
     result[:-k] = c[k:] / o[1 : len(o) - k + 1] - 1.0
 
-    if mode in ("SPOT_TWAP60", "SPOT_TWAP60_BLEND") and index is not None and (spot_1m_frame is not None or symbol is not None):
+    if mode in ("SPOT_TWAP60", "SPOT_TWAP60_BLEND", "SPOT_TO_TWAP60_PURE") and index is not None and (spot_1m_frame is not None or symbol is not None):
         s1 = spot_1m_frame
         if s1 is None and symbol is not None:
             spot_1m_path = Path(data_root) / "spot_1m" / f"{symbol}_1m_spot.parquet"
@@ -158,7 +158,11 @@ def build_twap60_labels(
             spc = s1[spc_col].reindex(close_ts).to_numpy(dtype=np.float64)
             twap_ret = np.full(len(raw), np.nan, dtype=np.float64)
             twap_ret[:-k] = tw60[k:] / tw60[:-k] - 1.0
-            if mode == "SPOT_TWAP60_BLEND":
+            if mode == "SPOT_TO_TWAP60_PURE":
+                s2t_ret = np.full(len(raw), np.nan, dtype=np.float64)
+                s2t_ret[:-k] = tw60[k:] / spc[:-k] - 1.0
+                target_ret = s2t_ret
+            elif mode == "SPOT_TWAP60_BLEND":
                 s2t_ret = np.full(len(raw), np.nan, dtype=np.float64)
                 s2t_ret[:-k] = tw60[k:] / spc[:-k] - 1.0
                 target_ret = 0.5 * twap_ret + 0.5 * s2t_ret
@@ -196,7 +200,7 @@ def train_twap60_streams(
     base_fold = dict(BIMONTHLY_FOLDS.get(phase, model.FOLDS.get(phase, BIMONTHLY_FOLDS["deployment_q4"])))
     if fold_override:
         base_fold.update(fold_override)
-    label_mode = str(base_fold.get("label_mode", "SPOT_TWAP60_BLEND"))
+    label_mode = str(base_fold.get("label_mode", "SPOT_TO_TWAP60_PURE"))
     half_life_days = base_fold.get("half_life_days", 270.0)
 
     streams = list(selected_streams or model.STREAMS.keys())
@@ -255,7 +259,26 @@ def train_twap60_streams(
                 sw = compute_exponential_sample_weights(frames["index"][tr], base_fold["train_end"], half_life_days)
                 base_fam, z0 = fit_family_weighted(x[tr], y, x[va], expert=False, sample_weight=sw)
                 exp_fam, zd = fit_family_weighted(xd[tr], y, xd[va], expert=True, sample_weight=sw)
-                weight, threshold_reset, grid = model.select_weight(z0, zd, va_eval, quantile)
+                va_atm_mask = None
+                if label_mode == "SPOT_TO_TWAP60_PURE" and spot_1m_df is not None and not spot_1m_df.empty:
+                    s1_va = spot_1m_df.set_index(pd.to_datetime(spot_1m_df["bound_ts"], utc=True)) if "bound_ts" in spot_1m_df.columns else spot_1m_df.copy()
+                    s1_va.index = pd.to_datetime(s1_va.index, utc=True)
+                    if s1_va.index.has_duplicates:
+                        s1_va = s1_va.loc[~s1_va.index.duplicated(keep="last")]
+                    va_close_ts = pd.to_datetime(frames["index"][va], utc=True) + pd.Timedelta(minutes=5)
+                    tw_va = s1_va["twap60"].reindex(va_close_ts).to_numpy(dtype=np.float64)
+                    sp_col = "spot_close" if "spot_close" in s1_va.columns else "close"
+                    sp_va = s1_va[sp_col].reindex(va_close_ts).to_numpy(dtype=np.float64)
+                    abs_hcap_bps = np.abs(tw_va / sp_va - 1.0) * 10000.0
+                    cand_mask = np.isfinite(abs_hcap_bps) & (abs_hcap_bps <= 2.0) & np.isfinite(va_eval) & (va_eval != 0.0)
+                    if int(cand_mask.sum()) >= 200:
+                        va_atm_mask = cand_mask
+                if va_atm_mask is not None:
+                    weight, threshold_reset, grid = model.select_weight(
+                        z0[va_atm_mask], zd[va_atm_mask], va_eval[va_atm_mask], quantile
+                    )
+                else:
+                    weight, threshold_reset, grid = model.select_weight(z0, zd, va_eval, quantile)
                 threshold_frozen = float(np.quantile(np.abs(z0), quantile))
 
                 package = {

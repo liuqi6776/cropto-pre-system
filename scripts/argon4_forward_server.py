@@ -149,13 +149,24 @@ def _classify_stream_guard(stream_name, info):
             "guard_type": "RISK_GUARD",
             "summary": f"{stream_name} {side or ''} ({z_str}) · {detail}".strip(),
         }
-    if "CONFIDENCE_TIERED_PRICE_CAP" in ntr:
+    if "EXECUTION_FRESHNESS_VETO" in ntr or exec_st == "EXECUTION_FRESHNESS_VETO":
         detail = ntr.split("(", 1)[1].rstrip(")") if "(" in ntr else ntr
         return {
             "stream": stream_name,
             "side": side,
+            "guard_code": "EXECUTION_FRESHNESS_VETO",
+            "guard_tag": "【风控·防飞刀新鲜度否决】",
+            "guard_type": "RISK_GUARD",
+            "summary": f"{stream_name} {side or ''} ({z_str}) · {detail}".strip(),
+        }
+    if "CONFIDENCE_TIERED_PRICE_CAP" in ntr:
+        detail = ntr.split("(", 1)[1].rstrip(")") if "(" in ntr else ntr
+        detail = detail.replace("微弱信号分层限价", "置信度分层限价")
+        return {
+            "stream": stream_name,
+            "side": side,
             "guard_code": "CONFIDENCE_TIERED_PRICE_CAP",
-            "guard_tag": "【风控·微弱信号限价】",
+            "guard_tag": "【风控·置信度分层限价】",
             "guard_type": "RISK_GUARD",
             "summary": f"{stream_name} {side or ''} ({z_str}) · {detail}".strip(),
         }
@@ -215,6 +226,8 @@ def _classify_stream_guard(stream_name, info):
             "summary": f"{stream_name} {side or ''} · {detail}".strip(),
         }
     if "UNREACHED" in ntr or exec_st == "UNREACHED":
+        if dec_st != "SIGNAL":
+            return None
         return {
             "stream": stream_name,
             "side": side,
@@ -839,16 +852,23 @@ class Application:
         ]
         service = {}
         active_mode_dir = runtime_base / "live"
+        parsed_candidates = []
         for sp in candidate_services:
             if sp.is_file():
                 s_data = load_json(sp, {})
                 if s_data:
-                    service = s_data
+                    cand_pid = s_data.get("pid")
+                    cand_running = _is_pid_running(cand_pid) if isinstance(cand_pid, int) else False
                     if sp.parent.name in ("live", "shadow"):
-                        active_mode_dir = sp.parent
+                        cand_dir = sp.parent
                     elif s_data.get("mode") in ("live", "shadow"):
-                        active_mode_dir = runtime_base / str(s_data["mode"])
-                    break
+                        cand_dir = runtime_base / str(s_data["mode"])
+                    else:
+                        cand_dir = runtime_base / "live"
+                    parsed_candidates.append((cand_running, s_data, cand_dir))
+        chosen = next((c for c in parsed_candidates if c[0]), parsed_candidates[0] if parsed_candidates else None)
+        if chosen is not None:
+            _, service, active_mode_dir = chosen
         if not active_mode_dir.is_dir() and (runtime_base / "shadow").is_dir():
             active_mode_dir = runtime_base / "shadow"
 

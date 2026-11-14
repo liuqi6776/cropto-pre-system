@@ -347,7 +347,7 @@ class MonitorAuditLogger:
                 )
                 is_tiered_cap = (
                     isinstance(limit_val, (int, float))
-                    and float(limit_val) < 0.5149
+                    and float(limit_val) < 0.5249
                 )
                 if st_status == "PRICE_LIMIT_NOT_MET":
                     if is_below_min_buy:
@@ -357,11 +357,21 @@ class MonitorAuditLogger:
                         why = (f"INSUFFICIENT_EXECUTABLE_DEPTH (信号触发 方向={side}, best_ask={best_ask_val}, "
                                f"可执行深度=${float(obs_depth_val):.2f} < 最小深度要求=${float(min_depth_val):.2f})")
                     elif is_tiered_cap:
-                        why = (f"CONFIDENCE_TIERED_PRICE_CAP (信号触发 方向={side}, 微弱信号分层限价 limit_price={limit_val}, "
+                        why = (f"CONFIDENCE_TIERED_PRICE_CAP (信号触发 方向={side}, 置信度分层限价 limit_price={limit_val}, "
                                f"盘口最优卖价 best_ask={best_ask_val} > {limit_val})")
                     else:
                         why = (f"PRICE_LIMIT_NOT_MET (信号触发 方向={side}, 但盘口最优卖价 best_ask={best_ask_val} "
                                f"> 限价上限 limit_price={limit_val})")
+                elif st_status == "EXECUTION_FRESHNESS_VETO":
+                    v_reason = st_out.get("veto_reason", "EXECUTION_FRESHNESS_VETO")
+                    drift_bps = st_out.get("signed_spot_drift_bps")
+                    ask_drop = st_out.get("book_ask_drop")
+                    extra_parts = [f"原因={v_reason}"]
+                    if isinstance(drift_bps, (int, float)):
+                        extra_parts.append(f"现货逆向漂移={float(drift_bps):.2f}bps")
+                    if isinstance(ask_drop, (int, float)):
+                        extra_parts.append(f"卖一跳水={float(ask_drop):.4f}")
+                    why = f"EXECUTION_FRESHNESS_VETO (信号触发 方向={side}, {', '.join(extra_parts)})"
                 elif st_status == "WAITING_PRICE_RECHECK":
                     if is_below_min_buy:
                         why = (f"WAITING_PRICE_RECHECK (信号触发 方向={side}, best_ask={best_ask_val} < "

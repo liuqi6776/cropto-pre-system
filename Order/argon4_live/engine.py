@@ -325,7 +325,37 @@ class LiveExecutionEngine:
             "min_buy_price": float(policy["min_buy_price"]),
             "stream_min_buy_price": stream_min_buy_price,
             "max_buy_price": float(policy["max_buy_price"]),
+            "execution_freshness_guard": (
+                dict(policy["execution_freshness_guard"])
+                if isinstance(policy.get("execution_freshness_guard"), Mapping)
+                else {}
+            ),
         }
+
+    def _fetch_live_spot_mid(self, underlying: str) -> float | None:
+        custom_fn = getattr(self, "_spot_mid_fetcher", None)
+        if callable(custom_fn):
+            val = custom_fn(underlying)
+            return float(val) if val is not None else None
+        if self.config.get("_disable_live_spot_drift_http"):
+            return None
+        try:
+            import requests
+
+            resp = requests.get(
+                "https://data-api.binance.vision/api/v3/ticker/bookTicker",
+                params={"symbol": f"{str(underlying).upper()}USDT"},
+                timeout=0.45,
+            )
+            if resp.status_code == 200:
+                payload = resp.json()
+                bid_p = float(payload.get("bidPrice") or 0.0)
+                ask_p = float(payload.get("askPrice") or 0.0)
+                if bid_p > 0.0 and ask_p >= bid_p:
+                    return 0.5 * (bid_p + ask_p)
+        except Exception:
+            return None
+        return None
 
     def _live_loss_limits(self, scale_dec: Decimal, now_utc: datetime | None = None) -> tuple[Decimal, int, float]:
         if self.max_daily_loss_usd_override is not None:
@@ -835,6 +865,115 @@ class LiveExecutionEngine:
             effective_min_buy_price = float(
                 stream_min_map.get(stream, min_buy_price) if isinstance(stream_min_map, Mapping) else min_buy_price
             )
+            sig_eff_max = sig.get("effective_max_buy_price") if isinstance(sig, Mapping) else None
+            effective_max_buy_price = (
+                min(float(max_buy_price), float(sig_eff_max))
+                if sig_eff_max is not None
+                else float(max_buy_price)
+            )
+            fresh_cfg = paper_caps.get("execution_freshness_guard") or {}
+            if isinstance(fresh_cfg, Mapping) and fresh_cfg.get("enabled") is True:
+                fresh_abort_status: str | None = None
+                fresh_abort_err: str | None = None
+                if observed_best_ask is not None and fill.get("early_best_ask") is not None:
+                    try:
+                        ask_drop = float(observed_best_ask) - float(fill["early_best_ask"])
+                        max_drop = float(fresh_cfg.get("max_book_ask_drop", 0.04))
+                        if ask_drop <= -max_drop:
+                            fresh_abort_status = "ABORTED_FALLING_KNIFE_BOOK"
+                            fresh_abort_err = f"BOOK_FALLING_KNIFE_DROP:{ask_drop:.4f}<=-{max_drop:.4f}"
+                    except (ValueError, TypeError):
+                        pass
+                if fresh_abort_status is None:
+                    signed_drift_bps: float | None = None
+                    spot_close_t = sig.get("spot_close_t") if isinstance(sig, Mapping) else None
+                    if spot_close_t is not None and (
+                        detection_lag_ms >= 800.0 or callable(getattr(self, "_spot_mid_fetcher", None))
+                    ):
+                        live_spot_mid = self._fetch_live_spot_mid(underlying)
+                        if live_spot_mid is not None and live_spot_mid > 0.0 and float(spot_close_t) > 0.0:
+                            dir_sign = 1.0 if outcome == "UP" else -1.0
+                            signed_drift_bps = ((live_spot_mid / float(spot_close_t)) - 1.0) * 10000.0 * dir_sign
+                    elif fill.get("signed_spot_drift_bps") is not None:
+                        try:
+                            signed_drift_bps = float(fill["signed_spot_drift_bps"])
+                        except (ValueError, TypeError):
+                            signed_drift_bps = None
+                    if signed_drift_bps is not None:
+                        max_drift = float(
+                            fresh_cfg.get("max_5m_adverse_spot_drift_bps", 2.5)
+                            if str(stream).endswith("_5m")
+                            else fresh_cfg.get("max_15m_adverse_spot_drift_bps", 3.5)
+                        )
+                        if signed_drift_bps <= -max_drift:
+                            fresh_abort_status = "ABORTED_ADVERSE_SPOT_DRIFT"
+                            fresh_abort_err = f"ADVERSE_SPOT_DRIFT_BPS:{signed_drift_bps:.3f}<=-{max_drift:.3f}"
+                if fresh_abort_status is not None:
+                    if not self.audit.claim_signal(
+                        signal_id=signal_id,
+                        cohort_id=cohort_id,
+                        stream=stream,
+                        paper_order_id=paper_order_id,
+                        claimed_at_utc=live_detected_cal,
+                    ):
+                        continue
+                    slot_idx = len(ordered_slots)
+                    ordered_slots.append(None)
+                    now_iso = format_utc_iso(live_detected_cal)
+                    live_exec = {
+                        "live_scale_factor": float(scale_dec),
+                        "order_type": "FAK",
+                        "limit_price": round(effective_max_buy_price, 4),
+                        "requested_stake_usd": float(desired_stake_usd),
+                        "requested_quantity": "0.00",
+                        "clob_order_id": None,
+                        "clob_status": fresh_abort_status,
+                        "error_code": fresh_abort_err,
+                        "filled_quantity": "0.00",
+                        "avg_fill_price": 0.0,
+                        "cost_usdc": 0.0,
+                        "fee_usdc": 0.0,
+                        "total_spent_usdc": 0.0,
+                        "unfilled_stake_usdc": float(desired_stake_usd),
+                        "polygon_tx_hashes": [],
+                        "onchain_confirmed": False,
+                        "onchain_block_number": None,
+                    }
+                    order_record = {
+                        "cohort_id": cohort_id,
+                        "stream": stream,
+                        "rank": rank,
+                        "signal_id": signal_id,
+                        "paper_order_id": paper_order_id,
+                        "market_id": market_id,
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "outcome": outcome,
+                        "market_protocol": market_protocol,
+                        "neg_risk": neg_risk,
+                        "timing": {
+                            "decision_at": decision_at_str,
+                            "paper_fill_at": paper_fill_at_str,
+                            "live_detected_at": now_iso,
+                            "live_signed_at": now_iso,
+                            "live_http_sent_at": now_iso,
+                            "live_http_ack_at": now_iso,
+                            "detection_lag_ms": detection_lag_ms,
+                            "clob_rtt_ms": 0.0,
+                        },
+                        "paper_benchmark": paper_benchmark,
+                        "live_execution": live_exec,
+                        "diff_vs_paper": compute_diff_vs_paper(paper_benchmark, live_exec, paper_status="OPEN"),
+                    }
+                    self.audit.record_order_execution(
+                        order_record,
+                        underlying=underlying,
+                        window_start=window_start,
+                        window_end=window_end,
+                    )
+                    ordered_slots[slot_idx] = order_record
+                    deferred_snapshots.append((cohort_id, live_detected_cal))
+                    continue
             stream_max_map = paper_caps.get("stream_max_order_usd") or {}
             effective_stream_max_order = float(
                 min(paper_caps["max_order_usd"], float(stream_max_map[stream]))
@@ -1057,7 +1196,7 @@ class LiveExecutionEngine:
                     observed_best_ask=observed_best_ask,
                     book_observed_at=book_observed_at,
                     min_buy_price=effective_min_buy_price,
-                    max_buy_price=max_buy_price,
+                    max_buy_price=effective_max_buy_price,
                     reference_now_utc=detected_local,
                     reference_mono=detected_mono,
                     pre_send_callback=_pre_send_persist,
@@ -1124,6 +1263,7 @@ class LiveExecutionEngine:
                 "detection_lag_ms": detection_lag_ms,
                 "paper_benchmark": paper_benchmark,
                 "effective_min_buy_price": effective_min_buy_price,
+                "effective_max_buy_price": effective_max_buy_price,
                 "pre_send_state": pre_send_state,
                 "pre_send_persist": _pre_send_persist,
                 "exec_bundle": exec_bundle,
@@ -1284,7 +1424,7 @@ class LiveExecutionEngine:
                         observed_best_ask=live_ask,
                         book_observed_at=format_utc_iso(now_retry_cal),
                         min_buy_price=r_ctx["effective_min_buy_price"],
-                        max_buy_price=max_buy_price,
+                        max_buy_price=r_ctx["effective_max_buy_price"],
                         reference_now_utc=retry_ref_utc,
                         reference_mono=retry_ref_mono,
                         pre_send_callback=r_ctx["pre_send_persist"],

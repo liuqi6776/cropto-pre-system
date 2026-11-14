@@ -120,7 +120,7 @@ function renderLive(d){
  }
 
  if($("live-pid-badge"))$("live-pid-badge").textContent=svc.pid?"PID "+svc.pid:"未启动";
- if($("live-proc-status"))$("live-proc-status").textContent=running?"正常运行中 (LIVE)":"已停止";
+ if($("live-proc-status"))$("live-proc-status").textContent=running?("正常运行中 ("+((d.active_mode||svc.mode||"live").toUpperCase())+")"):"已停止";
  if($("live-started-at"))$("live-started-at").textContent=when(svc.started_at);
  if($("live-mode-info"))$("live-mode-info").textContent=(svc.mode||"live").toUpperCase()+" / "+(svc.order_type||"FAK");
  if($("live-scale-info"))$("live-scale-info").textContent=(Number(d.live_scale_factor||1)*100).toFixed(0)+"% (1:1 跟随 "+moneyStrict(pcaps.initial_capital_usd)+" 统一配置)";
@@ -251,6 +251,7 @@ function executionText(result){
   return "第 "+((result.attempt||0)+1)+" 次检查价格未达限价 · "+when(result.next_retry_at)+" 重检 · 下层等待";
  }
  if(status==="BLEED_WINDOW_SINGLE_ORDER_CAP")return "2h阴跌/逼空期同窗口限 1 单护栏触发，已跳过第 2 单";
+ if(status==="EXECUTION_FRESHNESS_VETO")return "执行前最新现货/盘口逆风否决 ("+(result.veto_reason||"防飞刀拦截")+")，已跳过";
  if(status==="FILLED_BUDGET")return "本层额度已完成 · "+money(result.spent_usd)+" / "+money(result.approved_usd);
  if(status==="PARTIAL")return "本层未完成 · 已成交 "+money(result.spent_usd)+" / "+money(result.approved_usd)+"，下层等待";
  if(status==="UNREACHED")return "本轮未检查 · 上层或预算已阻断";

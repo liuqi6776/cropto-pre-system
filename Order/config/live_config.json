@@ -90,7 +90,7 @@
           "min_equity_usd": 2500.0,
           "single_stream_equity_fraction": 0.05,
           "tick_equity_fraction": 0.095,
-          "daily_loss_fraction": 0.10,
+          "daily_loss_fraction": 0.1,
           "max_order_usd": 320.0,
           "max_tick_budget_usd": 520.0,
           "max_active_window_risk_usd": 750.0,
@@ -134,12 +134,12 @@
     "order_type": "FAK",
     "allow_resting_orders": false,
     "protocol_version_default": "v2",
-    "max_buy_price": 0.485,
-    "min_buy_price": 0.445,
+    "max_buy_price": 0.525,
+    "min_buy_price": 0.47,
     "default_tick_size": "0.01",
     "tick_size_limit_prices": {
-      "0.01": 0.48,
-      "0.001": 0.485
+      "0.01": 0.52,
+      "0.001": 0.525
     },
     "default_clob_fee_rate_bps": 1000,
     "neg_risk": false,

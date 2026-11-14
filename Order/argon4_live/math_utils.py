@@ -14,7 +14,7 @@ from typing import Any, Mapping
 
 SHARE_STEP = Decimal("0.01")
 USD_MICRO = Decimal("0.000001")
-MAX_BUY_PRICE_CEILING = Decimal("0.515")
+MAX_BUY_PRICE_CEILING = Decimal("0.530")
 MIN_BUY_PRICE_FLOOR = Decimal("0.37")
 HARD_WINDOW_DEADLINE_SECONDS = 20.0
 

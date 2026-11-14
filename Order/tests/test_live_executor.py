@@ -7278,14 +7278,14 @@ def test_v14r23_filled_clob_status_recorded_as_open_position_and_locks_risk(tmp_
 
 
 def test_v14r24_live_config_tight_price_band_0445_0485_and_single_shot_fak(tmp_path: Path) -> None:
-    """v14r24: Verify tight [0.445, 0.485] band, tick_size=0.01->0.48 floor, single-shot FAK (0 retries),
-    and ABORTED_ABOVE_MAX_BUY_PRICE / ABORTED_BELOW_MIN_BUY_PRICE gating before CLOB submission."""
+    """v15r1: Verify [0.47, 0.525] confidence-tiered price band, tick_size=0.01->0.52 / 0.001->0.525 ceiling,
+    single-shot FAK (0 retries), and ABORTED_ABOVE_MAX_BUY_PRICE / ABORTED_BELOW_MIN_BUY_PRICE gating."""
     cfg_path = Path(__file__).resolve().parents[1] / "config" / "live_config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     exec_cfg = cfg["order_execution"]
-    assert exec_cfg["max_buy_price"] == pytest.approx(0.485)
-    assert exec_cfg["min_buy_price"] == pytest.approx(0.445)
-    assert exec_cfg["tick_size_limit_prices"] == {"0.01": 0.48, "0.001": 0.485}
+    assert exec_cfg["max_buy_price"] == pytest.approx(0.525)
+    assert exec_cfg["min_buy_price"] == pytest.approx(0.47)
+    assert exec_cfg["tick_size_limit_prices"] == {"0.01": 0.52, "0.001": 0.525}
     assert exec_cfg["fak_no_match_max_retries"] == 0
 
     sizing_01 = compute_live_order_sizing(
@@ -7295,7 +7295,7 @@ def test_v14r24_live_config_tight_price_band_0445_0485_and_single_shot_fak(tmp_p
         tick_size="0.01",
         tick_size_limit_prices=exec_cfg["tick_size_limit_prices"],
     )
-    assert sizing_01["limit_price"] == pytest.approx(0.48)
+    assert sizing_01["limit_price"] == pytest.approx(0.52)
 
     sizing_001 = compute_live_order_sizing(
         approved_stake_usd=100.0,
@@ -7304,7 +7304,7 @@ def test_v14r24_live_config_tight_price_band_0445_0485_and_single_shot_fak(tmp_p
         tick_size="0.001",
         tick_size_limit_prices=exec_cfg["tick_size_limit_prices"],
     )
-    assert sizing_001["limit_price"] == pytest.approx(0.485)
+    assert sizing_001["limit_price"] == pytest.approx(0.525)
 
     pk = "0x" + ("94" * 32)
     cands = derive_polymarket_candidate_wallets(pk)
@@ -7331,18 +7331,18 @@ def test_v14r24_live_config_tight_price_band_0445_0485_and_single_shot_fak(tmp_p
     clob._neg_risk["77777"] = False
 
     posted = []
-    book_state = {"ask": "0.49"}
+    book_state = {"ask": "0.53"}
     clob.client.get_order_book = lambda tid: {"asks": [{"price": book_state["ask"], "size": "200"}]}  # type: ignore[method-assign]
     clob.client.post_order = lambda *a, **kw: posted.append(a) or {  # type: ignore[method-assign]
         "success": True,
-        "orderID": "0xord_v14r24_ok",
+        "orderID": "0xord_v15_ok",
         "status": "MATCHED",
         "takingAmount": "50.00",
-        "makingAmount": "23.50",
+        "makingAmount": "25.50",
     }
     valid_until = (datetime.now(timezone.utc) + timedelta(seconds=15)).isoformat()
 
-    # 1) Ask 0.49 > 0.485 -> ABORTED_ABOVE_MAX_BUY_PRICE with 0 post_order calls
+    # 1) Ask 0.53 > 0.525 -> ABORTED_ABOVE_MAX_BUY_PRICE with 0 post_order calls
     res_high = clob.sign_and_execute_fak(
         token_id="77777",
         approved_stake_usd=50.0,
@@ -7353,8 +7353,8 @@ def test_v14r24_live_config_tight_price_band_0445_0485_and_single_shot_fak(tmp_p
     assert res_high["live_execution"]["clob_status"] == "ABORTED_ABOVE_MAX_BUY_PRICE"
     assert len(posted) == 0
 
-    # 2) Ask 0.44 < 0.445 -> ABORTED_BELOW_MIN_BUY_PRICE with 0 post_order calls
-    book_state["ask"] = "0.44"
+    # 2) Ask 0.46 < 0.47 -> ABORTED_BELOW_MIN_BUY_PRICE with 0 post_order calls
+    book_state["ask"] = "0.46"
     res_low = clob.sign_and_execute_fak(
         token_id="77777",
         approved_stake_usd=50.0,
@@ -7365,8 +7365,8 @@ def test_v14r24_live_config_tight_price_band_0445_0485_and_single_shot_fak(tmp_p
     assert res_low["live_execution"]["clob_status"] == "ABORTED_BELOW_MIN_BUY_PRICE"
     assert len(posted) == 0
 
-    # 3) Ask 0.47 inside [0.445, 0.485] -> fills cleanly at 0.48 tick limit
-    book_state["ask"] = "0.47"
+    # 3) Ask 0.51 inside [0.47, 0.525] -> fills cleanly at 0.52 tick limit
+    book_state["ask"] = "0.51"
     res_ok = clob.sign_and_execute_fak(
         token_id="77777",
         approved_stake_usd=50.0,
@@ -7375,10 +7375,82 @@ def test_v14r24_live_config_tight_price_band_0445_0485_and_single_shot_fak(tmp_p
         valid_until=valid_until,
     )
     assert res_ok["live_execution"]["clob_status"] == "MATCHED"
-    assert res_ok["live_execution"]["limit_price"] == pytest.approx(0.48)
+    assert res_ok["live_execution"]["limit_price"] == pytest.approx(0.52)
     assert len(posted) == 1
 
 
+def test_v15_per_signal_tiered_limit_price_freshness_abort_and_shadow_fastpath(tmp_path: Path) -> None:
+    """v15r1: Verify per-signal effective_max_buy_price clamps tick_size_limit_prices on both 0.01 and 0.001 books,
+    Shadow Mode reuses fresh observed_best_ask without network book calls, and LiveExecutionEngine aborts falling knives."""
+    pk = "0x" + ("95" * 32)
+    cands = derive_polymarket_candidate_wallets(pk)
+    clob_sh = ClobExecutor(
+        mode="shadow",
+        private_key=pk,
+        api_key="k",
+        api_secret="dGVzdF9zZWNyZXRfYmFzZTY0X3N0cmluZ18xMjM0NTY=",
+        api_passphrase="p",
+        signature_type=3,
+        funder_address=cands["beacon_deposit_wallet"],
+        auto_derive_l2_creds=False,
+        default_tick_size="0.001",
+        tick_size_limit_prices={"0.01": 0.52, "0.001": 0.525},
+        min_buy_price=0.47,
+        max_buy_price=0.525,
+        fresh_observed_book_max_age_seconds=2.5,
+    )
+    clob_sh._tick_sizes["88001"] = "0.01"
+    clob_sh._tick_sizes["88002"] = "0.001"
+    clob_sh._fee_rates_bps["88001"] = 1000
+    clob_sh._fee_rates_bps["88002"] = 1000
+    now_utc = datetime.now(timezone.utc)
+    valid_until = (now_utc + timedelta(seconds=15)).isoformat()
+
+    # Tier 1 (0.498) on 0.01 tick -> limit_price clamped to 0.49; ask 0.485 -> SHADOW_MATCHED at 0.485!
+    r_t1_01 = clob_sh.sign_and_execute_fak(
+        token_id="88001",
+        approved_stake_usd=50.0,
+        live_scale_factor=1.0,
+        fee_rate=0.075,
+        valid_until=valid_until,
+        observed_best_ask=0.485,
+        book_observed_at=now_utc.isoformat(),
+        max_buy_price=0.498,
+        reference_now_utc=now_utc,
+    )
+    assert r_t1_01["live_execution"]["clob_status"] == "SHADOW_MATCHED"
+    assert r_t1_01["live_execution"]["limit_price"] == pytest.approx(0.49)
+    assert r_t1_01["live_execution"]["avg_fill_price"] == pytest.approx(0.485)
+
+    # Tier 2 (0.502) on 0.001 tick -> limit_price clamped to 0.502; ask 0.505 > 0.502 -> ABORTED_ABOVE_MAX_BUY_PRICE!
+    r_t2_001_abort = clob_sh.sign_and_execute_fak(
+        token_id="88002",
+        approved_stake_usd=50.0,
+        live_scale_factor=1.0,
+        fee_rate=0.075,
+        valid_until=valid_until,
+        observed_best_ask=0.505,
+        book_observed_at=now_utc.isoformat(),
+        max_buy_price=0.502,
+        reference_now_utc=now_utc,
+    )
+    assert r_t2_001_abort["live_execution"]["clob_status"] == "ABORTED_ABOVE_MAX_BUY_PRICE"
+
+    # BTC_15m Top Tier (0.525) on 0.001 tick -> limit_price 0.525; ask 0.522 -> SHADOW_MATCHED at 0.522!
+    r_top = clob_sh.sign_and_execute_fak(
+        token_id="88002",
+        approved_stake_usd=50.0,
+        live_scale_factor=1.0,
+        fee_rate=0.075,
+        valid_until=valid_until,
+        observed_best_ask=0.522,
+        book_observed_at=now_utc.isoformat(),
+        max_buy_price=0.525,
+        reference_now_utc=now_utc,
+    )
+    assert r_top["live_execution"]["clob_status"] == "SHADOW_MATCHED"
+    assert r_top["live_execution"]["limit_price"] == pytest.approx(0.525)
+    assert r_top["live_execution"]["avg_fill_price"] == pytest.approx(0.522)
 
 
 
@@ -7388,3 +7460,27 @@ def test_v14r24_live_config_tight_price_band_0445_0485_and_single_shot_fak(tmp_p
 
 
 
+
+
+
+
+
+def test_shadow_mode_preserves_virtual_balance_with_l2_creds() -> None:
+    """Verify Shadow Mode starts with $1,269 virtual collateral and never overwrites it with
+    real/unprobed wallet $0.00 balance during periodic query_wallet_balance_and_allowance refreshes."""
+    pk = "0x" + ("96" * 32)
+    clob_sh = ClobExecutor(
+        mode="shadow",
+        private_key=pk,
+        api_key="k",
+        api_secret="dGVzdF9zZWNyZXRfYmFzZTY0X3N0cmluZ18xMjM0NTY=",
+        api_passphrase="p",
+        auto_derive_l2_creds=False,
+    )
+    assert clob_sh.has_l2_creds is True
+    assert clob_sh._cached_free_usdc == pytest.approx(1269.0)
+    assert clob_sh._cached_allowance_usdc == pytest.approx(1000000.0)
+    bal, allow = clob_sh.query_wallet_balance_and_allowance(refresh_network=True)
+    assert bal == pytest.approx(1269.0)
+    assert allow == pytest.approx(1000000.0)
+    assert clob_sh.balance_verified is True

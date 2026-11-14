@@ -29,7 +29,10 @@ ALL_STREAMS = {**STREAMS, "XRP_15m": ("XRP", 900)}
 MICRO = Decimal("1000000")
 QTY_STEP = Decimal("0.00000001")
 V5_SEMANTICS = "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1"
-V5_UNLOCKED = ("FILLED_BUDGET", "NO_SIGNAL", "NOT_DUE", "PRICE_LIMIT_NOT_MET", "BLEED_WINDOW_SINGLE_ORDER_CAP", DISABLED)
+V5_UNLOCKED = (
+    "FILLED_BUDGET", "NO_SIGNAL", "NOT_DUE", "PRICE_LIMIT_NOT_MET",
+    "BLEED_WINDOW_SINGLE_ORDER_CAP", "EXECUTION_FRESHNESS_VETO", DISABLED,
+)
 LEGACY_UNLOCKED = ("FILLED_CAPACITY", "NO_SIGNAL", "NOT_DUE")
 FORBIDDEN = re.compile(r"private[_ -]?key|mnemonic|secret|seed[_ -]?phrase|api[_ -]?key|password", re.I)
 
@@ -601,7 +604,9 @@ class Account:
         stamp, boundary = current_time(), _ts(cohort_id)
         key = _iso(boundary)
         _safe(receipt)
-        if (stream not in ALL_STREAMS or decision_status not in ("NO_SIGNAL", "NOT_DUE", "PRICE_LIMIT_NOT_MET", "BLEED_WINDOW_SINGLE_ORDER_CAP")
+        if (stream not in ALL_STREAMS or decision_status not in (
+                "NO_SIGNAL", "NOT_DUE", "PRICE_LIMIT_NOT_MET",
+                "BLEED_WINDOW_SINGLE_ORDER_CAP", "EXECUTION_FRESHNESS_VETO")
                 or not isinstance(receipt, Mapping)):
             raise AccountRejected("explicit validated skip receipt required")
         clean = None
@@ -610,6 +615,13 @@ class Account:
         elif decision_status == "BLEED_WINDOW_SINGLE_ORDER_CAP":
             if receipt.get("source") != "BLEED_WINDOW_SINGLE_ORDER_CAP":
                 raise AccountRejected("explicit bleed window single order cap receipt required")
+        elif decision_status == "EXECUTION_FRESHNESS_VETO":
+            if (receipt.get("source") != "OBSERVED_EXECUTION_FRESHNESS_VETO"
+                    or receipt.get("veto_reason") not in ("ADVERSE_SPOT_DRIFT_VETO", "BOOK_FALLING_KNIFE_VETO")):
+                raise AccountRejected("explicit execution freshness veto receipt required")
+            clean = self._validate_signal(receipt.get("signal"), stamp)
+            if clean["stream"] != stream or _ts(clean["window_start"]) != boundary:
+                raise AccountRejected("freshness veto signal cohort mismatch")
         with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             stamp = current_time()
@@ -831,7 +843,7 @@ class Account:
         if not _ts(clean["decision_at"]) <= source <= received <= stamp or (stamp-source).total_seconds() > 2:
             raise AccountRejected("price skip book is stale or future")
         skip_limit = _d(receipt.get("limit_price", ".515"))
-        if not Decimal(".450") <= skip_limit <= Decimal(".520"):
+        if not Decimal(".450") <= skip_limit <= Decimal(".530"):
             raise AccountRejected("unsupported price skip limit")
         min_limit = _d(receipt.get("min_buy_price", "0"))
         if not Decimal("0") <= min_limit <= Decimal(".500"):
@@ -1003,7 +1015,7 @@ class Account:
         limit = _d(limit_price)
         budget = _atoms(_d(stake))
         pre_limits = _policy_risk_limits(getattr(self, "policy", None))
-        if not 0 < limit <= Decimal(".515") or budget <= 0 or (authorization.get("cohort_id") is None and budget > pre_limits["max_order_atoms"]):
+        if not 0 < limit <= Decimal(".530") or budget <= 0 or (authorization.get("cohort_id") is None and budget > pre_limits["max_order_atoms"]):
             raise AccountRejected("order price or stake exceeds limit")
         asks = orderbook.get("asks")
         if not isinstance(asks, list):
@@ -1418,7 +1430,7 @@ class Account:
                                 "max_underlying_open_cost_usd": _num(limits["max_underlying_open_risk_usd"]),
                                 "max_active_window_cost_usd": _num(limits["max_active_window_risk_usd"]),
                                 "max_underlying_active_cost_usd": _num(limits["max_underlying_active_risk_usd"]),
-                                "max_buy_price": .515},
+                                "max_buy_price": float(effective_policy.get("max_buy_price", .515)) if isinstance(effective_policy, Mapping) else .515},
                 "limitations": ["No real orders or signed transactions", "Model attestation must be verified by the upstream signal adapter", "Paper IOC fills use observed ask depth; they are not actual fills", "Open positions have no mark-to-market valuation"]}
 
     def ledger(self, limit=100):

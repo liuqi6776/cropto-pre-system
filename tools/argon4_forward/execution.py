@@ -224,7 +224,8 @@ class PaperExecutor:
             return stamp
         return current
 
-    def process_cohort(self, cohort_id, decisions, markets, now=None, book_refresh=None, clock=None, market_refresh=None):
+    def process_cohort(self, cohort_id, decisions, markets, now=None, book_refresh=None, clock=None,
+                       market_refresh=None, spot_mid_provider=None, early_best_asks=None):
         """Process ranked decisions once per persisted cohort; no history replay.
 
         book_refresh(market, outcome) may return a newly validated public book.
@@ -234,7 +235,10 @@ class PaperExecutor:
         Cached 60-second observations cannot be promoted to fresh execution books.
         """
         if self.policy.get("waterfall_semantics") == V5_SEMANTICS:
-            return self._process_eligible_cohort(cohort_id,decisions,markets,now,book_refresh,clock,market_refresh)
+            return self._process_eligible_cohort(
+                cohort_id, decisions, markets, now, book_refresh, clock, market_refresh,
+                spot_mid_provider=spot_mid_provider, early_best_asks=early_best_asks,
+            )
         result = {"fills":[], "blocked":[], "cohort":None, "live_enabled":False,
                   "execution":"OBSERVED_BOOK_IOC_PAPER_ONLY"}
         try:
@@ -368,7 +372,8 @@ class PaperExecutor:
         if budget < Decimal(".000001"):
             raise AccountRejected("persistent budget or existing position limit exhausted")
 
-    def _process_eligible_cohort(self, cohort_id, decisions, markets, now, book_refresh, clock, market_refresh=None):
+    def _process_eligible_cohort(self, cohort_id, decisions, markets, now, book_refresh, clock,
+                                 market_refresh=None, spot_mid_provider=None, early_best_asks=None):
         """v5: skip verified ineligible streams, then fill each approved budget.
 
         Raw observed depth remains evidence, not the amount a higher rank must
@@ -414,7 +419,7 @@ class PaperExecutor:
                     state = previous["state"]
                     stream_results[stream] = {"status":state if state in V5_UNLOCKED else "PARTIAL",
                         "persisted":True,"approved_usd":previous["approved_usd"],"spent_usd":previous["spent_usd"]}
-                    if state not in ("NO_SIGNAL","NOT_DUE","BLEED_WINDOW_SINGLE_ORDER_CAP"):
+                    if state not in ("NO_SIGNAL","NOT_DUE","BLEED_WINDOW_SINGLE_ORDER_CAP","EXECUTION_FRESHNESS_VETO"):
                         stream_results[stream]["raw_capacity_usd"] = previous["capacity_usd"]
                     if state in V5_UNLOCKED:
                         continue
@@ -456,13 +461,19 @@ class PaperExecutor:
                     break
                 signal = dict(decision["signal"])
                 pred_dict = decision.get("prediction") if isinstance(decision.get("prediction"), dict) else {}
+                raw_spot_close_t = (
+                    decision.get("spot_close_t")
+                    or signal.get("spot_close_t")
+                    or pred_dict.get("ex_ante_spot_close_t")
+                    or pred_dict.get("spot_close_t")
+                )
                 raw_max_buy = (
                     decision.get("effective_max_buy_price")
                     or signal.get("effective_max_buy_price")
                     or pred_dict.get("effective_max_buy_price")
                     or self.policy.get("max_buy_price", 0.515)
                 )
-                effective_max_buy = min(Decimal(".515"), _d(raw_max_buy))
+                effective_max_buy = min(Decimal(".530"), _d(raw_max_buy))
                 bleed_cap_active = bool(
                     signal.get("bleed_single_order_window_cap")
                     or pred_dict.get("bleed_single_order_window_cap") is True
@@ -619,6 +630,80 @@ class PaperExecutor:
                 if multi_look is not None:
                     receipt = {"source":"OBSERVED_EXECUTABLE_BOOK","signal":signal,"orderbook":book,"fee_quote":fee}
                     self.account.finish_book_look(cohort["cohort_id"],stream,look_claim[1],"EXECUTABLE_BOOK",receipt,now=now)
+                best_ask_exec = float(min(_d(a["price"]) for a in book["asks"] if _d(a["size"]) > 0))
+                early_ask_val = (early_best_asks or {}).get((market["market_id"], side))
+                signed_drift_bps = None
+                fg_cfg = self.policy.get("execution_freshness_guard")
+                if multi_look is None and isinstance(fg_cfg, dict) and fg_cfg.get("enabled") is True:
+                    if early_ask_val is not None:
+                        ask_delta = float(best_ask_exec) - float(early_ask_val)
+                        max_drop = float(fg_cfg.get("max_book_ask_drop", 0.04))
+                        if ask_delta <= -max_drop:
+                            receipt = {
+                                "source": "OBSERVED_EXECUTION_FRESHNESS_VETO",
+                                "veto_reason": "BOOK_FALLING_KNIFE_VETO",
+                                "signal": signal,
+                                "early_best_ask": float(early_ask_val),
+                                "exec_best_ask": best_ask_exec,
+                                "book_ask_delta": round(ask_delta, 6),
+                            }
+                            self.account.record_cohort_skip(
+                                cohort["cohort_id"], stream, "EXECUTION_FRESHNESS_VETO", receipt, now=stamp
+                            )
+                            stream_results[stream] = {
+                                "status": "EXECUTION_FRESHNESS_VETO",
+                                "veto_reason": "BOOK_FALLING_KNIFE_VETO",
+                                "early_best_ask": float(early_ask_val),
+                                "best_ask": best_ask_exec,
+                                "book_ask_delta": round(ask_delta, 6),
+                                "book_checked": True,
+                                "approved_usd": 0.0,
+                                "spent_usd": 0.0,
+                                "persisted": True,
+                            }
+                            continue
+                    if raw_spot_close_t is not None and callable(spot_mid_provider):
+                        spot_obs = spot_mid_provider(signal["underlying"])
+                        spot_mid = (
+                            float(spot_obs.get("mid_price"))
+                            if isinstance(spot_obs, dict) and spot_obs.get("mid_price")
+                            else (float(spot_obs) if isinstance(spot_obs, (int, float)) else 0.0)
+                        )
+                        sc_t = float(raw_spot_close_t)
+                        if spot_mid > 0.0 and sc_t > 0.0:
+                            dir_sign = 1.0 if side == "UP" else -1.0
+                            signed_drift_bps = ((spot_mid / sc_t) - 1.0) * 10000.0 * dir_sign
+                            max_drift = float(
+                                fg_cfg.get("max_5m_adverse_spot_drift_bps", 2.5)
+                                if stream.endswith("_5m")
+                                else fg_cfg.get("max_15m_adverse_spot_drift_bps", 3.5)
+                            )
+                            if signed_drift_bps <= -max_drift:
+                                receipt = {
+                                    "source": "OBSERVED_EXECUTION_FRESHNESS_VETO",
+                                    "veto_reason": "ADVERSE_SPOT_DRIFT_VETO",
+                                    "signal": signal,
+                                    "spot_close_t": sc_t,
+                                    "exec_spot_mid": spot_mid,
+                                    "signed_spot_drift_bps": round(signed_drift_bps, 4),
+                                    "max_adverse_spot_drift_bps": max_drift,
+                                }
+                                self.account.record_cohort_skip(
+                                    cohort["cohort_id"], stream, "EXECUTION_FRESHNESS_VETO", receipt, now=stamp
+                                )
+                                stream_results[stream] = {
+                                    "status": "EXECUTION_FRESHNESS_VETO",
+                                    "veto_reason": "ADVERSE_SPOT_DRIFT_VETO",
+                                    "spot_close_t": sc_t,
+                                    "exec_spot_mid": spot_mid,
+                                    "signed_spot_drift_bps": round(signed_drift_bps, 4),
+                                    "best_ask": best_ask_exec,
+                                    "book_checked": True,
+                                    "approved_usd": 0.0,
+                                    "spent_usd": 0.0,
+                                    "persisted": True,
+                                }
+                                continue
                 # Re-read balances after I/O; both this target and the actual
                 # account mutation enforce the unchanged aggregate risk limits.
                 summary = self.account.overview(now=stamp, policy=self.policy)
@@ -650,7 +735,19 @@ class PaperExecutor:
                 fill = self.account.place_paper_buy(signal,book,fee,now=self._paper_acceptance_clock(now,clock,book,fee,signal),
                                                     stake=amount,limit_price=float(effective_max_buy),allocation_authorization=authorization)
                 look_claim = None
-                result["fills"].append(fill)
+                fill_view = {
+                    **fill,
+                    "limit_price": float(effective_max_buy),
+                    "book_snapshot": {
+                        "best_ask": best_ask_exec,
+                        "observed_at": book["observed_at"],
+                    },
+                }
+                if early_ask_val is not None:
+                    fill_view["early_best_ask"] = float(early_ask_val)
+                if signed_drift_bps is not None:
+                    fill_view["signed_spot_drift_bps"] = round(signed_drift_bps, 4)
+                result["fills"].append(fill_view)
                 state = fill["cohort_stream_state"]
                 stream_results[stream] = {"status":state,"raw_capacity_usd":float(capacity),"approved_usd":float(amount),
                     "spent_usd":float(_d(fill["cost_usd"])+_d(fill["fee_usd"])),"order_id":fill["order_id"],

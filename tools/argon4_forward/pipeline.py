@@ -724,24 +724,28 @@ class ForwardPipeline:
         try:
             if snapshot is not None and hasattr(snapshot, "prewarm_validated") and (os.cpu_count() or 1) >= 2:
                 snapshot.prewarm_validated(max_workers=4)
+            if s1_pool is not None:
+                for sym, fut in s1_futs.items():
+                    spot_1m_cache[sym] = fut.result()
+                if s1_started is not None:
+                    self._decision_timing["spot_1m_parallel_wall_seconds"] = time.perf_counter() - s1_started
+                s1_pool.shutdown(wait=True)
+                s1_pool = None
             btc_macro_rets = compute_ex_ante_btc_macro_returns_pct(
                 inputs.get("data_root"), as_of=now_lower, snapshot=snapshot)
-            if snapshot is not None and len(due_symbols) > 1 and (os.cpu_count() or 1) >= 4:
-                if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
-                    raise ValueError("missed feature decision window")
-                from concurrent.futures import ThreadPoolExecutor
-                from threadpoolctl import threadpool_limits
-
-                def _build_due_symbol(sym):
-                    t0 = time.perf_counter()
-                    return snapshot.build(sym, tail_rows=1), time.perf_counter() - t0
-
+            if snapshot is not None and due_symbols:
+                import inspect
+                use_lb = "max_lookback_5m" in inspect.signature(snapshot.build).parameters
                 wall_t0 = time.perf_counter()
-                with threadpool_limits(limits=1):
-                    with ThreadPoolExecutor(max_workers=min(3, len(due_symbols)), thread_name_prefix="argon4-feat") as pool:
-                        fut_map = {sym: pool.submit(_build_due_symbol, sym) for sym in due_symbols}
-                        for sym in due_symbols:
-                            frames[sym], self._decision_timing["features_seconds"][sym] = fut_map[sym].result()
+                for sym in due_symbols:
+                    if calibrated_now(self.clock) >= cohort + timedelta(seconds=20):
+                        raise ValueError("missed feature decision window")
+                    t0 = time.perf_counter()
+                    frames[sym] = (
+                        snapshot.build(sym, tail_rows=1, max_lookback_5m=3456)
+                        if use_lb else snapshot.build(sym, tail_rows=1)
+                    )
+                    self._decision_timing["features_seconds"][sym] = time.perf_counter() - t0
                 self._decision_timing["features_parallel_wall_seconds"] = time.perf_counter() - wall_t0
         finally:
             if s1_pool is not None:
@@ -883,6 +887,9 @@ class ForwardPipeline:
                 if score.get("effective_max_buy_price") is not None:
                     signal["effective_max_buy_price"] = float(score["effective_max_buy_price"])
                     decisions[stream]["effective_max_buy_price"] = float(score["effective_max_buy_price"])
+                if score.get("ex_ante_spot_close_t") is not None:
+                    signal["spot_close_t"] = float(score["ex_ante_spot_close_t"])
+                    decisions[stream]["spot_close_t"] = float(score["ex_ante_spot_close_t"])
                 decisions[stream].update(status="SIGNAL", signal=signal)
         if spot_1m_cache and getattr(self, "observations", None) is not None:
             try:
@@ -1225,7 +1232,7 @@ class ForwardPipeline:
         try:
             lower, upper = calibrated_now(self.clock, upper=False), calibrated_now(self.clock)
             elapsed = (lower-cohort_at(lower)).total_seconds()
-            return elapsed >= 299 or (upper-cohort_at(lower)).total_seconds() <= 20
+            return elapsed >= 297 or (upper-cohort_at(lower)).total_seconds() <= 20
         except ValueError:
             return False
 
@@ -1295,6 +1302,10 @@ class ForwardPipeline:
             markets_snap = {**(markets_snap if isinstance(markets_snap, dict) else {}), "streams": base_streams}
 
         prefetched_books = {}
+        prefetched_spot_mids = {}
+        early_best_asks = {}
+        fg_cfg = policy.get("execution_freshness_guard")
+        fg_enabled = bool(isinstance(fg_cfg, dict) and fg_cfg.get("enabled") is True)
         is_v5 = policy.get("waterfall_semantics") == "ELIGIBLE_SIGNALS_APPROVED_BUDGET_V1"
         # Under multi_look_ioc, Account.begin_book_look records requested_at per rank
         # inside PaperExecutor and rejects any book received_at < requested_at
@@ -1302,12 +1313,18 @@ class ForwardPipeline:
         # pre-fetch books ahead of PaperExecutor.process_cohort.
         if is_v5 and multi_look_settings(policy) is None and not prior_fills and isinstance(markets_snap, dict):
             sig_book_jobs = []
+            sig_spot_syms = []
             for st_name in policy.get("order", ()):
                 dec_obj = decisions.get(st_name)
                 if not (isinstance(dec_obj, dict) and dec_obj.get("status") == "SIGNAL"):
                     continue
                 sig_obj = dec_obj.get("signal") or {}
                 side = sig_obj.get("outcome")
+                und = sig_obj.get("underlying")
+                if fg_enabled and und and self.inputs is not None and hasattr(self.inputs, "capture_spot_book_ticker"):
+                    sym_u = f"{und}USDT"
+                    if sym_u not in sig_spot_syms:
+                        sig_spot_syms.append(sym_u)
                 try:
                     mkt_obj = PaperExecutor._market(markets_snap, st_name, cohort)
                 except Exception:
@@ -1316,16 +1333,60 @@ class ForwardPipeline:
                     key = (mkt_obj["market_id"], side)
                     if key not in {j[0] for j in sig_book_jobs}:
                         sig_book_jobs.append((key, mkt_obj, side))
-            if len(sig_book_jobs) > 1:
+            if fg_enabled and sig_book_jobs and (self.runtime / "book_telemetry.sqlite3").is_file():
+                try:
+                    with sqlite3.connect(self.runtime / "book_telemetry.sqlite3", timeout=0.25) as tdb:
+                        rows = tdb.execute(
+                            "SELECT payload_json FROM samples WHERE cohort=? AND target_offset_seconds=2 AND status='OBSERVED'",
+                            (cohort.isoformat().replace("+00:00", "Z"),),
+                        ).fetchall()
+                    by_st_side = {}
+                    for (p_raw,) in rows:
+                        p_obj = json.loads(p_raw)
+                        b_ask = p_obj.get("best_ask") or (p_obj.get("actual_observation") or {}).get("best_ask")
+                        if b_ask is not None and p_obj.get("stream") and p_obj.get("outcome"):
+                            by_st_side[(p_obj["stream"], p_obj["outcome"])] = float(b_ask)
+                    for st_name in policy.get("order", ()):
+                        dec_obj = decisions.get(st_name)
+                        if not (isinstance(dec_obj, dict) and dec_obj.get("status") == "SIGNAL"):
+                            continue
+                        side = (dec_obj.get("signal") or {}).get("outcome")
+                        b_ask = by_st_side.get((st_name, side))
+                        if b_ask is not None:
+                            try:
+                                mkt_obj = PaperExecutor._market(markets_snap, st_name, cohort)
+                                early_best_asks[(mkt_obj["market_id"], side)] = b_ask
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            if len(sig_book_jobs) > 1 or (sig_spot_syms and len(sig_book_jobs) >= 1):
                 from concurrent.futures import ThreadPoolExecutor
 
                 def _fetch_one_book(job):
                     k_pair, m_obj, sd = job
                     return k_pair, self.refresh_book(m_obj, sd)
 
+                def _fetch_one_spot(sym_u):
+                    try:
+                        self.set_input_clock(clock)
+                        dl = time.monotonic() + min(0.55, max(0.15, (cohort + timedelta(seconds=19.2) - calibrated_now(clock)).total_seconds()))
+                        obs = self.inputs.capture_spot_book_ticker(sym_u, cohort_id=cohort.isoformat(), deadline_monotonic=dl)
+                        return sym_u, obs
+                    except Exception:
+                        return sym_u, None
+
+                total_workers = min(6, len(sig_book_jobs) + len(sig_spot_syms))
                 try:
-                    with ThreadPoolExecutor(max_workers=min(4, len(sig_book_jobs)), thread_name_prefix="argon4-book") as bpool:
-                        for k_pair, b_val in bpool.map(_fetch_one_book, sig_book_jobs):
+                    with ThreadPoolExecutor(max_workers=max(1, total_workers), thread_name_prefix="argon4-exec-io") as bpool:
+                        book_futs = [bpool.submit(_fetch_one_book, j) for j in sig_book_jobs] if (len(sig_book_jobs) > 1 or sig_spot_syms) else []
+                        spot_futs = [bpool.submit(_fetch_one_spot, s) for s in sig_spot_syms]
+                        for sf in spot_futs:
+                            sym_u, s_obs = sf.result()
+                            if isinstance(s_obs, dict) and s_obs.get("mid_price"):
+                                prefetched_spot_mids[sym_u] = s_obs
+                        for bf in book_futs:
+                            k_pair, b_val = bf.result()
                             prefetched_books[k_pair] = b_val
                 except Exception:
                     prefetched_books.clear()
@@ -1336,12 +1397,29 @@ class ForwardPipeline:
                 return hit
             return self.refresh_book(market, outcome)
 
+        def _spot_mid_provider(underlying):
+            sym_u = f"{underlying}USDT"
+            if sym_u in prefetched_spot_mids:
+                return prefetched_spot_mids[sym_u]
+            if fg_enabled and self.inputs is not None and hasattr(self.inputs, "capture_spot_book_ticker"):
+                try:
+                    self.set_input_clock(clock)
+                    dl = time.monotonic() + 0.50
+                    obs = self.inputs.capture_spot_book_ticker(sym_u, cohort_id=cohort.isoformat(), deadline_monotonic=dl)
+                    prefetched_spot_mids[sym_u] = obs
+                    return obs
+                except Exception:
+                    return None
+            return None
+
         with self.monitor_log.phase("pipeline", "execute_priority_waterfall",
                                     cohort=cohort.isoformat(), slow_warn_seconds=5.0):
             outcome = PaperExecutor(self.account, policy).process_cohort(
                 cohort.isoformat(), decisions, markets_snap,
                 now=lambda: self.execution_now(clock), book_refresh=_fast_book_refresh,
-                clock=clock, market_refresh=self.refresh_market)
+                clock=clock, market_refresh=self.refresh_market,
+                spot_mid_provider=_spot_mid_provider if fg_enabled else None,
+                early_best_asks=early_best_asks or None)
         self._pending_timing["execution_seconds"] = self._pending_timing.get("execution_seconds", 0)+time.perf_counter()-started
         self._pending_timing["execution_passes"] = self._pending_timing.get("execution_passes", 0)+1
         self._pending_timing.setdefault("first_execution_completed_after_boundary_seconds", (calibrated_now(clock)-cohort).total_seconds())
@@ -1520,6 +1598,13 @@ class ForwardPipeline:
             if (current_cohort < next_window
                     and not self._same_cohort_view_admitted(revision_view)):
                 self.abandon_prepared("REVISION_CUTOVER_WINDOW")
+                if (self.warmup_complete and self.inputs is not None
+                        and hasattr(self.inputs, "prefetch_auxiliary")
+                        and (current_cohort + timedelta(minutes=5)) >= next_window):
+                    try:
+                        self.prefetch_inputs(engineering, calibrated_now(self.clock, upper=False))
+                    except Exception:
+                        pass
                 self._log_block_once(("REVISION_CUTOVER_WINDOW", current_cohort.isoformat(), revision_view.get("revision_id")),
                                      current_cohort.isoformat(), "REVISION_CUTOVER_WINDOW",
                                      "输入修订已归档并核验；切换完成所在窗口跳过",

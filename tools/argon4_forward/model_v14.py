@@ -680,9 +680,6 @@ def apply_volatility_regime_guard(
         streak_marginal_dz = float(tiered_cfg.get("counter_15m_marginal_delta_z", 0.12))
         streak_action = str(tiered_cfg.get("counter_15m_marginal_action", "CAP_OR_SKIP")).upper()
         streak_max_buy = float(tiered_cfg.get("counter_15m_marginal_max_buy_price", 0.475))
-        strong_min_dz = float(tiered_cfg.get("strong_signal_min_delta_z", 0.15))
-        strong_cap = float(tiered_cfg.get("strong_max_buy_price", 0.515))
-        marginal_cap = float(tiered_cfg.get("marginal_max_buy_price", 0.49))
 
         is_counter_15m_streak = False
         if own_ret_15m_bps is not None and side in ("UP", "DOWN"):
@@ -702,12 +699,40 @@ def apply_volatility_regime_guard(
                 return res
             res["effective_max_buy_price"] = streak_max_buy
             res["price_tier_reason"] = "MARGINAL_AGAINST_15M_STREAK"
-        elif delta_z < strong_min_dz:
-            res["effective_max_buy_price"] = marginal_cap
-            res["price_tier_reason"] = "MARGINAL_SIGNAL_CAP"
+        elif isinstance(tiered_cfg.get("tiers"), list) and tiered_cfg["tiers"]:
+            is_15m = str(stream).endswith("_15m")
+            sorted_tiers = sorted(
+                (t for t in tiered_cfg["tiers"] if isinstance(t, dict)),
+                key=lambda item: float(item.get("min_delta_z", 0.0)),
+            )
+            chosen_cap = 0.490
+            chosen_idx = 1
+            for idx_t, t_item in enumerate(sorted_tiers, 1):
+                if delta_z >= float(t_item.get("min_delta_z", 0.0)):
+                    chosen_cap = float(
+                        t_item.get("max_15m" if is_15m else "max_5m", t_item.get("max_buy_price", chosen_cap))
+                    )
+                    chosen_idx = idx_t
+            top_map = tiered_cfg.get("stream_top_tiers")
+            if isinstance(top_map, dict) and isinstance(top_map.get(stream), dict):
+                top_spec = top_map[stream]
+                if delta_z >= float(top_spec.get("min_delta_z", 1.0)):
+                    chosen_cap = float(top_spec["max_buy_price"])
+                    res["effective_max_buy_price"] = chosen_cap
+                    res["price_tier_reason"] = f"CONFIDENCE_STREAM_TOP_TIER_{stream}"
+                    return res
+            res["effective_max_buy_price"] = chosen_cap
+            res["price_tier_reason"] = f"CONFIDENCE_TIER_{chosen_idx}_{'15M' if is_15m else '5M'}"
         else:
-            res["effective_max_buy_price"] = strong_cap
-            res["price_tier_reason"] = "STRONG_SIGNAL_CAP"
+            strong_min_dz = float(tiered_cfg.get("strong_signal_min_delta_z", 0.15))
+            strong_cap = float(tiered_cfg.get("strong_max_buy_price", 0.515))
+            marginal_cap = float(tiered_cfg.get("marginal_max_buy_price", 0.49))
+            if delta_z < strong_min_dz:
+                res["effective_max_buy_price"] = marginal_cap
+                res["price_tier_reason"] = "MARGINAL_SIGNAL_CAP"
+            else:
+                res["effective_max_buy_price"] = strong_cap
+                res["price_tier_reason"] = "STRONG_SIGNAL_CAP"
 
     return res
 

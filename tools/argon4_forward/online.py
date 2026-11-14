@@ -40,6 +40,7 @@ ENDPOINTS = {
     "spot": ("https://data-api.binance.vision", "/api/v3/klines"),
     "dvol": ("https://www.deribit.com", "/api/v2/public/get_volatility_index_data"),
     "book_ticker": ("https://fapi.binance.com", "/fapi/v1/ticker/bookTicker"),
+    "spot_book_ticker": ("https://data-api.binance.vision", "/api/v3/ticker/bookTicker"),
 }
 STEPS = {"1m": pd.Timedelta(minutes=1), "5m": pd.Timedelta(minutes=5),
          "1h": pd.Timedelta(hours=1), "4h": pd.Timedelta(hours=4), "1D": pd.Timedelta(days=1)}
@@ -89,7 +90,7 @@ def _parameters(kind, params):
     """Allow only the exact public parameter vocabulary; never forward auth."""
     if kind not in ENDPOINTS:
         raise ValueError("Endpoint is not a public input endpoint")
-    if kind == "book_ticker":
+    if kind in ("book_ticker", "spot_book_ticker"):
         if set(params) not in (set(), {"symbol"}):
             raise ValueError("Unexpected public input parameters")
         if "symbol" in params and params["symbol"] not in ALL_SYMBOLS:
@@ -1124,6 +1125,42 @@ class OnlineInputs:
             "clock_evidence_sha256": receipt.get("clock_evidence_sha256", self.clock_evidence_sha256),
             "as_of": _iso(cutoff),
             "tickers": tickers,
+        }
+
+    def capture_spot_book_ticker(self, symbol, *, cohort_id=None, deadline_monotonic=None):
+        """Capture real-time Binance Spot top-of-book mid price with receipt provenance."""
+        if symbol not in ALL_SYMBOLS:
+            raise ValueError("Unsupported symbol")
+        params = {"symbol": symbol}
+        if isinstance(self.client, PublicInputsHTTP):
+            payload, receipt = self.client.get(
+                "spot_book_ticker",
+                params,
+                deadline_monotonic=deadline_monotonic,
+                cohort_id=cohort_id,
+                receipt_clock=self.clock,
+                receipt_time_basis=self.time_basis,
+                receipt_clock_evidence=self.clock_evidence_sha256,
+            )
+        else:
+            payload, receipt = self.client.get("spot_book_ticker", params)
+        if not isinstance(payload, dict) or payload.get("symbol") != symbol:
+            raise ValueError("INVALID_SPOT_BOOK_TICKER")
+        bid_p = float(payload["bidPrice"])
+        ask_p = float(payload["askPrice"])
+        if not (math.isfinite(bid_p) and math.isfinite(ask_p) and 0 < bid_p <= ask_p):
+            raise ValueError("INVALID_SPOT_BOOK_TICKER_PRICE")
+        mid = 0.5 * (bid_p + ask_p)
+        return {
+            "status": "OBSERVED",
+            "symbol": symbol,
+            "bid_price": bid_p,
+            "ask_price": ask_p,
+            "mid_price": mid,
+            "cohort_id": cohort_id,
+            "requested_at": receipt.get("requested_at"),
+            "received_at": receipt.get("received_at"),
+            "receipt_sha256": receipt.get("sha256"),
         }
 
     def capture_spot_1m_twap60(self, symbol, boundary_utc=None, *, cohort_id=None, deadline_monotonic=None):

@@ -62,10 +62,10 @@ def _atomic_write_parquet(df: pd.DataFrame, path: Path, *, index: bool = False) 
 def build_rolling_fold(
     as_of_utc: pd.Timestamp | str | datetime | None = None,
     *,
-    validation_days: int = 60,
+    validation_days: int = 105,
     valid_horizon_days: int = 95,
     half_life_days: float = 270.0,
-    label_mode: str = "SPOT_TWAP60_BLEND",
+    label_mode: str = "SPOT_TO_TWAP60_PURE",
 ) -> dict[str, Any]:
     """Compute rolling train/validation/deployment timestamps anchored to ``as_of_utc``."""
     now_ts = pd.Timestamp.now(tz="UTC") if as_of_utc is None else pd.Timestamp(as_of_utc)
@@ -375,7 +375,7 @@ def atomic_promote_and_pin_policy(
     old_pins = dict(policy.get("deployment_manifest_sha256") or {})
     policy["previous_deployment_manifest_sha256"] = old_pins
     policy["deployment_manifest_sha256"] = new_pins
-    policy["deployment_model_target_oracle"] = oracle_tag or f"S4_SPOT_TWAP60_BLEND_HL270D_AUTO_{stamp[:8]}"
+    policy["deployment_model_target_oracle"] = oracle_tag or f"PURE_SPOT_TO_TWAP60_HL270D_VAL105D_AUTO_{stamp[:8]}"
     _atomic_write_json(Path(policy_path), policy)
     return {
         "promoted_at_utc": stamp,
@@ -391,7 +391,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--model-root", type=Path, default=model.MODEL_ROOT)
     ap.add_argument("--policy", type=Path, default=ROOT / "config/argon4_forward_policy.json")
     ap.add_argument("--phase", type=str, default="deployment_q4")
-    ap.add_argument("--validation-days", type=int, default=60)
+    ap.add_argument("--validation-days", type=int, default=105)
     ap.add_argument("--valid-horizon-days", type=int, default=95)
     ap.add_argument("--half-life-days", type=float, default=270.0)
     ap.add_argument("--min-mean-val-acc", type=float, default=0.535)

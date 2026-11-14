@@ -1,6 +1,6 @@
 {
   "status": "CONFIRMED",
-  "version": "argon4-local311-independent65-20261107-v13r2",
+  "version": "argon4-local311-independent65-20261114-v15r1",
   "venue": "polymarket",
   "ranking_source": "USER_CONFIRMED_STAGE2_LOCAL_FROZEN_RAW_WIN_RATE; same saved local models; historical research evidence remains exploratory",
   "ranking_label": "第二阶段：本地原始胜率 BTC15 → ETH5 → ETH15 → BTC5 → SOL15 → SOL5",
@@ -26,15 +26,15 @@
   "max_open_risk_usd": 650,
   "max_underlying_active_risk_usd": 300,
   "max_underlying_open_risk_usd": 450,
-  "max_buy_price": 0.485,
-  "min_buy_price": 0.445,
+  "max_buy_price": 0.525,
+  "min_buy_price": 0.47,
   "stream_min_buy_price": {
-    "BTC_5m": 0.445,
-    "ETH_5m": 0.445,
-    "SOL_5m": 0.445,
-    "BTC_15m": 0.445,
-    "ETH_15m": 0.445,
-    "SOL_15m": 0.445
+    "BTC_5m": 0.47,
+    "ETH_5m": 0.47,
+    "SOL_5m": 0.47,
+    "BTC_15m": 0.47,
+    "ETH_15m": 0.47,
+    "SOL_15m": 0.47
   },
   "stream_max_order_usd": {
     "BTC_15m": 240,
@@ -154,6 +154,16 @@
   },
   "ranking_model_scope": "LOCAL_SELF_TRAINED_OOS",
   "deployment_manifest_sha256": {
+    "BTC_15m": "55440025210f244056c3d9c03dabec7ee143d623adacab98878765734c3c47db",
+    "BTC_5m": "8a422c96d96825abd124ba698af00fc9fef083a14770f4a4a67a2a4dcab940d5",
+    "ETH_15m": "cacb6caa444b21155ecaed531108807a79d0f84bbe0be7d09ce74de3f0ebce33",
+    "ETH_5m": "fd46b7ac9feee6831ca8e09b9f5f13f226715f066eb43a2a57185e305a269d55",
+    "SOL_15m": "6db7de5accd7cc712c85ba9b10d8fe0ef551a666e451ebc57b7b85107c7ab96a",
+    "SOL_5m": "cdf029c362cd413140f6e02e09d326705cbd1cc2f450edcdbc09d31314a8dbce",
+    "BNB_15m": "edc5a4c2909b7561f0f42a55ad61f41d2b2532ac6107498dba6bf1c5f153bd55"
+  },
+  "deployment_model_target_oracle": "PURE_SPOT_TO_TWAP60_HL270D_VAL105D_AUTO_20261114",
+  "previous_deployment_manifest_sha256": {
     "BTC_15m": "4f9b2c5ce4545c7f43bd04986dad1027389a9684cabb438a3bfe66a357ffcf37",
     "BTC_5m": "a2847aa17ea3cf0c130877b0151aa6c86a2bb079c643724f1edcea8d7dce98fc",
     "ETH_15m": "3a92c890f6a1d591defd7388e911ab6ccaeedc31b2b7abf7e41eba7491b0d393",
@@ -161,16 +171,6 @@
     "SOL_15m": "cc09e1d7a45fd35674b4420f3daf31ffbf28be477648a36385d8d3be5dfe63c0",
     "SOL_5m": "f74b7cd26997ea4912bd9640f98ec2b07bbfb7cab1e9a93ae60d330101fb0f60",
     "BNB_15m": "fe0a9d9309222ab86ed3f6a94c7c20a58d7cff29b43a728b3b8d37b8595a12b6"
-  },
-  "deployment_model_target_oracle": "S4_SPOT_TWAP60_BLEND_HL270D_BIMONTHLY_20261113",
-  "previous_deployment_manifest_sha256": {
-    "BTC_15m": "2e40d0fb86d9f45a2710e53d5ef99b3a77c1636385a2f1209d5d3b925ee00ff5",
-    "BTC_5m": "b9518a9addd766e3e3b57ecfab89a87bc90080157e55e25acf8eb7e5538085bb",
-    "ETH_15m": "19ed37c8f4844380c33550acf63151efc69bd4dbba5762f65587b921f282091b",
-    "ETH_5m": "71fd662b882312d7221211ef4209a0919dae1ac0b9e3c1d742a367dc13b04b1e",
-    "SOL_15m": "499cd6651f7f938262ddab781c4a0ebebc031fca1a7fca184147bfc0c30c2109",
-    "SOL_5m": "4e1bae288125d21a220d853b9122c0b3062ebd04f11c9b207368ad03c7290379",
-    "BNB_15m": "90f90df773353bf4d7f1bc196f617847a1d358f157dd1e6a42f988c6fdcc085e"
   },
   "input_revision_policy": {
     "scope": "OBSERVED_FUTURES_5M_1H_AND_MARK_1H_VIEWS_ONLY",
@@ -400,8 +400,14 @@
       "enabled": true,
       "timezone": "America/New_York",
       "windows_local_minutes": [
-        [1080, 1200],
-        [1260, 1320]
+        [
+          1080,
+          1200
+        ],
+        [
+          1260,
+          1320
+        ]
       ],
       "note": "Sunday 18:00-20:00 ET (CME Futures Open = Mon 07:00-09:00 BJT EST) + Sunday 21:00-22:00 ET (Dec 6+ Nasdaq/NYSE 23x5 Equity Week Open = Mon 10:00-11:00 BJT EST)",
       "skip_streams": [
@@ -449,7 +455,30 @@
       }
     },
     "confidence_tiered_max_buy_price": {
-      "enabled": false,
+      "enabled": true,
+      "tiers": [
+        {
+          "min_delta_z": 0.0,
+          "max_5m": 0.49,
+          "max_15m": 0.498
+        },
+        {
+          "min_delta_z": 0.35,
+          "max_5m": 0.502,
+          "max_15m": 0.51
+        },
+        {
+          "min_delta_z": 0.8,
+          "max_5m": 0.51,
+          "max_15m": 0.52
+        }
+      ],
+      "stream_top_tiers": {
+        "BTC_15m": {
+          "min_delta_z": 1.0,
+          "max_buy_price": 0.525
+        }
+      },
       "strong_signal_min_delta_z": 0.15,
       "strong_max_buy_price": 0.515,
       "marginal_max_buy_price": 0.49,
@@ -469,6 +498,12 @@
   },
   "early_window_book_ticker": {
     "enabled": false
+  },
+  "execution_freshness_guard": {
+    "enabled": true,
+    "max_5m_adverse_spot_drift_bps": 2.5,
+    "max_15m_adverse_spot_drift_bps": 3.5,
+    "max_book_ask_drop": 0.04
   },
   "storage_maintenance": {
     "enabled": true,
