@@ -58,10 +58,44 @@ def _as_finite_float(val: Any, field_name: str) -> float:
 
 
 def validate_policy_dict(payload: Any) -> dict[str, Any]:
-    """Strictly validate all required risk caps and price bounds in `argon4_forward_policy.json`."""
+    """Strictly validate all required risk caps and price bounds in `argon4_forward_policy.json`.
+
+    Nested `payload["risk"]` overrides top-level `payload` fields using the exact same
+    precedence and active-risk inheritance rules as `tools.argon4_forward.account._policy_risk_limits`.
+    """
     if not isinstance(payload, Mapping):
         raise PolicyVerificationError("POLICY_INVALID_TYPE", "Policy JSON root must be an object")
-    missing = [k for k in REQUIRED_POLICY_FIELDS if k not in payload or payload.get(k) is None]
+    raw_risk = payload.get("risk")
+    if "risk" in payload and raw_risk is not None and not isinstance(raw_risk, Mapping):
+        raise PolicyVerificationError("POLICY_INVALID_VALUE", "Policy field risk must be a mapping")
+    risk_block: Mapping[str, Any] = raw_risk if isinstance(raw_risk, Mapping) else {}
+
+    def _raw_field(key: str) -> Any:
+        if key in risk_block:
+            return risk_block.get(key)
+        return payload.get(key)
+
+    resolved_raw: dict[str, Any] = {}
+    for k in REQUIRED_POLICY_FIELDS:
+        if k == "max_active_window_risk_usd":
+            if "max_active_window_risk_usd" in risk_block:
+                resolved_raw[k] = risk_block.get("max_active_window_risk_usd")
+            elif "max_open_risk_usd" in risk_block:
+                resolved_raw[k] = risk_block.get("max_open_risk_usd")
+            else:
+                resolved_raw[k] = payload.get("max_active_window_risk_usd")
+        elif k == "max_underlying_active_risk_usd":
+            if "max_underlying_active_risk_usd" in risk_block:
+                resolved_raw[k] = risk_block.get("max_underlying_active_risk_usd")
+            elif "max_underlying_open_risk_usd" in risk_block or "max_open_risk_usd" in risk_block:
+                # Derived after underlying_open and active_window are validated as finite floats below
+                resolved_raw[k] = "__DERIVE_MIN_UNDERLYING_ACTIVE__"
+            else:
+                resolved_raw[k] = payload.get("max_underlying_active_risk_usd")
+        else:
+            resolved_raw[k] = _raw_field(k)
+
+    missing = [k for k in REQUIRED_POLICY_FIELDS if resolved_raw.get(k) is None]
     if missing:
         raise PolicyVerificationError(
             "POLICY_MISSING_FIELDS",
@@ -70,7 +104,14 @@ def validate_policy_dict(payload: Any) -> dict[str, Any]:
     out = dict(payload)
     nums: dict[str, float] = {}
     for k in REQUIRED_POLICY_FIELDS:
-        nums[k] = _as_finite_float(payload.get(k), k)
+        if resolved_raw[k] == "__DERIVE_MIN_UNDERLYING_ACTIVE__":
+            continue
+        nums[k] = _as_finite_float(resolved_raw[k], k)
+    if resolved_raw.get("max_underlying_active_risk_usd") == "__DERIVE_MIN_UNDERLYING_ACTIVE__":
+        nums["max_underlying_active_risk_usd"] = min(
+            nums["max_underlying_open_risk_usd"],
+            nums["max_active_window_risk_usd"],
+        )
 
     for pos_key in (
         "initial_capital_usd",
@@ -84,6 +125,16 @@ def validate_policy_dict(payload: Any) -> dict[str, Any]:
         if nums[pos_key] <= 0.0:
             raise PolicyVerificationError("POLICY_INVALID_BOUND", f"Policy field {pos_key} must be > 0, got {nums[pos_key]}")
 
+    if nums["max_order_usd"] > nums["max_tick_budget_usd"]:
+        raise PolicyVerificationError(
+            "POLICY_INVALID_BOUND",
+            f"max_order_usd ({nums['max_order_usd']}) exceeds max_tick_budget_usd ({nums['max_tick_budget_usd']})",
+        )
+    if nums["max_underlying_open_risk_usd"] > nums["max_open_risk_usd"]:
+        raise PolicyVerificationError(
+            "POLICY_INVALID_BOUND",
+            f"max_underlying_open_risk_usd ({nums['max_underlying_open_risk_usd']}) exceeds max_open_risk_usd ({nums['max_open_risk_usd']})",
+        )
     if nums["max_active_window_risk_usd"] > nums["max_open_risk_usd"]:
         raise PolicyVerificationError(
             "POLICY_INVALID_BOUND",
@@ -94,7 +145,16 @@ def validate_policy_dict(payload: Any) -> dict[str, Any]:
             "POLICY_INVALID_BOUND",
             f"max_underlying_active_risk_usd ({nums['max_underlying_active_risk_usd']}) exceeds max_underlying_open_risk_usd ({nums['max_underlying_open_risk_usd']})",
         )
-    if not (0.0 < nums["min_buy_price"] <= nums["max_buy_price"] < 1.0):
+    if nums["max_underlying_active_risk_usd"] > nums["max_active_window_risk_usd"]:
+        raise PolicyVerificationError(
+            "POLICY_INVALID_BOUND",
+            f"max_underlying_active_risk_usd ({nums['max_underlying_active_risk_usd']}) exceeds max_active_window_risk_usd ({nums['max_active_window_risk_usd']})",
+        )
+    if not (
+        0.0 < nums["min_buy_price"] <= 0.500
+        and 0.450 <= nums["max_buy_price"] <= 0.530
+        and nums["min_buy_price"] <= nums["max_buy_price"]
+    ):
         raise PolicyVerificationError(
             "POLICY_INVALID_BOUND",
             f"Invalid buy price bounds: min={nums['min_buy_price']}, max={nums['max_buy_price']}",
@@ -105,17 +165,26 @@ def validate_policy_dict(payload: Any) -> dict[str, Any]:
             f"daily_loss_fraction must be in (0, 1], got {nums['daily_loss_fraction']}",
         )
 
+    for k, v in nums.items():
+        out[k] = v
+
     for map_key in ("stream_max_order_usd", "stream_min_buy_price"):
-        if map_key in payload and payload.get(map_key) is not None:
-            sub = payload.get(map_key)
+        has_in_risk = map_key in risk_block
+        sub = risk_block.get(map_key) if has_in_risk else payload.get(map_key)
+        if sub is not None:
             if not isinstance(sub, Mapping):
                 raise PolicyVerificationError("POLICY_INVALID_VALUE", f"Policy field {map_key} must be a mapping")
+            clean_sub: dict[str, float] = {}
             for s_name, s_val in sub.items():
                 f_val = _as_finite_float(s_val, f"{map_key}.{s_name}")
                 if map_key == "stream_max_order_usd" and f_val <= 0.0:
                     raise PolicyVerificationError("POLICY_INVALID_BOUND", f"{map_key}.{s_name} must be > 0")
-                if map_key == "stream_min_buy_price" and not (0.0 < f_val <= nums["max_buy_price"]):
+                if map_key == "stream_min_buy_price" and not (0.0 < f_val <= 0.500 and f_val <= nums["max_buy_price"]):
                     raise PolicyVerificationError("POLICY_INVALID_BOUND", f"{map_key}.{s_name} out of bounds")
+                clean_sub[str(s_name)] = f_val
+            out[map_key] = clean_sub
+        elif has_in_risk:
+            out[map_key] = {}
     return out
 
 

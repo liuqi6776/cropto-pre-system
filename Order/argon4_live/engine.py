@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import threading
@@ -31,6 +32,7 @@ from .audit_store import AuditStore
 from .clob_executor import ClobExecutor
 from .math_utils import (
     HARD_WINDOW_DEADLINE_SECONDS,
+    MAX_BUY_PRICE_CEILING,
     USD_MICRO,
     align_limit_price,
     check_hard_deadline,
@@ -861,16 +863,113 @@ class LiveExecutionEngine:
                     continue
 
             # [P1-6], [P1-7], Design Gap #1: Atomically claim signal and reserve risk quota under BEGIN IMMEDIATE
-            stream_min_map = paper_caps.get("stream_min_buy_price") or {}
-            effective_min_buy_price = float(
-                stream_min_map.get(stream, min_buy_price) if isinstance(stream_min_map, Mapping) else min_buy_price
-            )
-            sig_eff_max = sig.get("effective_max_buy_price") if isinstance(sig, Mapping) else None
-            effective_max_buy_price = (
-                min(float(max_buy_price), float(sig_eff_max))
-                if sig_eff_max is not None
-                else float(max_buy_price)
-            )
+            def _parse_strict_buy_price_bound(raw_val: Any, field_name: str) -> float:
+                dec = to_decimal(raw_val, field_name)
+                if not (Decimal("0") < dec <= MAX_BUY_PRICE_CEILING):
+                    raise ValueError(f"{field_name} out of bounds (0, {MAX_BUY_PRICE_CEILING}]: {raw_val!r}")
+                num = float(dec)
+                if not math.isfinite(num):
+                    raise ValueError(f"Non-finite {field_name}: {raw_val!r}")
+                return num
+
+            limit_abort_err: str | None = None
+            effective_min_buy_price = 0.0
+            effective_max_buy_price = 0.0
+            try:
+                stream_min_map = paper_caps.get("stream_min_buy_price") or {}
+                raw_min_p = (
+                    stream_min_map.get(stream, min_buy_price)
+                    if isinstance(stream_min_map, Mapping) and stream in stream_min_map
+                    else min_buy_price
+                )
+                effective_min_buy_price = _parse_strict_buy_price_bound(raw_min_p, "effective_min_buy_price")
+                max_candidates = [_parse_strict_buy_price_bound(max_buy_price, "policy.max_buy_price")]
+                if isinstance(sig, Mapping) and "effective_max_buy_price" in sig:
+                    if sig.get("effective_max_buy_price") is None:
+                        raise ValueError("signal.effective_max_buy_price is None")
+                    max_candidates.append(
+                        _parse_strict_buy_price_bound(sig.get("effective_max_buy_price"), "signal.effective_max_buy_price")
+                    )
+                if isinstance(fill, Mapping) and "limit_price" in fill:
+                    if fill.get("limit_price") is None:
+                        raise ValueError("fill.limit_price is None")
+                    max_candidates.append(
+                        _parse_strict_buy_price_bound(fill.get("limit_price"), "fill.limit_price")
+                    )
+                effective_max_buy_price = min(max_candidates)
+                if effective_min_buy_price > effective_max_buy_price:
+                    raise ValueError(
+                        f"effective_min_buy_price ({effective_min_buy_price}) > effective_max_buy_price ({effective_max_buy_price})"
+                    )
+            except ValueError as exc:
+                limit_abort_err = f"INVALID_LIMIT_PRICE:{exc}"
+
+            if limit_abort_err is not None:
+                if not self.audit.claim_signal(
+                    signal_id=signal_id,
+                    cohort_id=cohort_id,
+                    stream=stream,
+                    paper_order_id=paper_order_id,
+                    claimed_at_utc=live_detected_cal,
+                ):
+                    continue
+                slot_idx = len(ordered_slots)
+                ordered_slots.append(None)
+                now_iso = format_utc_iso(live_detected_cal)
+                live_exec = {
+                    "live_scale_factor": float(scale_dec),
+                    "order_type": "FAK",
+                    "limit_price": self._default_limit_price(),
+                    "requested_stake_usd": float(desired_stake_usd),
+                    "requested_quantity": "0.00",
+                    "clob_order_id": None,
+                    "clob_status": "ABORTED_INVALID_LIMIT_PRICE",
+                    "error_code": limit_abort_err,
+                    "filled_quantity": "0.00",
+                    "avg_fill_price": 0.0,
+                    "cost_usdc": 0.0,
+                    "fee_usdc": 0.0,
+                    "total_spent_usdc": 0.0,
+                    "unfilled_stake_usdc": float(desired_stake_usd),
+                    "polygon_tx_hashes": [],
+                    "onchain_confirmed": False,
+                    "onchain_block_number": None,
+                }
+                order_record = {
+                    "cohort_id": cohort_id,
+                    "stream": stream,
+                    "rank": rank,
+                    "signal_id": signal_id,
+                    "paper_order_id": paper_order_id,
+                    "market_id": market_id,
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "outcome": outcome,
+                    "market_protocol": market_protocol,
+                    "neg_risk": neg_risk,
+                    "timing": {
+                        "decision_at": decision_at_str,
+                        "paper_fill_at": paper_fill_at_str,
+                        "live_detected_at": now_iso,
+                        "live_signed_at": now_iso,
+                        "live_http_sent_at": now_iso,
+                        "live_http_ack_at": now_iso,
+                        "detection_lag_ms": detection_lag_ms,
+                        "clob_rtt_ms": 0.0,
+                    },
+                    "paper_benchmark": paper_benchmark,
+                    "live_execution": live_exec,
+                    "diff_vs_paper": compute_diff_vs_paper(paper_benchmark, live_exec, paper_status="OPEN"),
+                }
+                self.audit.record_order_execution(
+                    order_record,
+                    underlying=underlying,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+                ordered_slots[slot_idx] = order_record
+                deferred_snapshots.append((cohort_id, live_detected_cal))
+                continue
             fresh_cfg = paper_caps.get("execution_freshness_guard") or {}
             if isinstance(fresh_cfg, Mapping) and fresh_cfg.get("enabled") is True:
                 fresh_abort_status: str | None = None

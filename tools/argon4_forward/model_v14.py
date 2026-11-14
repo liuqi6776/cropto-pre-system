@@ -672,9 +672,11 @@ def apply_volatility_regime_guard(
     if isinstance(tiered_cfg, dict) and tiered_cfg.get("enabled") is True and res.get("selected") is True:
         side = str(res.get("side", "")).upper()
         z_abs = abs(float(res.get("z_v4", 0.0)))
-        th_val = float(res.get("threshold_frozen", 0.0))
-        delta_z = max(0.0, z_abs - th_val)
+        base_th_val = float(res.get("base_threshold_frozen", res.get("threshold_frozen", 0.0)))
+        raw_excess_z = z_abs - base_th_val
+        delta_z = max(0.0, raw_excess_z)
         res["signal_excess_z"] = round(delta_z, 6)
+        res["raw_signal_excess_z"] = round(raw_excess_z, 6)
 
         streak_min_bps = float(tiered_cfg.get("counter_15m_streak_min_bps", 45.0))
         streak_marginal_dz = float(tiered_cfg.get("counter_15m_marginal_delta_z", 0.12))
@@ -699,6 +701,10 @@ def apply_volatility_regime_guard(
                 return res
             res["effective_max_buy_price"] = streak_max_buy
             res["price_tier_reason"] = "MARGINAL_AGAINST_15M_STREAK"
+        elif raw_excess_z < -1e-12:
+            sub_cap = float(tiered_cfg.get("sub_threshold_max_buy_price", 0.485))
+            res["effective_max_buy_price"] = sub_cap
+            res["price_tier_reason"] = "SUB_BASELINE_THRESHOLD_CAP"
         elif isinstance(tiered_cfg.get("tiers"), list) and tiered_cfg["tiers"]:
             is_15m = str(stream).endswith("_15m")
             sorted_tiers = sorted(
@@ -777,6 +783,8 @@ def predict_stream_v14(
         res = namespace["predict_stream"](stream, base_frame, v4_frame, decision_time, bundle=bundle, phase=phase)
     else:
         raise model.ModelInputError("unknown stream or phase")
+    if res.get("threshold_frozen") is not None:
+        res = {**res, "base_threshold_frozen": float(res["threshold_frozen"])}
     if threshold_override is not None:
         th = float(threshold_override)
         zv = float(res["z_v4"])

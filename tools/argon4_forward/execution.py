@@ -467,13 +467,28 @@ class PaperExecutor:
                     or pred_dict.get("ex_ante_spot_close_t")
                     or pred_dict.get("spot_close_t")
                 )
-                raw_max_buy = (
-                    decision.get("effective_max_buy_price")
-                    or signal.get("effective_max_buy_price")
-                    or pred_dict.get("effective_max_buy_price")
-                    or self.policy.get("max_buy_price", 0.515)
-                )
-                effective_max_buy = min(Decimal(".530"), _d(raw_max_buy))
+                sig_max_candidates = []
+                for v in (
+                    decision.get("effective_max_buy_price"),
+                    signal.get("effective_max_buy_price"),
+                    pred_dict.get("effective_max_buy_price"),
+                ):
+                    if v is None:
+                        continue
+                    if isinstance(v, bool):
+                        raise AccountRejected("invalid effective_max_buy_price")
+                    dv = _d(v)
+                    if not (Decimal("0") < dv <= Decimal("0.530")):
+                        raise AccountRejected("invalid effective_max_buy_price")
+                    sig_max_candidates.append(dv)
+                cap_candidates = [Decimal(".530")]
+                if limits.get("has_explicit_max_buy_price"):
+                    cap_candidates.append(limits["max_buy_price"])
+                if sig_max_candidates:
+                    cap_candidates.append(min(sig_max_candidates))
+                elif not limits.get("has_explicit_max_buy_price"):
+                    cap_candidates.append(Decimal(".515"))
+                effective_max_buy = min(cap_candidates)
                 bleed_cap_active = bool(
                     signal.get("bleed_single_order_window_cap")
                     or pred_dict.get("bleed_single_order_window_cap") is True

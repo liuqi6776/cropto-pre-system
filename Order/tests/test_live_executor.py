@@ -7484,3 +7484,320 @@ def test_shadow_mode_preserves_virtual_balance_with_l2_creds() -> None:
     assert bal == pytest.approx(1269.0)
     assert allow == pytest.approx(1000000.0)
     assert clob_sh.balance_verified is True
+
+
+def test_v15r2_engine_intersects_policy_signal_and_paper_fill_limit_price(tmp_path: Path) -> None:
+    """Verify LiveExecutionEngine derives the exact min(policy_max_buy_price, signal.effective_max_buy_price, fill.limit_price)
+    ceiling so lowering global max_buy_price (e.g. 0.490) stays 100% aligned between Paper and External Live."""
+    upstream_root = tmp_path / "crypto-predict_system"
+    local_root = tmp_path / "Order"
+    upstream_root.mkdir(parents=True)
+    state_path = upstream_root / "pipeline_state.json"
+    policy_path = upstream_root / "argon4_forward_policy.json"
+    state_path.write_text("{}", encoding="utf-8")
+
+    tight_policy = {
+        "initial_capital_usd": 1269.0,
+        "max_order_usd": 240.0,
+        "max_tick_budget_usd": 380.0,
+        "max_active_window_risk_usd": 450.0,
+        "max_open_risk_usd": 650.0,
+        "max_underlying_active_risk_usd": 300.0,
+        "max_underlying_open_risk_usd": 450.0,
+        "single_stream_equity_fraction": 0.08,
+        "tick_equity_fraction": 0.15,
+        "min_buy_price": 0.47,
+        "max_buy_price": 0.490,
+        "daily_loss_fraction": 0.15,
+    }
+    policy_path.write_text(json.dumps(tight_policy), encoding="utf-8")
+
+    audit = AuditStore(
+        local_root / "runtime/shadow/live_audit.sqlite3",
+        local_root / "runtime/shadow/live_orders.jsonl",
+        local_root / "runtime/shadow/live_quota_snapshots.jsonl",
+        local_root / "runtime/shadow/live_settlements.jsonl",
+        local_root=local_root,
+        upstream_root=upstream_root,
+    )
+    pk = "0x" + ("97" * 32)
+    cands = derive_polymarket_candidate_wallets(pk)
+    observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_status = lambda *a, **kw: None  # type: ignore[method-assign]
+    clob = ClobExecutor(
+        mode="shadow",
+        private_key=pk,
+        api_key="k",
+        api_secret="dGVzdF9zZWNyZXRfYmFzZTY0X3N0cmluZ18xMjM0NTY=",
+        api_passphrase="p",
+        signature_type=3,
+        funder_address=cands["beacon_deposit_wallet"],
+        auto_derive_l2_creds=False,
+        default_tick_size="0.01",
+        tick_size_limit_prices={"0.01": 0.52, "0.001": 0.525},
+        min_buy_price=0.47,
+        max_buy_price=0.525,
+    )
+    clob._tick_sizes["2001"] = "0.01"
+    clob._fee_rates_bps["2001"] = 1000
+    redeemer = AutoRedeemer(
+        mode="shadow",
+        withdrawal_permission=False,
+        private_key=pk,
+        funder_address=cands["beacon_deposit_wallet"],
+        signature_type=3,
+    )
+    engine = LiveExecutionEngine(
+        config={
+            "capital_and_scaling": {
+                "live_scale_factor": 1.0,
+                "paper_max_daily_realized_loss_usd": 190.35,
+                "auto_equity_sizing": {"enabled": False},
+            },
+            "withdrawal_permission": False,
+        },
+        observer=observer,
+        audit_store=audit,
+        clob_executor=clob,
+        redeemer=redeemer,
+    )
+
+    cohort_iso = "2026-11-14T06:00:00+00:00"
+    t_detect = datetime(2026, 11, 14, 6, 0, 3, tzinfo=timezone.utc)
+    state_payload = {
+        "last_cohort": cohort_iso,
+        "execution": {
+            "cohort": {"cohort_id": cohort_iso, "budget_usd": 190.0},
+            "fills": [
+                {
+                    "signal_id": "sig_tight_cap_049",
+                    "order_id": "paper_tight_cap_049",
+                    "stream": "BTC_15m",
+                    "status": "OPEN",
+                    "underlying": "BTC",
+                    "outcome": "UP",
+                    "market_id": "986099",
+                    "limit_price": 0.490,
+                    "fill_at": "2026-11-14T06:00:02+00:00",
+                    "book_observed_at": "2026-11-14T06:00:02+00:00",
+                    "book_snapshot": {"best_ask": 0.48, "observed_at": "2026-11-14T06:00:02+00:00"},
+                    "quantity": "100.00000000",
+                    "cost_usd": 48.0,
+                    "fee_usd": 1.74,
+                    "fee_quote": {"rate": 0.07},
+                    "allocation_authorization": {"rank": 1, "cohort_id": cohort_iso, "approved_stake_usd": 50.0},
+                    "venue_market": {
+                        "asset": "BTC",
+                        "condition_id": "0x" + ("19" * 32),
+                        "window_start": cohort_iso,
+                        "window_end": "2026-11-14T06:15:00+00:00",
+                        "outcome_ids": {"UP": "2001", "DOWN": "2002"},
+                        "best_ask": 0.48,
+                        "best_bid": 0.47,
+                        "protocol": "v2",
+                        "neg_risk": False,
+                    },
+                }
+            ],
+        },
+        "decisions": {
+            "BTC_15m": {
+                "signal": {
+                    "signal_id": "sig_tight_cap_049",
+                    "market_id": "986099",
+                    "outcome": "UP",
+                    "underlying": "BTC",
+                    "effective_max_buy_price": 0.525,
+                    "window_start": cohort_iso,
+                    "window_end": "2026-11-14T06:15:00+00:00",
+                    "decision_at": "2026-11-14T06:00:01+00:00",
+                    "valid_until": "2026-11-14T06:00:20+00:00",
+                }
+            }
+        },
+    }
+    records = engine.process_pipeline_state(state_payload, detected_at_local_utc=t_detect)
+    assert len(records) == 1
+    assert records[0]["live_execution"]["clob_status"] == "SHADOW_MATCHED"
+    assert records[0]["live_execution"]["limit_price"] == pytest.approx(0.490)
+    observer.close()
+
+
+def test_v15r3_nested_risk_precedence_and_nan_limit_price_fail_closed(tmp_path: Path) -> None:
+    """v15r3:
+    1. validate_policy_dict resolves nested policy['risk'] overrides over top-level fields
+       with the exact same precedence as upstream account._policy_risk_limits.
+    2. LiveExecutionEngine strictly aborts (ABORTED_INVALID_LIMIT_PRICE, zero order submission)
+       when fill.limit_price or signal.effective_max_buy_price is NaN, Inf, 'nan', bool, None, or > 0.530.
+    """
+    from argon4_live.upstream_observer import validate_policy_dict
+
+    upstream_root = tmp_path / "crypto-predict_system"
+    local_root = tmp_path / "Order"
+    state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
+    policy_path = upstream_root / "config/argon4_forward_policy.json"
+    _write_json(state_path, {})
+
+    nested_policy = {
+        "initial_capital_usd": 1269.0,
+        "max_order_usd": 240.0,
+        "max_tick_budget_usd": 380.0,
+        "max_active_window_risk_usd": 450.0,
+        "max_open_risk_usd": 650.0,
+        "max_underlying_active_risk_usd": 300.0,
+        "max_underlying_open_risk_usd": 450.0,
+        "min_buy_price": 0.470,
+        "max_buy_price": 0.525,
+        "stream_min_buy_price": {"BTC_15m": 0.470},
+        "daily_loss_fraction": 0.15,
+        "risk": {
+            "max_buy_price": 0.488,
+            "min_buy_price": 0.450,
+            "stream_min_buy_price": {"BTC_15m": 0.455},
+            "max_open_risk_usd": 100.0,
+            "max_underlying_open_risk_usd": 50.0,
+            "max_order_usd": 25.0,
+            "max_tick_budget_usd": 120.0,
+        },
+    }
+    validated = validate_policy_dict(nested_policy)
+    assert validated["max_buy_price"] == pytest.approx(0.488)
+    assert validated["min_buy_price"] == pytest.approx(0.450)
+    assert validated["stream_min_buy_price"]["BTC_15m"] == pytest.approx(0.455)
+    assert validated["max_active_window_risk_usd"] == pytest.approx(100.0)
+    assert validated["max_underlying_active_risk_usd"] == pytest.approx(50.0)
+
+    _write_json(policy_path, nested_policy)
+
+    audit = AuditStore(
+        local_root / "runtime/live/live_audit.sqlite3",
+        local_root / "runtime/live/live_orders.jsonl",
+        local_root / "runtime/live/live_quota_snapshots.jsonl",
+        local_root / "runtime/live/live_settlements.jsonl",
+        local_root=local_root,
+        upstream_root=upstream_root,
+    )
+    pk = "0x" + ("93" * 32)
+    cands = derive_polymarket_candidate_wallets(pk)
+    observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_status = lambda *a, **kw: None  # type: ignore[method-assign]
+    clob = ClobExecutor(
+        mode="shadow",
+        private_key=pk,
+        api_key="k",
+        api_secret="dGVzdF9zZWNyZXRfYmFzZTY0X3N0cmluZ18xMjM0NTY=",
+        api_passphrase="p",
+        signature_type=3,
+        funder_address=cands["beacon_deposit_wallet"],
+        auto_derive_l2_creds=False,
+        default_tick_size="0.001",
+        tick_size_limit_prices={"0.01": 0.52, "0.001": 0.525},
+        min_buy_price=0.47,
+        max_buy_price=0.525,
+    )
+    clob._tick_sizes["2001"] = "0.001"
+    clob._fee_rates_bps["2001"] = 1000
+    redeemer = AutoRedeemer(
+        mode="shadow",
+        withdrawal_permission=False,
+        private_key=pk,
+        funder_address=cands["beacon_deposit_wallet"],
+        signature_type=3,
+    )
+    engine = LiveExecutionEngine(
+        config={
+            "capital_and_scaling": {
+                "live_scale_factor": 1.0,
+                "paper_max_daily_realized_loss_usd": 150.0,
+                "auto_equity_sizing": {"enabled": False},
+            },
+            "withdrawal_permission": False,
+            "_disable_live_spot_drift_http": True,
+        },
+        observer=observer,
+        audit_store=audit,
+        clob_executor=clob,
+        redeemer=redeemer,
+    )
+
+    cohort_iso = "2026-11-14T07:00:00+00:00"
+    t_detect = datetime(2026, 11, 14, 7, 0, 2, 100000, tzinfo=timezone.utc)
+
+    def _make_state(sig_id: str, fill_lim: Any, sig_lim: Any = 0.525) -> dict[str, Any]:
+        fill_obj: dict[str, Any] = {
+            "signal_id": sig_id,
+            "order_id": f"paper_{sig_id}",
+            "stream": "BTC_15m",
+            "status": "OPEN",
+            "underlying": "BTC",
+            "outcome": "UP",
+            "market_id": "987001",
+            "limit_price": fill_lim,
+            "fill_at": "2026-11-14T07:00:02+00:00",
+            "book_observed_at": "2026-11-14T07:00:02+00:00",
+            "book_snapshot": {"best_ask": 0.460, "observed_at": "2026-11-14T07:00:02+00:00"},
+            "quantity": "50.00000000",
+            "cost_usd": 23.0,
+            "fee_usd": 0.87,
+            "fee_quote": {"rate": 0.07},
+            "allocation_authorization": {"rank": 1, "cohort_id": cohort_iso, "approved_stake_usd": 25.0},
+            "venue_market": {
+                "asset": "BTC",
+                "condition_id": "0x" + ("21" * 32),
+                "window_start": cohort_iso,
+                "window_end": "2026-11-14T07:15:00+00:00",
+                "outcome_ids": {"UP": "2001", "DOWN": "2002"},
+                "best_ask": 0.460,
+                "best_bid": 0.450,
+                "protocol": "v2",
+                "neg_risk": False,
+            },
+        }
+        return {
+            "last_cohort": cohort_iso,
+            "execution": {"cohort": {"cohort_id": cohort_iso, "budget_usd": 100.0}, "fills": [fill_obj]},
+            "decisions": {
+                "BTC_15m": {
+                    "signal": {
+                        "signal_id": sig_id,
+                        "market_id": "987001",
+                        "outcome": "UP",
+                        "underlying": "BTC",
+                        "effective_max_buy_price": sig_lim,
+                        "window_start": cohort_iso,
+                        "window_end": "2026-11-14T07:15:00+00:00",
+                        "decision_at": "2026-11-14T07:00:01+00:00",
+                        "valid_until": "2026-11-14T07:00:20+00:00",
+                    }
+                }
+            },
+        }
+
+    # 1) Valid nested risk policy (stream_min_buy_price=0.455, max_buy_price=0.488) with ask=0.460 -> SHADOW_MATCHED at cap 0.488!
+    ok_rec = engine.process_pipeline_state(_make_state("sig_nested_ok", 0.510, 0.525), detected_at_local_utc=t_detect)
+    assert len(ok_rec) == 1
+    assert ok_rec[0]["live_execution"]["clob_status"] == "SHADOW_MATCHED"
+    assert ok_rec[0]["live_execution"]["limit_price"] == pytest.approx(0.488)
+
+    # 2) Every NaN / Inf / 'nan' / bool / None / >0.530 limit input MUST abort fail-closed!
+    bad_cases = [
+        ("sig_nan_fill", float("nan"), 0.510),
+        ("sig_inf_fill", float("inf"), 0.510),
+        ("sig_str_nan_fill", "nan", 0.510),
+        ("sig_bool_fill", True, 0.510),
+        ("sig_none_fill", None, 0.510),
+        ("sig_high_fill", 0.60, 0.510),
+        ("sig_nan_sig", 0.488, float("nan")),
+        ("sig_bool_sig", 0.488, False),
+    ]
+    for sig_id, bad_fill_lim, bad_sig_lim in bad_cases:
+        recs = engine.process_pipeline_state(
+            _make_state(sig_id, bad_fill_lim, bad_sig_lim),
+            detected_at_local_utc=t_detect,
+        )
+        assert len(recs) == 1, sig_id
+        assert recs[0]["live_execution"]["clob_status"] == "ABORTED_INVALID_LIMIT_PRICE", sig_id
+        assert "INVALID_LIMIT_PRICE" in (recs[0]["live_execution"]["error_code"] or ""), sig_id
+    observer.close()
+
+

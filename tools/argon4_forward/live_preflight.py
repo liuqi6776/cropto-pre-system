@@ -34,14 +34,14 @@ def preparation_status(policy, config):
                     config.get("max_open_risk_usd") == expected_open)
     return {"status": "DISABLED", "live_enabled": False,
             "configuration_safe": disabled, "risk_limits_match": limits_match,
-            "risk_limits": {k: ({sk: float(sv) for sk, sv in v.items()} if isinstance(v, dict) else (int(v) if v == int(v) else float(v)))
+            "risk_limits": {k: (bool(v) if isinstance(v, bool) else ({sk: float(sv) for sk, sv in v.items()} if isinstance(v, dict) else (int(v) if v == int(v) else float(v))))
                             for k, v in risk_limits.items() if not k.endswith("_atoms")},
             "engineering": engineering, "policy_version": policy.get("version"),
             "min_decision_delay_seconds": earliest, "multi_look_ioc": multi_look,
             "aged_revision_fastpath": revision_profile,
             "price_limit_basis": "ASK_PRICE_EXCLUDING_FEE_FEES_INCLUDED_IN_CAPITAL_LIMITS",
             "execution_stage": stage, "execution_style": "TAKER_IOC_PAPER_ONLY",
-            "max_buy_price": policy.get("max_buy_price"),
+            "max_buy_price": float(risk_limits["max_buy_price"]) if risk_limits.get("has_explicit_max_buy_price") else None,
             "signer_connected": False, "order_transport_connected": False,
             "order_adapter_implemented": False, "ready_for_live": False,
             "blockers": ["WORKSPACE_LIVE_TRADING_PROHIBITED", "NO_LIVE_ORDER_ADAPTER",

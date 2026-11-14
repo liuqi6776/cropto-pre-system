@@ -1,0 +1,22 @@
+# ARGON-4 Single-Factor Candidate Check (2026-11-14) / 单因子受控对照检验
+
+## Overview / 概述
+- **EN**: Reproducible, read-only local single-factor evaluation script (`evaluate_single_factor_candidates.py`) isolating two candidate guard adjustments without modifying production `config/argon4_forward_policy.json` or live runtime state:
+  1. **Candidate 1 (`min_buy_price` & all 6 `stream_min_buy_price`: `0.47 -> 0.445`)**: Audited against real observed Polymarket orderbooks, actual taker fees (`0.07 * p * (1 - p)`), and official Gamma market settlements. Canonicalizes `Z` vs `+00:00` UTC timestamps and joins via `allocation_consumption` + `cohort_streams.signal_id` + `decision_cohorts` (`0` unattributed local orders), separating local `account.sqlite3` evidence from optional `--cloud-snapshot` evidence.
+  2. **Candidate 2 (`us_open_blackout.local_end_minute`: `720 -> 600` [`12:00 ET -> 10:00 ET`])**: Strict 1-parameter control calling `model_v14.apply_volatility_regime_guard` directly with `policy_A` (`local_end_minute = 720`, unmodified `v15r1`) vs `policy_B` (`deepcopy(policy_A)` with **only** `local_end_minute = 600`) on out-of-sample `2026-01-01 .. 2026-09-24` `LOCAL_V4_FROZEN` predictions (trained/calibrated `<= 2025-12-31`). Zero non-online filters are applied in `strict_single_parameter_ab`; offline proxy slices (`rank1_per_cohort_lower_bound`, `handicap_bps >= -1.0`) are strictly isolated in `secondary_non_online_diagnostics_on_unlocked_delta`.
+- **ZH**: 可复现的本地只读单因子对照检验脚本 (`evaluate_single_factor_candidates.py`)，在不改动生产环境 `config/argon4_forward_policy.json` 或运行态的前提下，独立检验两项候选调整：
+  1. **候选一（全局 `min_buy_price` 与全部 6 条流 `stream_min_buy_price`：`0.47 -> 0.445`）**：统一规范化 `Z` 与 `+00:00` UTC 时间戳并通过 `allocation_consumption`、`cohort_streams.signal_id` 与 `decision_cohorts` 精确关联策略版本（本地订单版本缺失数 `= 0`），严格分离本地 `account.sqlite3` 与可选 `--cloud-snapshot` 云端快照样本。
+  2. **候选二（`us_open_blackout.local_end_minute`：`720 -> 600`，即 `12:00 ET -> 10:00 ET`）**：直接调用线上真实护栏函数 `model_v14.apply_volatility_regime_guard`，严格对比 `policy_A`（`local_end_minute = 720`，线上原版 `v15r1`）与仅修改 `local_end_minute = 600` 一个参数的 `policy_B`（零额外线上不存在的条件）；非线上代理诊断切片（如每窗口 `rank=1` 下界、`handicap_bps >= -1.0` 平价代理子集）均被严格隔离在次级诊断区并附带局限性说明。
+
+## Key Findings / 核心结论
+- **Candidate 1 (`0.47 -> 0.445`)**:
+  - **EN**: Local `account.sqlite3` contains only `4` settled fills in `[0.445, 0.470)` (`3W/1L`, all from earlier `v13r2`) and `0` current `v15r1` floor-rejected samples (`2` in optional Cloud snapshot, both `0W/2L`). Sample size under `v15r1` is insufficient to justify relaxing the `0.47` floor now; continue accumulating `v15r1` `PRICE_LIMIT_NOT_MET` book-skip receipts first.
+  - **ZH**: 本地 `account.sqlite3` 在 `[0.445, 0.470)` 仅有 `4` 笔早期 `v13r2` 模拟成交（`3` 胜 `1` 负），当前 `v15r1` 下因 `0.47` 下限被拒的本地样本为 `0` 笔（可选云端快照中仅 `2` 笔且按官方结算均为负 `0W/2L`）。当前 `v15r1` 拒单样本严重不足，暂不放宽 `0.47` 下限，继续积累线上 `PRICE_LIMIT_NOT_MET` 真实拒单盘口样本。
+- **Candidate 2 (`local_end_minute: 720 -> 600`)**:
+  - **EN**: Under strict 1-parameter control (`B \ A`, `N = 963` newly unlocked `10:00–12:00 ET` signals), Binance Perp Point WR is only `49.74%` (`-3.88%` ROI at each signal's tier cap; `-1.01%` ROI at `0.485`), and drops to `48.00%` on rank-1-per-cohort (`N = 675`). Although Spot `1m OHLC4` proxy WR is `55.35%` across all `963` signals, `605/963` had `handicap_bps < -1.0` (deep-ITM opening handicap unlikely to fill below `0.49–0.52` on live books), leaving `53.35%` proxy WR (`52.51%` Perp WR) on `handicap_bps >= -1.0` (`N = 358`) before orderbook adverse selection. Do **not** relax `us_open_blackout` in production until shadow book telemetry confirms net positive executable edge.
+  - **ZH**: 在严格单参数对照下（`B \ A` 共解锁 `N = 963` 笔 `10:00–12:00 ET` 信号），Binance 永续点位真实胜率仅为 `49.74%`（按各信号自身价档上限计 ROI 为 `-3.88%`，按 `0.485` 均价计为 `-1.01%`），每窗口取 `rank=1` 下界（`N = 675`）时进一步降至 `48.00%`。虽然现货 `1m OHLC4` 代理胜率表面为 `55.35%`，但其中 `605/963` 笔为 `handicap_bps < -1.0` 的深度实值开局（真实盘口开盘买一价往往高于限价帽无法成交），剔除后（`N = 358`）代理胜率回落至 `53.35%`（永续点位 `52.51%`）且尚未计入真实盘口逆向选择折损。因此生产环境维持 `12:00 ET` 不放宽。
+
+## Usage / 运行方式
+```powershell
+python -B reports/argon4_single_factor_check_20261114/evaluate_single_factor_candidates.py
+```

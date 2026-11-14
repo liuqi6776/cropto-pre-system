@@ -3,6 +3,7 @@
 Never replay a missed decision window or count a historical backtest as cash.
 The only execution class used here is the isolated SQLite paper executor.
 """
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from copy import deepcopy
 import hashlib
@@ -884,9 +885,34 @@ class ForwardPipeline:
                 if score.get("bleed_single_order_window_cap") is True:
                     signal["bleed_single_order_window_cap"] = True
                     signal["max_orders_in_window"] = 1
+                pol_dict = policy if isinstance(policy, Mapping) else {}
+                if "risk" in pol_dict and pol_dict.get("risk") is not None and not isinstance(pol_dict.get("risk"), Mapping):
+                    raise ValueError("invalid policy risk limits")
+                risk_dict = pol_dict.get("risk") if isinstance(pol_dict.get("risk"), Mapping) else {}
+                if "max_buy_price" in risk_dict:
+                    pol_max = risk_dict.get("max_buy_price")
+                    if pol_max is None:
+                        raise ValueError("invalid policy max_buy_price")
+                else:
+                    pol_max = pol_dict.get("max_buy_price")
+                pol_max_f = None
+                if pol_max is not None:
+                    if isinstance(pol_max, bool) or not isinstance(pol_max, (int, float)):
+                        raise ValueError("invalid policy max_buy_price")
+                    pol_max_f = float(pol_max)
+                    if not math.isfinite(pol_max_f) or not (0.0 < pol_max_f <= 0.530):
+                        raise ValueError("invalid policy max_buy_price")
                 if score.get("effective_max_buy_price") is not None:
-                    signal["effective_max_buy_price"] = float(score["effective_max_buy_price"])
-                    decisions[stream]["effective_max_buy_price"] = float(score["effective_max_buy_price"])
+                    raw_eff = score["effective_max_buy_price"]
+                    if isinstance(raw_eff, bool) or not isinstance(raw_eff, (int, float)):
+                        raise ValueError("invalid effective_max_buy_price")
+                    eff_cap = float(raw_eff)
+                    if not math.isfinite(eff_cap) or not (0.0 < eff_cap <= 0.530):
+                        raise ValueError("invalid effective_max_buy_price")
+                    if pol_max_f is not None:
+                        eff_cap = min(pol_max_f, eff_cap)
+                    signal["effective_max_buy_price"] = eff_cap
+                    decisions[stream]["effective_max_buy_price"] = eff_cap
                 if score.get("ex_ante_spot_close_t") is not None:
                     signal["spot_close_t"] = float(score["ex_ante_spot_close_t"])
                     decisions[stream]["spot_close_t"] = float(score["ex_ante_spot_close_t"])

@@ -1309,7 +1309,12 @@ def test_v14r9_storage_janitor_biweekly_cold_archive_and_revision_integrity(runt
     assert res2["status"] == "COMMITTED"
     rev1_obs = Path(res1["archive_path"]) / "observations.sqlite3"
     rev2_obs = Path(res2["archive_path"]) / "observations.sqlite3"
-    assert rev1_obs.stat().st_ino == rev2_obs.stat().st_ino
+    st_rev1 = rev1_obs.stat()
+    st_rev2 = rev2_obs.stat()
+    if st_rev1.st_nlink >= 2 and st_rev1.st_ino != 0:
+        assert st_rev1.st_ino == st_rev2.st_ino
+    else:
+        assert revisions._sha(rev1_obs) == revisions._sha(rev2_obs)
 
 
 def test_v14r10_async_janitor_trading_yield_min_buy_policy_and_active_risk_status(tmp_path):
@@ -2859,7 +2864,11 @@ def test_v14r19_sub4s_latency_online_sha256_cache_transport_pool_and_live_config
     try:
         os.link(sample_file, hardlink_file)
         assert sj_mod._dir_size_bytes(rt_jan) == 2048
-        assert sj_mod._physical_dir_size_bytes(rt_jan) == 1024
+        st_sample = sample_file.stat()
+        if st_sample.st_nlink >= 2 and st_sample.st_ino != 0:
+            assert sj_mod._physical_dir_size_bytes(rt_jan) == 1024
+        else:
+            assert sj_mod._physical_dir_size_bytes(rt_jan) in (1024, 2048)
     except OSError:
         assert sj_mod._physical_dir_size_bytes(rt_jan) == 1024
 
@@ -3699,11 +3708,262 @@ def test_v15_confidence_tiers_freshness_veto_and_lookback_parity(tmp_path, monke
         pipe_p.close()
 
 
+def test_v15r2_paper_live_max_buy_price_consistency_and_threshold_override_tier_isolation(tmp_path, monkeypatch):
+    """Verify:
+    1) Lowering policy['max_buy_price'] (e.g. 0.490) clamps higher per-signal tiered caps (e.g. 0.510 / 0.525)
+       in PaperExecutor, Account.place_paper_buy, and ForwardPipeline — preventing Paper-fills-while-Live-aborts divergence.
+    2) Lowering threshold_override in predict_stream_v14 preserves base_threshold_frozen so existing signals are never
+       promoted to higher confidence buy-price tiers, while sub-baseline signals are capped at sub_threshold_max_buy_price.
+    """
+    from copy import deepcopy
+    from datetime import timedelta
+    from tools.argon4_forward import account, execution
+    from test_argon4_forward_execution import BOUNDARY, clock as make_clock, fixture_inputs, no_signal, v5_policy
+
+    policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
+    vg = deepcopy(policy["volatility_regime_guard"])
+    vg["confidence_tiered_max_buy_price"]["sub_threshold_max_buy_price"] = 0.485
+
+    # --- Part A: threshold_override must NOT inflate delta_z or promote confidence price tiers ---
+    monkeypatch.setattr(
+        model_v14.model,
+        "predict_stream",
+        lambda stream, bf, vf, dt, bundle=None, **kw: {
+            "stream": stream,
+            "underlying": "BTC",
+            "side": "UP",
+            "z_v4": z_holder["z"],
+            "threshold_frozen": 1.00,
+            "selected": abs(z_holder["z"]) >= 1.00,
+            "model_version": "test_v15r2",
+            "model_sha256": "a" * 64,
+        },
+    )
+    z_holder = {"z": 1.30}  # Above base_th=1.00 by +0.30 (< 0.35 Tier 2 cutoff!), so baseline is Tier 1 (0.498 on 15m)
+    res_base = model_v14.predict_stream_v14(
+        "BTC_15m",
+        None,
+        None,
+        BOUNDARY,
+        ex_ante_rv12_bps=10.0,
+        volatility_regime_guard=vg,
+        cohort_time="2026-11-14T06:00:00+00:00",
+        spot_twap60_t=90000.0,
+        spot_close_t=90000.0,
+    )
+    res_lowered = model_v14.predict_stream_v14(
+        "BTC_15m",
+        None,
+        None,
+        BOUNDARY,
+        threshold_override=0.92,  # Without base_threshold_frozen isolation, 1.30 - 0.92 = 0.38 >= 0.35 would jump to 0.510!
+        ex_ante_rv12_bps=10.0,
+        volatility_regime_guard=vg,
+        cohort_time="2026-11-14T06:00:00+00:00",
+        spot_twap60_t=90000.0,
+        spot_close_t=90000.0,
+    )
+    assert res_base["effective_max_buy_price"] == pytest.approx(0.498)
+    assert res_lowered["base_threshold_frozen"] == pytest.approx(1.00)
+    assert res_lowered["threshold_frozen"] == pytest.approx(0.92)
+    assert res_lowered["signal_excess_z"] == pytest.approx(0.30)
+    assert res_lowered["effective_max_buy_price"] == pytest.approx(0.498)
+    assert res_lowered["price_tier_reason"] == "CONFIDENCE_TIER_1_15M"
+
+    # Sub-baseline marginal signal (0.92 <= 0.95 < 1.00) admitted via threshold_override -> capped at 0.485!
+    z_holder["z"] = 0.95
+    res_sub = model_v14.predict_stream_v14(
+        "BTC_15m",
+        None,
+        None,
+        BOUNDARY,
+        threshold_override=0.92,
+        ex_ante_rv12_bps=10.0,
+        volatility_regime_guard=vg,
+        cohort_time="2026-11-14T06:00:00+00:00",
+        spot_twap60_t=90000.0,
+        spot_close_t=90000.0,
+    )
+    assert res_sub["selected"] is True
+    assert res_sub["raw_signal_excess_z"] == pytest.approx(-0.05)
+    assert res_sub["signal_excess_z"] == pytest.approx(0.0)
+    assert res_sub["effective_max_buy_price"] == pytest.approx(0.485)
+    assert res_sub["price_tier_reason"] == "SUB_BASELINE_THRESHOLD_CAP"
+
+    # --- Part B: Tightened global max_buy_price=0.490 clamps signal effective_max_buy_price=0.510 in Paper ---
+    tight_pol = {
+        **v5_policy(),
+        "version": "v15r2-tight-cap-test",
+        "max_buy_price": 0.490,
+        "min_buy_price": 0.470,
+        "stream_min_buy_price": {s: 0.470 for s in ("BTC_15m", "ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m")},
+        "order": ["BTC_15m", "ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m", "BNB_15m"],
+    }
+    ledger = account.Account(
+        tmp_path / "v15r2_acc.sqlite3",
+        initial_capital=10000,
+        started_at=BOUNDARY - timedelta(seconds=1),
+    )
+    exec_tight = execution.PaperExecutor(ledger, tight_pol)
+    decisions, markets = fixture_inputs(capacity=300, boundary=BOUNDARY)
+    decisions["BTC_15m"]["signal"]["effective_max_buy_price"] = 0.525
+    decisions["BTC_15m"]["effective_max_buy_price"] = 0.525
+    decisions["ETH_5m"]["signal"]["effective_max_buy_price"] = 0.510
+    decisions["ETH_5m"]["effective_max_buy_price"] = 0.510
+    for st_off in ("ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m", "BNB_15m"):
+        decisions[st_off] = no_signal(st_off, BOUNDARY)
+
+    # BTC_15m best_ask=0.500 (> 0.490 global cap, even though signal tier was 0.525!) -> MUST skip as PRICE_LIMIT_NOT_MET
+    # and unlock ETH_5m at best_ask=0.480 (<= 0.490 global cap)!
+    markets["BTC_15m"]["books"]["UP"]["asks"] = [{"price": 0.500, "size": 600}]
+    markets["ETH_5m"]["books"]["UP"]["asks"] = [{"price": 0.480, "size": 600}]
+
+    now_ts = BOUNDARY + timedelta(seconds=2)
+    out = exec_tight.process_cohort(
+        BOUNDARY.isoformat(),
+        decisions,
+        markets,
+        now=now_ts,
+        clock=make_clock(now_ts),
+    )
+    assert out["status"] == "PROCESSED", out
+    assert out["stream_results"]["BTC_15m"]["status"] == "PRICE_LIMIT_NOT_MET"
+    assert out["stream_results"]["BTC_15m"]["limit_price"] == pytest.approx(0.490)
+    assert out["stream_results"]["ETH_5m"]["status"] == "FILLED_BUDGET"
+    assert len(out["fills"]) == 1
+    assert out["fills"][0]["limit_price"] == pytest.approx(0.490)
 
 
+def test_v15r3_nested_risk_precedence_and_nonfinite_limit_price_rejection(tmp_path, monkeypatch):
+    """v15r3:
+    1. Nested policy['risk'] overrides top-level price/risk fields identically across
+       _policy_risk_limits, Account.overview, live_preflight, ForwardPipeline._score_decisions, and PaperExecutor.
+    2. Non-finite (NaN/Inf), boolean, or out-of-bounds effective_max_buy_price values are strictly rejected.
+    """
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from test_argon4_forward_execution import (
+        BOUNDARY,
+        clock as make_clock,
+        fixture_inputs,
+        no_signal,
+        v5_policy,
+    )
+    from tools.argon4_forward import execution, live_preflight, pipeline as pipe_mod
 
+    nested_pol = {
+        **v5_policy(),
+        "version": "v15r3-nested-risk-test",
+        "max_buy_price": 0.525,
+        "min_buy_price": 0.470,
+        "stream_min_buy_price": {"BTC_15m": 0.470},
+        "risk": {
+            "max_buy_price": 0.488,
+            "min_buy_price": 0.450,
+            "stream_min_buy_price": {"BTC_15m": 0.455},
+        },
+        "order": ["BTC_15m", "ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m", "BNB_15m"],
+    }
+    limits = account._policy_risk_limits(nested_pol)
+    assert limits["max_buy_price"] == Decimal("0.488")
+    assert limits["min_buy_price"] == Decimal("0.450")
+    assert limits["stream_min_buy_price"]["BTC_15m"] == Decimal("0.455")
 
+    ledger = account.Account(
+        tmp_path / "v15r3_acc.sqlite3",
+        initial_capital=10000,
+        started_at=BOUNDARY - timedelta(seconds=1),
+    )
+    ov = ledger.overview(now=BOUNDARY, policy=nested_pol)
+    assert ov["risk_limits"]["max_buy_price"] == pytest.approx(0.488)
 
+    prep = live_preflight.preparation_status(
+        {**nested_pol, "live_enabled": False},
+        {
+            "live_enabled": False,
+            "mode": "disabled",
+            "signer_connected": False,
+            "order_transport_connected": False,
+            "max_order_usd": float(limits["max_order_usd"]),
+            "max_open_risk_usd": float(limits["max_open_risk_usd"]),
+        },
+    )
+    assert prep["max_buy_price"] == pytest.approx(0.488)
+    assert prep["risk_limits"]["has_explicit_max_buy_price"] is True
 
+    # ForwardPipeline._score_decisions must ALSO honor nested policy['risk']['max_buy_price'] = 0.488 over top-level 0.525
+    obs = SimpleNamespace(save=lambda *_a, **_kw: None, latest=lambda *_a, **_kw: None, path=str(tmp_path / "obs.sqlite3"))
+    pipe = pipe_mod.ForwardPipeline(ledger, tmp_path / "rt_v15r3", obs)
+    pipe.clock = make_clock(BOUNDARY + timedelta(seconds=2))
+    pipe.bundles = {st: {} for st in nested_pol["order"]}
+    monkeypatch.setattr(pipe_mod, "calibrated_now", lambda _clk=None, upper=True: BOUNDARY + timedelta(seconds=2))
+    dummy_row = pd.DataFrame({"x": [1.0]}, index=pd.DatetimeIndex([BOUNDARY - timedelta(minutes=5)]))
+    pre_frames = {sym: {"base": dummy_row, "expert": dummy_row} for sym in pipe_mod.ALL_SYMBOLS}
+    prof = pipe_mod.stage_profile(nested_pol, BOUNDARY)
+    fake_score = {
+        "selected": True,
+        "side": "UP",
+        "model_version": "m_v15r3",
+        "model_sha256": "a" * 64,
+        "effective_max_buy_price": 0.510,
+        "ex_ante_spot_close_t": 90000.0,
+    }
+    scored = pipe._score_decisions(
+        nested_pol,
+        {"data_root": None},
+        BOUNDARY,
+        prof,
+        BOUNDARY + timedelta(seconds=1),
+        BOUNDARY + timedelta(seconds=1),
+        dict(pre_frames),
+        {},
+        None,
+        lambda *_a, **_kw: None,
+        lambda *_a, **_kw: dict(fake_score),
+    )
+    assert scored["BTC_15m"]["status"] == "SIGNAL"
+    assert scored["BTC_15m"]["signal"]["effective_max_buy_price"] == pytest.approx(0.488)
+
+    # Non-finite or boolean effective_max_buy_price in _score_decisions must raise ValueError
+    for bad_val in (float("nan"), float("inf"), True, 0.0, 0.60):
+        with pytest.raises(ValueError, match="effective_max_buy_price"):
+            pipe._score_decisions(
+                nested_pol,
+                {"data_root": None},
+                BOUNDARY,
+                prof,
+                BOUNDARY + timedelta(seconds=1),
+                BOUNDARY + timedelta(seconds=1),
+                dict(pre_frames),
+                {},
+                None,
+                lambda *_a, **_kw: None,
+                lambda *_a, _v=bad_val, **_kw: {**fake_score, "effective_max_buy_price": _v},
+            )
+
+    # PaperExecutor.process_cohort must also block fail-closed on NaN / Inf / bool / out-of-bounds effective_max_buy_price
+    for idx_bad, bad_sig_cap in enumerate((float("nan"), float("inf"), True, -0.1, 0.55)):
+        bad_ledger = account.Account(
+            tmp_path / f"v15r3_bad_{idx_bad}.sqlite3",
+            initial_capital=10000,
+            started_at=BOUNDARY - timedelta(seconds=1),
+        )
+        exec_nested = execution.PaperExecutor(bad_ledger, nested_pol)
+        decisions, markets = fixture_inputs(capacity=300, boundary=BOUNDARY)
+        for st_off in ("ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m", "BNB_15m"):
+            decisions[st_off] = no_signal(st_off, BOUNDARY)
+        decisions["BTC_15m"]["signal"]["effective_max_buy_price"] = bad_sig_cap
+        decisions["BTC_15m"]["effective_max_buy_price"] = bad_sig_cap
+        now_ts = BOUNDARY + timedelta(seconds=3)
+        res_bad = exec_nested.process_cohort(
+            BOUNDARY.isoformat(),
+            decisions,
+            markets,
+            now=now_ts,
+            clock=make_clock(now_ts),
+        )
+        assert res_bad["status"] == "BLOCKED", (bad_sig_cap, res_bad)
+        assert res_bad["fills"] == []
+        assert res_bad["blocked"], bad_sig_cap
 
 

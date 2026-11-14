@@ -106,10 +106,17 @@ def _stage(policy, boundary):
 def _policy_risk_limits(policy=None):
     """Read and validate configurable risk limits from policy (with v13r2 defaults)."""
     src = policy if isinstance(policy, Mapping) else {}
+    if "risk" in src and src.get("risk") is not None and not isinstance(src.get("risk"), Mapping):
+        raise AccountRejected("invalid policy risk limits")
     risk_block = src.get("risk") if isinstance(src.get("risk"), Mapping) else {}
 
     def dec_field(key, default):
-        raw = risk_block.get(key) if key in risk_block else src.get(key)
+        if key in risk_block:
+            raw = risk_block.get(key)
+            if raw is None or isinstance(raw, bool):
+                raise AccountRejected("invalid policy risk limits")
+            return _d(raw)
+        raw = src.get(key)
         if raw is None:
             return Decimal(str(default))
         if isinstance(raw, bool):
@@ -142,6 +149,10 @@ def _policy_risk_limits(policy=None):
     )
     daily_loss = dec_field("daily_loss_fraction", "0.055")
     min_buy_price = dec_field("min_buy_price", "0")
+    has_explicit_max_buy = has_field("max_buy_price") and (
+        (risk_block.get("max_buy_price") if "max_buy_price" in risk_block else src.get("max_buy_price")) is not None
+    )
+    max_buy_price = dec_field("max_buy_price", "0.530")
     raw_stream_min = risk_block.get("stream_min_buy_price") if "stream_min_buy_price" in risk_block else src.get("stream_min_buy_price")
     stream_min_buy_price = {}
     if raw_stream_min is not None:
@@ -151,7 +162,7 @@ def _policy_risk_limits(policy=None):
             if s_key not in ALL_STREAMS or isinstance(s_val, bool):
                 raise AccountRejected("invalid policy risk limits")
             d_val = _d(s_val)
-            if not Decimal("0") <= d_val <= Decimal("0.500"):
+            if not Decimal("0") <= d_val <= Decimal("0.500") or d_val > max_buy_price:
                 raise AccountRejected("invalid policy risk limits")
             stream_min_buy_price[str(s_key)] = d_val
     raw_stream_max = risk_block.get("stream_max_order_usd") if "stream_max_order_usd" in risk_block else src.get("stream_max_order_usd")
@@ -171,6 +182,8 @@ def _policy_risk_limits(policy=None):
             or single_frac > tick_frac
             or not Decimal("0.010") <= daily_loss <= Decimal("0.250")
             or not Decimal("0") <= min_buy_price <= Decimal("0.500")
+            or not Decimal("0.450") <= max_buy_price <= Decimal("0.530")
+            or min_buy_price > max_buy_price
             or max_tick <= 0 or max_order <= 0 or max_open <= 0 or max_underlying <= 0
             or max_active_open <= 0 or max_active_underlying <= 0
             or max_order > max_tick or max_underlying > max_open
@@ -188,6 +201,8 @@ def _policy_risk_limits(policy=None):
         "max_underlying_active_risk_usd": max_active_underlying,
         "daily_loss_fraction": daily_loss,
         "min_buy_price": min_buy_price,
+        "max_buy_price": max_buy_price,
+        "has_explicit_max_buy_price": has_explicit_max_buy,
         "stream_min_buy_price": stream_min_buy_price,
         "stream_max_order_usd": stream_max_order_usd,
         "stream_max_order_atoms": {k: _atoms(v) for k, v in stream_max_order_usd.items()},
@@ -870,6 +885,8 @@ class Account:
             raise AccountRejected("price skip requires all positive asks above the limit")
         if cohort_policy is not None:
             limits = _policy_risk_limits(cohort_policy)
+            if limits.get("has_explicit_max_buy_price") and skip_limit > limits["max_buy_price"]:
+                raise AccountRejected("price skip limit exceeds cohort policy max_buy_price")
             expected_min_buy = (limits.get("stream_min_buy_price") or {}).get(stream, limits["min_buy_price"])
             if "min_buy_price" in receipt or (expected_min_buy > 0 and min(positive) < skip_limit and min_exec_depth <= 0):
                 if min_limit != expected_min_buy:
@@ -1118,7 +1135,7 @@ class Account:
                     raise AccountRejected("cohort observed capacity invalid")
             limits = _policy_risk_limits(cohort_policy if cohort_policy is not None else (json.loads(latest["policy_json"]) if latest else getattr(self, "policy", None)))
             stream_max_atoms = (limits.get("stream_max_order_atoms") or {}).get(clean["stream"], limits["max_order_atoms"])
-            if budget > min(limits["max_order_atoms"], stream_max_atoms):
+            if limit > limits["max_buy_price"] or budget > min(limits["max_order_atoms"], stream_max_atoms):
                 raise AccountRejected("order price or stake exceeds limit")
             rank_use = con.execute("SELECT 1 FROM allocation_consumption WHERE plan_id=? AND rank=?",
                                    (authorization["plan_id"], authorization["rank"])).fetchone()
@@ -1430,7 +1447,7 @@ class Account:
                                 "max_underlying_open_cost_usd": _num(limits["max_underlying_open_risk_usd"]),
                                 "max_active_window_cost_usd": _num(limits["max_active_window_risk_usd"]),
                                 "max_underlying_active_cost_usd": _num(limits["max_underlying_active_risk_usd"]),
-                                "max_buy_price": float(effective_policy.get("max_buy_price", .515)) if isinstance(effective_policy, Mapping) else .515},
+                                "max_buy_price": _num(limits["max_buy_price"]) if limits.get("has_explicit_max_buy_price") else .515},
                 "limitations": ["No real orders or signed transactions", "Model attestation must be verified by the upstream signal adapter", "Paper IOC fills use observed ask depth; they are not actual fills", "Open positions have no mark-to-market valuation"]}
 
     def ledger(self, limit=100):
