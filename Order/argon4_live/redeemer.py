@@ -85,14 +85,17 @@ def resolve_verified_payout_ratios(
     official_outcome: str,
     payout_ratios: Mapping[str, Any] | None = None,
 ) -> dict[str, Decimal] | None:
-    """Resolve and validate per-outcome settlement payout ratios in `[0, 1]`.
+    """Resolve and validate complete binary per-outcome settlement payout ratios in `[0, 1]`.
 
-    Binary outcomes (`UP` / `DOWN`) without explicit `payout_ratios` resolve to `[1, 0]` / `[0, 1]`.
-    Special/non-binary outcomes such as `VOID` REQUIRE verified official `payout_ratios`;
-    when absent or invalid, returns `None` so callers fail closed (`AWAITING_OFFICIAL_PAYOUT_VECTOR`).
+    Binary outcomes (`UP` / `DOWN`) without explicit `payout_ratios` (`None`) resolve to `[1, 0]` / `[0, 1]`.
+    When `payout_ratios` is supplied, BOTH `"UP"` and `"DOWN"` MUST be present (no unknown/duplicate keys)
+    and MUST sum to `1.0` (within `1e-5`). Incomplete vectors such as `{"UP": 0.5}` return `None` so callers
+    fail closed (`AWAITING_OFFICIAL_PAYOUT_VECTOR`) instead of defaulting missing sides to `0`.
     """
     winner = str(official_outcome or "").upper().strip()
-    if isinstance(payout_ratios, Mapping) and payout_ratios:
+    if payout_ratios is not None:
+        if not isinstance(payout_ratios, Mapping) or not payout_ratios:
+            return None
         parsed: dict[str, Decimal] = {}
         for k, v in payout_ratios.items():
             if isinstance(v, bool) or not isinstance(v, (int, float, Decimal, str)):
@@ -106,9 +109,18 @@ def resolve_verified_payout_ratios(
                 return None
             if not (Decimal("0") <= dec <= Decimal("1")):
                 return None
-            parsed[_norm_outcome_key(k)] = dec
-        total = sum(parsed.values(), Decimal("0"))
-        if total <= Decimal("0") or total > Decimal("1.000001"):
+            norm_k = _norm_outcome_key(k)
+            if norm_k not in ("UP", "DOWN") or norm_k in parsed:
+                return None
+            parsed[norm_k] = dec
+        if set(parsed.keys()) != {"UP", "DOWN"}:
+            return None
+        total = parsed["UP"] + parsed["DOWN"]
+        if abs(total - Decimal("1")) > Decimal("0.00001"):
+            return None
+        if winner in ("UP", "YES") and parsed["UP"] < Decimal("0.99999"):
+            return None
+        if winner in ("DOWN", "NO") and parsed["DOWN"] < Decimal("0.99999"):
             return None
         return parsed
 
@@ -1244,7 +1256,23 @@ class AutoRedeemer:
             if pos_status == "NO_FILL":
                 continue
             ord_out = _norm_outcome_key(order.get("outcome", ""))
-            ord_ratio = ratio_map.get(ord_out, Decimal("0"))
+            if ord_out not in ratio_map:
+                return {
+                    "live_expected_payout_usdc": 0.0,
+                    "redeem_tx_hash": None,
+                    "redeem_status": "AWAITING_OFFICIAL_PAYOUT_VECTOR",
+                    "redeemed_usdc_amount": 0.0,
+                    "newly_redeemed_usdc_amount": 0.0,
+                    "redeem_latency_seconds": 0.0,
+                    "error": f"INCOMPLETE_PAYOUT_VECTOR_MISSING_{ord_out or 'UNKNOWN'}",
+                    "payout_ratios": None,
+                    "redeemed_order_keys": sorted(already_redeemed_keys),
+                    "newly_redeemed_order_keys": [],
+                    "pending_batch_order_keys": [],
+                    "pending_batch_payout_usdc": 0.0,
+                    "has_remaining_unredeemed": False,
+                }
+            ord_ratio = ratio_map[ord_out]
             if ord_ratio > Decimal("0"):
                 qty = to_decimal(order.get("filled_quantity", "0"), "filled_quantity")
                 if qty <= Decimal("0"):

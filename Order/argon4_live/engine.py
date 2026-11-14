@@ -43,7 +43,7 @@ from .math_utils import (
     to_decimal,
     validate_and_project_utc,
 )
-from .redeemer import AutoRedeemer
+from .redeemer import AutoRedeemer, resolve_verified_payout_ratios
 from .safety import (
     OFFICIAL_CTF_COLLATERAL_ADAPTER_ADDRESS,
     OFFICIAL_NEG_RISK_COLLATERAL_ADAPTER_ADDRESS,
@@ -379,7 +379,21 @@ class LiveExecutionEngine:
         eff_eq = (eq_info["true_live_equity_dec"] * scale_dec).quantize(USD_MICRO, rounding=ROUND_DOWN)
         eff_day_start = (eq_info["day_start_true_equity_dec"] * scale_dec).quantize(USD_MICRO, rounding=ROUND_DOWN)
         if eff_eq <= Decimal("0"):
-            return None
+            return {
+                "tier_name": "DEPLETED_EQUITY_STOP",
+                "true_live_equity_usdc": float(eff_eq),
+                "target_stake_dec": Decimal("0"),
+                "cohort_budget_usd": 0.0,
+                "daily_loss_cap_dec": Decimal("0"),
+                "caps_override": {
+                    "max_order_usd": 0.0,
+                    "max_tick_budget_usd": 0.0,
+                    "max_active_window_risk_usd": 0.0,
+                    "max_open_risk_usd": 0.0,
+                    "max_underlying_active_risk_usd": 0.0,
+                    "max_underlying_open_risk_usd": 0.0,
+                },
+            }
 
         ordered_tiers = sorted(
             (t for t in tiers if isinstance(t, Mapping) and t.get("min_equity_usd") is not None),
@@ -1470,13 +1484,19 @@ class LiveExecutionEngine:
             else any(bool(o.get("neg_risk")) for o in live_orders)
         )
         existing_settlement = self.audit.get_settlement_record(market_id)
-        eff_payout_ratios = payout_ratios
-        if eff_payout_ratios is None and isinstance(existing_settlement, Mapping):
-            existing_pr = existing_settlement.get("payout_ratios")
-            if isinstance(existing_pr, Mapping) and existing_pr:
-                eff_payout_ratios = existing_pr
-        if eff_payout_ratios is None and str(official_outcome).upper().strip() not in ("UP", "DOWN"):
-            eff_payout_ratios = self.observer.fetch_official_market_payout_ratios(market_id, resolved_cond)
+        eff_payout_ratios: Mapping[str, Any] | None = None
+        if payout_ratios is not None:
+            if resolve_verified_payout_ratios(official_outcome, payout_ratios) is not None:
+                eff_payout_ratios = payout_ratios
+        else:
+            if isinstance(existing_settlement, Mapping):
+                existing_pr = existing_settlement.get("payout_ratios")
+                if resolve_verified_payout_ratios(official_outcome, existing_pr) is not None:
+                    eff_payout_ratios = existing_pr
+            if eff_payout_ratios is None and str(official_outcome).upper().strip() not in ("UP", "DOWN"):
+                fetched_pr = self.observer.fetch_official_market_payout_ratios(market_id, resolved_cond)
+                if resolve_verified_payout_ratios(official_outcome, fetched_pr) is not None:
+                    eff_payout_ratios = fetched_pr
         before_redeemed = float((existing_settlement or {}).get("redeemed_usdc_amount") or 0.0)
         was_pending_redemption = (
             isinstance(existing_settlement, Mapping)

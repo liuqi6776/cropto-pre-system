@@ -385,7 +385,9 @@ def compute_diff_vs_paper(
     spent_diff = float((live_spent - scaled_paper_spent).quantize(USD_MICRO, rounding=ROUND_DOWN))
     clob_status = str(live_execution.get("clob_status", "")).upper()
     live_filled_qty = to_decimal(live_execution.get("filled_quantity", "0") or "0", "filled_quantity")
-    status_match = (paper_status == "OPEN") == (clob_status in ("MATCHED", "SHADOW_MATCHED") and live_filled_qty > 0)
+    status_match = (paper_status == "OPEN") == (
+        clob_status in ("MATCHED", "FILLED", "SHADOW_MATCHED") and live_filled_qty > 0
+    )
 
     return {
         "scaled_paper_target_usd": float(scaled_paper_target),

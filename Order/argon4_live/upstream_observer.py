@@ -128,112 +128,218 @@ def _normalize_outcome_key(raw_label: Any) -> str:
     return txt
 
 
-def extract_payout_ratios_from_payload(payload: Mapping[str, Any] | None) -> dict[str, float] | None:
-    """Extract verified per-outcome settlement payout ratios in `[0.0, 1.0]` from Polymarket/status payloads."""
+def _validate_complete_binary_payout_map(raw: Mapping[str, float]) -> dict[str, float] | None:
+    """Require complete binary `{UP, DOWN}` keys with finite values in `[0.0, 1.0]` summing to `1.0`."""
+    if not isinstance(raw, Mapping) or set(raw.keys()) != {"UP", "DOWN"}:
+        return None
+    try:
+        up_val = float(raw["UP"])
+        down_val = float(raw["DOWN"])
+    except (ValueError, TypeError):
+        return None
+    if not (math.isfinite(up_val) and math.isfinite(down_val)):
+        return None
+    if not (0.0 <= up_val <= 1.0 and 0.0 <= down_val <= 1.0):
+        return None
+    if abs((up_val + down_val) - 1.0) > 1e-5:
+        return None
+    return {"UP": round(up_val, 8), "DOWN": round(down_val, 8)}
+
+
+def extract_payout_ratios_from_payload(
+    payload: Mapping[str, Any] | None,
+    *,
+    allow_outcome_prices: bool = False,
+) -> dict[str, float] | None:
+    """Extract verified complete binary settlement payout ratios (`UP` and `DOWN` summing to `1.0`).
+
+    By default (`allow_outcome_prices=False`), market trading `outcomePrices` are NEVER treated as
+    authoritative settlement payout ratios so disputed or unfinalized trading prices cannot leak into
+    settlement accounting.
+    """
     if not isinstance(payload, Mapping):
         return None
 
     direct = payload.get("payout_ratios") or payload.get("payoutRatios")
     if isinstance(direct, Mapping) and direct:
         cleaned: dict[str, float] = {}
+        valid_direct = True
         for k, v in direct.items():
             if isinstance(v, bool) or not isinstance(v, (int, float, str)):
-                cleaned = {}
+                valid_direct = False
                 break
             try:
                 num = float(v)
             except (ValueError, TypeError):
-                cleaned = {}
+                valid_direct = False
                 break
-            if not math.isfinite(num) or not (0.0 <= num <= 1.0):
-                cleaned = {}
+            norm_k = _normalize_outcome_key(k)
+            if norm_k not in ("UP", "DOWN") or norm_k in cleaned:
+                valid_direct = False
                 break
-            cleaned[_normalize_outcome_key(k)] = num
-        if cleaned and ("UP" in cleaned or "DOWN" in cleaned) and 0.0 < sum(cleaned.values()) <= 1.000001:
-            return cleaned
+            cleaned[norm_k] = num
+        if valid_direct:
+            validated = _validate_complete_binary_payout_map(cleaned)
+            if validated is not None:
+                return validated
 
     raw_outcomes = payload.get("outcomes")
     outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
-    if not isinstance(outcomes, list) or len(outcomes) < 2:
-        # Also inspect CLOB `tokens` list when explicit token payout fields exist
-        tokens = payload.get("tokens")
-        if isinstance(tokens, list) and len(tokens) >= 2:
-            tok_ratios: dict[str, float] = {}
-            for tok in tokens:
-                if not isinstance(tok, Mapping):
-                    tok_ratios = {}
-                    break
-                key = _normalize_outcome_key(tok.get("outcome"))
-                pr = tok.get("payout_ratio")
-                if pr is None:
-                    pr = tok.get("payout")
-                if pr is None:
-                    tok_ratios = {}
+    if isinstance(outcomes, list) and len(outcomes) >= 2:
+        raw_nums = (
+            payload.get("payoutNumerators")
+            if payload.get("payoutNumerators") is not None
+            else payload.get("payout_numerators")
+        )
+        if raw_nums is not None:
+            nums = json.loads(raw_nums) if isinstance(raw_nums, str) else raw_nums
+            denom_raw = payload.get("payoutDenominator") or payload.get("payout_denominator")
+            if isinstance(nums, list) and len(nums) == len(outcomes):
+                try:
+                    floats = [float(x) for x in nums]
+                except (ValueError, TypeError):
+                    floats = []
+                if floats and all(math.isfinite(x) and x >= 0.0 for x in floats):
+                    if denom_raw is not None:
+                        try:
+                            denom = float(denom_raw)
+                        except (ValueError, TypeError):
+                            denom = 0.0
+                    else:
+                        total = sum(floats)
+                        denom = total if total > 1.0 else 1.0
+                    if denom > 0.0:
+                        ratios: dict[str, float] = {}
+                        valid_num_map = True
+                        for lbl, val in zip(outcomes, floats):
+                            norm_k = _normalize_outcome_key(lbl)
+                            if norm_k not in ("UP", "DOWN") or norm_k in ratios:
+                                valid_num_map = False
+                                break
+                            ratios[norm_k] = val / denom
+                        if valid_num_map:
+                            validated = _validate_complete_binary_payout_map(ratios)
+                            if validated is not None:
+                                return validated
+
+    # Inspect CLOB `tokens` list when explicit token payout fields exist
+    tokens = payload.get("tokens")
+    if isinstance(tokens, list) and len(tokens) >= 2:
+        tok_ratios: dict[str, float] = {}
+        valid_tokens = True
+        for tok in tokens:
+            if not isinstance(tok, Mapping):
+                valid_tokens = False
+                break
+            key = _normalize_outcome_key(tok.get("outcome"))
+            pr = tok.get("payout_ratio")
+            if pr is None:
+                pr = tok.get("payout")
+            if pr is None or isinstance(pr, bool):
+                valid_tokens = False
+                break
+            try:
+                num = float(pr)
+            except (ValueError, TypeError):
+                valid_tokens = False
+                break
+            if key not in ("UP", "DOWN") or key in tok_ratios:
+                valid_tokens = False
+                break
+            tok_ratios[key] = num
+        if valid_tokens:
+            validated = _validate_complete_binary_payout_map(tok_ratios)
+            if validated is not None:
+                return validated
+
+    if allow_outcome_prices and isinstance(outcomes, list) and len(outcomes) >= 2:
+        raw_prices = payload.get("outcomePrices")
+        prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+        if isinstance(prices, list) and len(prices) == len(outcomes):
+            parsed: dict[str, float] = {}
+            valid_prices = True
+            for out_label, pr_val in zip(outcomes, prices):
+                if isinstance(pr_val, bool):
+                    valid_prices = False
                     break
                 try:
-                    num = float(pr)
+                    num = float(pr_val)
                 except (ValueError, TypeError):
-                    tok_ratios = {}
+                    valid_prices = False
                     break
-                if not math.isfinite(num) or not (0.0 <= num <= 1.0):
-                    tok_ratios = {}
+                norm_k = _normalize_outcome_key(out_label)
+                if norm_k not in ("UP", "DOWN") or norm_k in parsed:
+                    valid_prices = False
                     break
-                tok_ratios[key] = num
-            if tok_ratios and 0.0 < sum(tok_ratios.values()) <= 1.000001:
-                return tok_ratios
-        return None
-
-    raw_nums = (
-        payload.get("payoutNumerators")
-        if payload.get("payoutNumerators") is not None
-        else payload.get("payout_numerators")
-    )
-    if raw_nums is not None:
-        nums = json.loads(raw_nums) if isinstance(raw_nums, str) else raw_nums
-        denom_raw = payload.get("payoutDenominator") or payload.get("payout_denominator")
-        if isinstance(nums, list) and len(nums) == len(outcomes):
-            try:
-                floats = [float(x) for x in nums]
-            except (ValueError, TypeError):
-                floats = []
-            if floats and all(math.isfinite(x) and x >= 0.0 for x in floats):
-                if denom_raw is not None:
-                    try:
-                        denom = float(denom_raw)
-                    except (ValueError, TypeError):
-                        denom = 0.0
-                else:
-                    total = sum(floats)
-                    denom = total if total > 1.0 else 1.0
-                if denom > 0.0:
-                    ratios = {
-                        _normalize_outcome_key(lbl): round(val / denom, 8)
-                        for lbl, val in zip(outcomes, floats)
-                    }
-                    if (
-                        all(0.0 <= r <= 1.0 for r in ratios.values())
-                        and 0.0 < sum(ratios.values()) <= 1.000001
-                    ):
-                        return ratios
-
-    raw_prices = payload.get("outcomePrices")
-    prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-    if isinstance(prices, list) and len(prices) == len(outcomes):
-        parsed: dict[str, float] = {}
-        for out_label, pr_val in zip(outcomes, prices):
-            try:
-                num = float(pr_val)
-            except (ValueError, TypeError):
-                parsed = {}
-                break
-            if not math.isfinite(num) or not (0.0 <= num <= 1.0):
-                parsed = {}
-                break
-            parsed[_normalize_outcome_key(out_label)] = num
-        if parsed and 0.0 < sum(parsed.values()) <= 1.000001:
-            return parsed
+                parsed[norm_k] = num
+            if valid_prices:
+                validated = _validate_complete_binary_payout_map(parsed)
+                if validated is not None:
+                    return validated
 
     return None
+
+
+NON_FINAL_RESOLUTION_STATUSES = frozenset(
+    {
+        "disputed",
+        "proposed",
+        "requested",
+        "pending",
+        "open",
+        "in_dispute",
+        "active",
+        "inactive",
+        "unresolved",
+        "unsettled",
+        "flagged",
+        "paused",
+        "under_review",
+        "challenged",
+    }
+)
+FINAL_RESOLUTION_STATUSES = frozenset({"resolved", "settled", "finalized"})
+
+
+def _is_market_officially_finalized(payload: Mapping[str, Any] | None) -> bool:
+    """Return True only when a market is closed, undisputed, not in a pending UMA stage, and positively finalized."""
+    if not isinstance(payload, Mapping) or payload.get("closed") is not True:
+        return False
+    if payload.get("disputed") is True:
+        return False
+    res_block = payload.get("resolution") if isinstance(payload.get("resolution"), Mapping) else {}
+    if res_block.get("disputed") is True:
+        return False
+
+    statuses = [
+        str(val or "").strip().lower()
+        for val in (
+            payload.get("umaResolutionStatus"),
+            payload.get("uma_resolution_status"),
+            payload.get("resolutionStatus"),
+            payload.get("resolution_status"),
+            res_block.get("umaResolutionStatus"),
+            res_block.get("uma_resolution_status"),
+            res_block.get("status"),
+            res_block.get("resolutionStatus"),
+            res_block.get("resolution_status"),
+        )
+    ]
+    if any(st in NON_FINAL_RESOLUTION_STATUSES for st in statuses if st):
+        return False
+
+    if any(st in FINAL_RESOLUTION_STATUSES for st in statuses if st):
+        return True
+    if payload.get("resolved") is True or res_block.get("resolved") is True:
+        return True
+
+    tokens = payload.get("tokens")
+    if isinstance(tokens, list):
+        winning_tokens = [tok for tok in tokens if isinstance(tok, Mapping) and tok.get("winner") is True]
+        if len(winning_tokens) == 1:
+            return True
+
+    return False
 
 
 class UpstreamObserver:
@@ -464,71 +570,49 @@ class UpstreamObserver:
                 resp = requests.get(f"{self.clob_host}/markets/{condition_id}", timeout=2.5)
                 if resp.status_code == 200:
                     mkt = resp.json()
-                    if isinstance(mkt, Mapping) and mkt.get("closed") is True:
-                        uma_st = str(
-                            mkt.get("umaResolutionStatus") or mkt.get("uma_resolution_status") or ""
-                        ).strip().lower()
-                        res_st = str(
-                            mkt.get("resolutionStatus") or mkt.get("resolution_status") or ""
-                        ).strip().lower()
-                        non_final_statuses = {
-                            "disputed",
-                            "proposed",
-                            "requested",
-                            "pending",
-                            "open",
-                            "in_dispute",
-                            "active",
-                            "inactive",
-                            "unresolved",
-                        }
-                        if (
-                            uma_st not in non_final_statuses
-                            and res_st not in non_final_statuses
-                            and mkt.get("disputed") is not True
-                        ):
-                            clob_ratios = extract_payout_ratios_from_payload(mkt)
-                            tokens = mkt.get("tokens")
-                            if isinstance(tokens, list):
-                                winning_tokens = [
-                                    tok for tok in tokens if isinstance(tok, Mapping) and tok.get("winner") is True
-                                ]
-                                if len(winning_tokens) == 1:
-                                    tok = winning_tokens[0]
-                                    raw_out = str(tok.get("outcome") or "").upper().strip()
-                                    tok_id = str(tok.get("token_id") or "").strip()
-                                    if raw_out in ("UP", "YES"):
-                                        winner = "UP"
-                                    elif raw_out in ("DOWN", "NO"):
-                                        winner = "DOWN"
-                                    elif token_id and tok_id == str(token_id) and expected_outcome:
-                                        winner = str(expected_outcome).upper().strip()
-                                    else:
-                                        winner = raw_out
-                                    if winner in ("UP", "DOWN", "VOID"):
-                                        if clob_ratios is None and winner in ("UP", "DOWN"):
-                                            clob_ratios = {"UP": 1.0, "DOWN": 0.0} if winner == "UP" else {"UP": 0.0, "DOWN": 1.0}
-                                        return {
-                                            "market_id": str(market_id),
-                                            "condition_id": str(condition_id),
-                                            "official_outcome": winner,
-                                            "payout_ratios": clob_ratios,
-                                            "paper_payout_usd": 0.0,
-                                            "paper_realized_pnl_usd": 0.0,
-                                            "settled_at": None,
-                                            "source": "polymarket_clob",
-                                        }
-                            if clob_ratios is not None and any(0.0 < float(v) < 1.0 for v in clob_ratios.values()):
-                                return {
-                                    "market_id": str(market_id),
-                                    "condition_id": str(condition_id),
-                                    "official_outcome": "VOID",
-                                    "payout_ratios": clob_ratios,
-                                    "paper_payout_usd": 0.0,
-                                    "paper_realized_pnl_usd": 0.0,
-                                    "settled_at": None,
-                                    "source": "polymarket_clob",
-                                }
+                    if _is_market_officially_finalized(mkt):
+                        clob_ratios = extract_payout_ratios_from_payload(mkt, allow_outcome_prices=False)
+                        tokens = mkt.get("tokens")
+                        if isinstance(tokens, list):
+                            winning_tokens = [
+                                tok for tok in tokens if isinstance(tok, Mapping) and tok.get("winner") is True
+                            ]
+                            if len(winning_tokens) == 1:
+                                tok = winning_tokens[0]
+                                raw_out = str(tok.get("outcome") or "").upper().strip()
+                                tok_id = str(tok.get("token_id") or "").strip()
+                                if raw_out in ("UP", "YES"):
+                                    winner = "UP"
+                                elif raw_out in ("DOWN", "NO"):
+                                    winner = "DOWN"
+                                elif token_id and tok_id == str(token_id) and expected_outcome:
+                                    winner = str(expected_outcome).upper().strip()
+                                else:
+                                    winner = raw_out
+                                if winner in ("UP", "DOWN", "VOID"):
+                                    if clob_ratios is None and winner in ("UP", "DOWN"):
+                                        clob_ratios = {"UP": 1.0, "DOWN": 0.0} if winner == "UP" else {"UP": 0.0, "DOWN": 1.0}
+                                    return {
+                                        "market_id": str(market_id),
+                                        "condition_id": str(condition_id),
+                                        "official_outcome": winner,
+                                        "payout_ratios": clob_ratios,
+                                        "paper_payout_usd": 0.0,
+                                        "paper_realized_pnl_usd": 0.0,
+                                        "settled_at": None,
+                                        "source": "polymarket_clob",
+                                    }
+                        if clob_ratios is not None and any(0.0 < float(v) < 1.0 for v in clob_ratios.values()):
+                            return {
+                                "market_id": str(market_id),
+                                "condition_id": str(condition_id),
+                                "official_outcome": "VOID",
+                                "payout_ratios": clob_ratios,
+                                "paper_payout_usd": 0.0,
+                                "paper_realized_pnl_usd": 0.0,
+                                "settled_at": None,
+                                "source": "polymarket_clob",
+                            }
             except Exception:
                 pass
 
@@ -538,105 +622,87 @@ class UpstreamObserver:
                 resp = requests.get(f"{self.gamma_host}/markets/{market_id}", timeout=2.5)
                 if resp.status_code == 200:
                     gm = resp.json()
-                    if isinstance(gm, Mapping) and gm.get("closed") is True:
+                    if _is_market_officially_finalized(gm):
                         res_block = gm.get("resolution") if isinstance(gm.get("resolution"), Mapping) else {}
-                        uma_st = str(
-                            gm.get("umaResolutionStatus")
-                            or gm.get("uma_resolution_status")
-                            or res_block.get("umaResolutionStatus")
-                            or res_block.get("uma_resolution_status")
+                        gamma_ratios = extract_payout_ratios_from_payload(gm, allow_outcome_prices=False)
+                        if gamma_ratios is None and res_block:
+                            gamma_ratios = extract_payout_ratios_from_payload(res_block, allow_outcome_prices=False)
+
+                        # 3a. Check explicit winner / resolution outcome field first (preserving authoritative payout_ratios)
+                        explicit_out = str(
+                            gm.get("winningOutcome")
+                            or gm.get("winner")
+                            or res_block.get("outcome")
+                            or res_block.get("winner")
                             or ""
-                        ).strip().lower()
-                        res_st = str(
-                            gm.get("resolutionStatus")
-                            or gm.get("resolution_status")
-                            or res_block.get("status")
-                            or res_block.get("resolutionStatus")
-                            or ""
-                        ).strip().lower()
-                        non_final_statuses = {
-                            "disputed",
-                            "proposed",
-                            "requested",
-                            "pending",
-                            "open",
-                            "in_dispute",
-                            "active",
-                            "inactive",
-                            "unresolved",
-                            "unsettled",
-                        }
-                        final_statuses = {"resolved", "settled", "finalized"}
-                        is_officially_resolved = (
-                            uma_st not in non_final_statuses
-                            and res_st not in non_final_statuses
-                            and gm.get("disputed") is not True
-                            and (
-                                uma_st in final_statuses
-                                or res_st in final_statuses
-                                or gm.get("resolved") is True
+                        ).upper().strip()
+                        if explicit_out in ("UP", "YES", "DOWN", "NO", "VOID"):
+                            winner = (
+                                "UP"
+                                if explicit_out in ("UP", "YES")
+                                else ("DOWN" if explicit_out in ("DOWN", "NO") else explicit_out)
                             )
-                        )
-                        if is_officially_resolved:
-                            gamma_ratios = extract_payout_ratios_from_payload(gm)
-                            if gamma_ratios is None and res_block:
-                                gamma_ratios = extract_payout_ratios_from_payload(res_block)
+                            if gamma_ratios is None and winner in ("UP", "DOWN"):
+                                gamma_ratios = {"UP": 1.0, "DOWN": 0.0} if winner == "UP" else {"UP": 0.0, "DOWN": 1.0}
+                            return {
+                                "market_id": str(market_id),
+                                "condition_id": str(condition_id or gm.get("conditionId") or ""),
+                                "official_outcome": winner,
+                                "payout_ratios": gamma_ratios,
+                                "paper_payout_usd": 0.0,
+                                "paper_realized_pnl_usd": 0.0,
+                                "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
+                                "source": "polymarket_gamma",
+                            }
 
-                            # 3a. Check explicit winner / resolution outcome field first (preserving extracted payout_ratios!)
-                            explicit_out = str(
-                                gm.get("winningOutcome")
-                                or gm.get("winner")
-                                or res_block.get("outcome")
-                                or res_block.get("winner")
-                                or ""
-                            ).upper().strip()
-                            if explicit_out in ("UP", "YES", "DOWN", "NO", "VOID"):
-                                winner = (
-                                    "UP"
-                                    if explicit_out in ("UP", "YES")
-                                    else ("DOWN" if explicit_out in ("DOWN", "NO") else explicit_out)
-                                )
-                                if gamma_ratios is None and winner in ("UP", "DOWN"):
-                                    gamma_ratios = {"UP": 1.0, "DOWN": 0.0} if winner == "UP" else {"UP": 0.0, "DOWN": 1.0}
-                                return {
-                                    "market_id": str(market_id),
-                                    "condition_id": str(condition_id or gm.get("conditionId") or ""),
-                                    "official_outcome": winner,
-                                    "payout_ratios": gamma_ratios,
-                                    "paper_payout_usd": 0.0,
-                                    "paper_realized_pnl_usd": 0.0,
-                                    "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
-                                    "source": "polymarket_gamma",
-                                }
-
-                            # 3b. Check exact settled payout vector ([1, 0], [0, 1], or split vector such as [0.5, 0.5])
-                            if gamma_ratios is not None:
-                                exact_winners = [lbl for lbl, p_num in gamma_ratios.items() if p_num == 1.0]
-                                exact_losers = [lbl for lbl, p_num in gamma_ratios.items() if p_num == 0.0]
-                                if len(exact_winners) == 1 and len(exact_losers) == len(gamma_ratios) - 1:
-                                    winner = _normalize_outcome_key(exact_winners[0])
-                                    if winner in ("UP", "DOWN", "VOID"):
-                                        return {
-                                            "market_id": str(market_id),
-                                            "condition_id": str(condition_id or gm.get("conditionId") or ""),
-                                            "official_outcome": winner,
-                                            "payout_ratios": gamma_ratios,
-                                            "paper_payout_usd": 0.0,
-                                            "paper_realized_pnl_usd": 0.0,
-                                            "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
-                                            "source": "polymarket_gamma",
-                                        }
-                                elif sum(gamma_ratios.values()) > 0.0:
+                        # 3b. Check exact settled authoritative payout vector ([1, 0], [0, 1], or split VOID),
+                        # OR exact binary `outcomePrices` ([1, 0] / [0, 1]) ONLY when finalized and binary.
+                        # Arbitrary fractional `outcomePrices` (e.g. [0.7, 0.3]) are NEVER treated as VOID ratios!
+                        if gamma_ratios is not None:
+                            exact_winners = [lbl for lbl, p_num in gamma_ratios.items() if p_num == 1.0]
+                            exact_losers = [lbl for lbl, p_num in gamma_ratios.items() if p_num == 0.0]
+                            if len(exact_winners) == 1 and len(exact_losers) == len(gamma_ratios) - 1:
+                                winner = _normalize_outcome_key(exact_winners[0])
+                                if winner in ("UP", "DOWN", "VOID"):
                                     return {
                                         "market_id": str(market_id),
                                         "condition_id": str(condition_id or gm.get("conditionId") or ""),
-                                        "official_outcome": "VOID",
+                                        "official_outcome": winner,
                                         "payout_ratios": gamma_ratios,
                                         "paper_payout_usd": 0.0,
                                         "paper_realized_pnl_usd": 0.0,
                                         "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
                                         "source": "polymarket_gamma",
                                     }
+                            elif sum(gamma_ratios.values()) > 0.0:
+                                return {
+                                    "market_id": str(market_id),
+                                    "condition_id": str(condition_id or gm.get("conditionId") or ""),
+                                    "official_outcome": "VOID",
+                                    "payout_ratios": gamma_ratios,
+                                    "paper_payout_usd": 0.0,
+                                    "paper_realized_pnl_usd": 0.0,
+                                    "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
+                                    "source": "polymarket_gamma",
+                                }
+                        else:
+                            price_ratios = extract_payout_ratios_from_payload(gm, allow_outcome_prices=True)
+                            if price_ratios is not None:
+                                exact_winners = [lbl for lbl, p_num in price_ratios.items() if p_num == 1.0]
+                                exact_losers = [lbl for lbl, p_num in price_ratios.items() if p_num == 0.0]
+                                if len(exact_winners) == 1 and len(exact_losers) == len(price_ratios) - 1:
+                                    winner = _normalize_outcome_key(exact_winners[0])
+                                    if winner in ("UP", "DOWN"):
+                                        return {
+                                            "market_id": str(market_id),
+                                            "condition_id": str(condition_id or gm.get("conditionId") or ""),
+                                            "official_outcome": winner,
+                                            "payout_ratios": price_ratios,
+                                            "paper_payout_usd": 0.0,
+                                            "paper_realized_pnl_usd": 0.0,
+                                            "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
+                                            "source": "polymarket_gamma",
+                                        }
             except Exception:
                 pass
 
@@ -647,16 +713,16 @@ class UpstreamObserver:
         market_id: str,
         condition_id: str | None = None,
     ) -> dict[str, float] | None:
-        """Query Polymarket Gamma / CLOB directly for verified official oracle payout ratios."""
+        """Query Polymarket Gamma / CLOB directly for verified, finalized official oracle payout ratios."""
         if market_id:
             try:
                 resp = requests.get(f"{self.gamma_host}/markets/{market_id}", timeout=2.5)
                 if resp.status_code == 200:
                     gm = resp.json()
-                    if isinstance(gm, Mapping) and gm.get("closed") is True and gm.get("disputed") is not True:
-                        ratios = extract_payout_ratios_from_payload(gm)
+                    if _is_market_officially_finalized(gm):
+                        ratios = extract_payout_ratios_from_payload(gm, allow_outcome_prices=False)
                         if ratios is None and isinstance(gm.get("resolution"), Mapping):
-                            ratios = extract_payout_ratios_from_payload(gm["resolution"])
+                            ratios = extract_payout_ratios_from_payload(gm["resolution"], allow_outcome_prices=False)
                         if ratios is not None:
                             return ratios
             except Exception:
@@ -666,8 +732,8 @@ class UpstreamObserver:
                 resp = requests.get(f"{self.clob_host}/markets/{condition_id}", timeout=2.5)
                 if resp.status_code == 200:
                     mkt = resp.json()
-                    if isinstance(mkt, Mapping) and mkt.get("closed") is True and mkt.get("disputed") is not True:
-                        ratios = extract_payout_ratios_from_payload(mkt)
+                    if _is_market_officially_finalized(mkt):
+                        ratios = extract_payout_ratios_from_payload(mkt, allow_outcome_prices=False)
                         if ratios is not None:
                             return ratios
             except Exception:

@@ -983,20 +983,28 @@ class Application:
                     q_dt = q_dt.replace(tzinfo=timezone.utc)
             except Exception:
                 q_dt = None
-        q_age_seconds: float | None = (
-            round(max(0.0, (datetime.now(timezone.utc) - q_dt).total_seconds()), 2)
+        raw_delta_seconds: float | None = (
+            (datetime.now(timezone.utc) - q_dt).total_seconds()
             if q_dt is not None
             else None
+        )
+        max_future_skew_seconds = 5.0
+        q_age_seconds: float | None = (
+            None
+            if raw_delta_seconds is None
+            else (round(raw_delta_seconds, 2) if raw_delta_seconds < -max_future_skew_seconds else round(max(0.0, raw_delta_seconds), 2))
         )
         stale_limit = 180.0 if process_running else 600.0
         if not q_ts or not raw_lwq or q_dt is None:
             quota_snapshot_status = "MISSING"
+        elif raw_delta_seconds is not None and raw_delta_seconds < -max_future_skew_seconds:
+            quota_snapshot_status = "INVALID_FUTURE"
         elif (q_age_seconds is not None and q_age_seconds > stale_limit) or (acc_started and q_ts < acc_started):
             quota_snapshot_status = "STALE"
         else:
             quota_snapshot_status = "FRESH"
 
-        if quota_snapshot_status == "MISSING":
+        if quota_snapshot_status in ("MISSING", "INVALID_FUTURE"):
             lwq: dict[str, Any] = {
                 "proxy_wallet_address": raw_lwq.get("proxy_wallet_address") or service.get("funder_address"),
                 "onchain_free_usdc_balance": None,
@@ -1061,7 +1069,7 @@ class Application:
             },
             "live_wallet_free_pusd": {
                 "value_usd": lwq.get("onchain_free_usdc_balance"),
-                "source": "live_quota_snapshot" if quota_snapshot_status != "MISSING" else "UNAVAILABLE",
+                "source": "live_quota_snapshot" if quota_snapshot_status not in ("MISSING", "INVALID_FUTURE") else "UNAVAILABLE",
                 "timestamp_utc": q_ts or None,
                 "status": quota_snapshot_status,
             },

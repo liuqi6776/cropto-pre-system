@@ -229,3 +229,235 @@ def test_live_dashboard_never_fabricates_balances_and_ui_surfaces_errors(tmp_pat
         if app.telemetry:
             app.telemetry.close()
 
+
+def test_live_dashboard_rejects_future_snapshot_timestamp_and_app_js_clears_stale_live_state(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+    import shutil
+    import subprocess
+
+    monkeypatch.setenv("ARGON4_ORDER_ROOT", str(tmp_path / "Order_future"))
+    app = Application(tmp_path / "run_live_future")
+    try:
+        order_rt = tmp_path / "Order_future/runtime/live"
+        order_rt.mkdir(parents=True)
+        future_ts = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        snap = {
+            "timestamp_utc": future_ts,
+            "live_wallet_and_quotas": {
+                "onchain_free_usdc_balance": 999.0,
+                "clob_allowance_usdc": 999.0,
+                "total_locked_open_risk_usdc": 10.0,
+                "remaining_total_open_risk_quota_usd": 50.0,
+                "remaining_cohort_budget_quota_usd": 30.0,
+                "remaining_underlying_quota_usd": {},
+            },
+        }
+        (order_rt / "live_quota_snapshots.jsonl").write_text(json.dumps(snap) + "\n", encoding="utf-8")
+        monkeypatch.setattr(app.account, "overview", lambda policy=None: {
+            "cash": 100.0,
+            "locked_cost": 0.0,
+            "realized_pnl": 0.0,
+            "started_at": "2026-11-10T00:00:00+00:00",
+        })
+        d_future = app.live_dashboard()
+        assert d_future["quota_snapshot_status"] == "INVALID_FUTURE"
+        assert d_future["quota_snapshot_age_seconds"] is not None and d_future["quota_snapshot_age_seconds"] < -86000.0
+        assert d_future["latest_quota"]["live_wallet_and_quotas"]["onchain_free_usdc_balance"] is None
+        assert d_future["capital_sources"]["live_wallet_free_pusd"]["status"] == "INVALID_FUTURE"
+
+        js_path = Path(__file__).resolve().parents[1] / "dashboard/argon4_forward/app.js"
+        js_text = js_path.read_text(encoding="utf-8")
+        assert "INVALID_FUTURE" in js_text
+        assert 'renderLiveError("本地监控服务未连接")' in js_text
+        assert "空响应(null)" in js_text
+
+        node_exe = shutil.which("node")
+        if node_exe is not None:
+            node_script = """
+const fs = require("fs");
+const vm = require("vm");
+const assert = require("assert");
+
+const elements = {};
+function makeEl(id) {
+  return {
+    id,
+    textContent: "",
+    className: "",
+    hidden: false,
+    _attrs: {},
+    children: [],
+    classList: { toggle() {} },
+    setAttribute(k, v) { this._attrs[k] = v; },
+    getAttribute(k) { return this._attrs[k]; },
+    addEventListener() {},
+    replaceChildren() { this.children = []; },
+    append(...nodes) { this.children.push(...nodes); },
+    appendChild(n) { this.children.push(n); },
+    querySelectorAll() { return []; },
+    closest() { return { hidden: false }; },
+  };
+}
+const allIds = [
+  "tab-btn-live", "tab-btn-monitor", "tab-panel-live", "tab-panel-monitor",
+  "tab-badge-live", "tab-badge-monitor", "header-subtitle",
+  "live-banner", "live-pid-badge", "live-proc-status",
+  "live-free-usdc", "live-allowance-note", "live-open-risk", "live-remaining-quota",
+  "live-quota-time", "live-pnl", "live-winrate", "live-fills-count", "live-latency-note",
+  "live-lock-active", "live-lock-expired", "live-lock-unredeemed", "live-lock-inflight",
+  "live-rem-cohort", "live-scaled-caps", "live-started-at", "live-mode-info",
+  "live-scale-info", "live-wallet-addr", "live-withdraw-lock", "live-paper-mirror",
+  "live-underlying-quotas", "live-orders-summary", "live-orders-body",
+  "live-settlements-summary", "live-settlements-body", "live-logs-box",
+  "diag5m-section", "diag5m-badge", "diag5m-headline", "diag5m-card-hb", "diag5m-hb-main",
+  "diag5m-hb-sub", "diag5m-win-main", "diag5m-win-sub",
+  "diag5m-card-data", "diag5m-data-main", "diag5m-data-sub",
+  "diag5m-last-main", "diag5m-last-sub", "diag5m-filters", "diag5m-expand-btn", "diag5m-tbody",
+  "flt-all", "flt-nosig", "flt-traded", "flt-risk", "flt-data", "flt-stuck",
+  "connection", "observing", "ledger",
+  "equity", "valuation", "pnl", "return", "cash", "locked", "wins", "winrate",
+  "since", "chart", "chartnote", "blockers", "lastdecision", "paperstate", "lastcycle",
+  "trainingstatus", "trainingdetail", "backtestrows", "ranking", "streams", "quotes",
+  "engineeringversion", "latencycohort", "latencytotal", "latencybreakdown", "latencyfirstlook",
+  "telemetrystate", "telemetrylatest", "telemetryactual", "telemetryusable", "livepreparation",
+  "riskactive", "riskpending", "riskunknown", "risktotal", "riskcoins", "riskstate",
+];
+for (const id of allIds) elements[id] = makeEl(id);
+
+let mode = "healthy";
+const sandbox = {
+  console,
+  Date,
+  Math,
+  Number,
+  String,
+  Boolean,
+  Array,
+  Object,
+  Intl,
+  Promise,
+  Error,
+  setInterval: () => 1,
+  document: {
+    getElementById: (id) => elements[id] || null,
+    createElement: (tag) => makeEl(tag),
+    createElementNS: (_ns, tag) => makeEl(tag),
+  },
+  fetch: async (url) => {
+    if (mode === "all_fail") {
+      throw new Error("connection refused");
+    }
+    if (url === "/api/status") {
+      return {
+        ok: true,
+        json: async () => ({
+          account: { equity: 1000, cash: 1000, locked_cost: 0, realized_pnl: 0, initial_capital: 1000, trade_events: [], recent_orders: [] },
+          open_risk: {},
+          blockers: [],
+          streams: [],
+          markets: { streams: {} },
+          reference: { quotes: [] },
+          allocation: { order: [] },
+          models: {},
+          status_5m_live: { overall_state: "HEALTHY", headline: "ok" },
+          cohort_summary: {},
+          cohort_timeline: [],
+        }),
+      };
+    }
+    if (url === "/api/ledger") return { ok: true, json: async () => [] };
+    if (url === "/api/equity") return { ok: true, json: async () => [] };
+    if (url === "/api/live_dashboard") {
+      if (mode === "null_live") return { ok: true, json: async () => null };
+      if (mode === "future") {
+        return {
+          ok: true,
+          json: async () => ({
+            process_running: true,
+            service: { pid: 36565, mode: "live" },
+            quota_snapshot_status: "INVALID_FUTURE",
+            quota_snapshot_age_seconds: -86400,
+            latest_quota: {
+              timestamp_utc: "2099-01-01T00:00:00Z",
+              live_wallet_and_quotas: { onchain_free_usdc_balance: null },
+            },
+            summary: { realized_pnl_usdc: 0, wins: 0, losses: 0, filled_orders: 0, total_signals: 0 },
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          process_running: true,
+          service: { pid: 36565, mode: "live" },
+          quota_snapshot_status: "FRESH",
+          quota_snapshot_age_seconds: 1.0,
+          latest_quota: {
+            timestamp_utc: new Date().toISOString(),
+            live_wallet_and_quotas: { onchain_free_usdc_balance: 500, clob_allowance_usdc: 9999999, total_locked_open_risk_usdc: 0, remaining_total_open_risk_quota_usd: 100, remaining_cohort_budget_quota_usd: 50 },
+          },
+          summary: { realized_pnl_usdc: 0, wins: 0, losses: 0, filled_orders: 0, total_signals: 0 },
+        }),
+      };
+    }
+    throw new Error("unexpected url " + url);
+  },
+};
+
+const code = fs.readFileSync(process.env.APP_JS_PATH, "utf8");
+vm.runInNewContext(code, sandbox);
+
+(async () => {
+  await sandbox.refresh();
+  assert.strictEqual(elements["live-banner"].className, "banner ok");
+  assert.strictEqual(elements["live-pid-badge"].textContent, "PID 36565");
+
+  // 1. Future snapshot -> never FRESH / banner offline
+  mode = "future";
+  await sandbox.refresh();
+  assert.strictEqual(elements["live-banner"].className, "banner offline");
+  assert.strictEqual(elements["tab-badge-live"].className, "tab-pill offline");
+  assert.ok(elements["live-banner"].textContent.includes("未来时间"));
+  assert.strictEqual(elements["live-free-usdc"].textContent, "未知");
+
+  // Re-establish healthy state, then return HTTP 200 null for /api/live_dashboard -> clears green + old PID
+  mode = "healthy";
+  await sandbox.refresh();
+  assert.strictEqual(elements["live-banner"].className, "banner ok");
+  mode = "null_live";
+  await sandbox.refresh();
+  assert.strictEqual(elements["live-banner"].className, "banner offline");
+  assert.strictEqual(elements["tab-badge-live"].className, "tab-pill offline");
+  assert.strictEqual(elements["live-pid-badge"].textContent, "未知");
+  assert.ok(!elements["live-banner"].textContent.includes("36565"));
+
+  // Re-establish healthy state, then fail all endpoints -> clears global banner AND Live tab green + old PID
+  mode = "healthy";
+  await sandbox.refresh();
+  assert.strictEqual(elements["live-banner"].className, "banner ok");
+  mode = "all_fail";
+  await sandbox.refresh();
+  assert.strictEqual(elements["connection"].className, "banner offline");
+  assert.strictEqual(elements["live-banner"].className, "banner offline");
+  assert.strictEqual(elements["tab-badge-live"].className, "tab-pill offline");
+  assert.strictEqual(elements["live-pid-badge"].textContent, "未知");
+  assert.ok(!elements["live-banner"].textContent.includes("36565"));
+})();
+"""
+            proc = subprocess.run(
+                [node_exe, "-e", node_script],
+                env={**os.environ, "APP_JS_PATH": str(js_path)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert proc.returncode == 0, f"Node DOM test failed: {proc.stderr or proc.stdout}"
+    finally:
+        if app.pipeline:
+            app.pipeline.close()
+        app.market_transport.close()
+        if app.telemetry:
+            app.telemetry.close()
+
+

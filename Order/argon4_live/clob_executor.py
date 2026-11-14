@@ -1767,7 +1767,7 @@ class ClobExecutor:
                 if tr_status in ("FAILED", "REJECTED", "CANCELED"):
                     continue
                 all_failed = False
-                if tr_status in ("MATCHED", "RETRYING") and not tr.get("transaction_hash"):
+                if tr_status in ("MATCHED", "FILLED", "RETRYING") and not tr.get("transaction_hash"):
                     any_pending = True
                 sz = to_decimal(tr.get("size", 0), "size")
                 pr = to_decimal(tr.get("price", limit_price), "price")

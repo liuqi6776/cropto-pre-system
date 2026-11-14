@@ -43,6 +43,9 @@ RISK_LOCKING_POSITION_STATUSES = (
     "DELAYED",
 )
 
+# Normalized CLOB execution statuses representing an actual fill when filled_quantity > 0
+FILLED_CLOB_STATUSES = ("MATCHED", "FILLED", "SHADOW_MATCHED")
+
 IN_FLIGHT_POSITION_STATUSES = (
     "RESERVED",
     "ORDER_STATE_UNKNOWN",
@@ -755,17 +758,22 @@ class AuditStore:
                         }
 
                 # 1. Check independent live daily loss stop & consecutive loss cooldown (Design Gap #1)
+                # Explicit `None` means daily loss limit is disabled; any value `<= 0` means zero remaining loss budget -> STOP!
                 loss_stats = self._compute_loss_guard_in_tx(con, lock_now_dt)
                 if max_daily_realized_loss_usd is not None:
                     daily_loss_cap = to_decimal(max_daily_realized_loss_usd, "max_daily_realized_loss_usd")
-                    if daily_loss_cap > 0 and loss_stats["daily_realized_pnl_dec"] <= -daily_loss_cap:
+                    if daily_loss_cap <= Decimal("0") or loss_stats["daily_realized_pnl_dec"] <= -daily_loss_cap:
                         return {
                             "claimed": True,
                             "aborted": True,
                             "abort_status": "ABORTED_DAILY_LOSS_STOP",
                             "abort_error": (
-                                f"DAILY_LOSS_STOP:daily_realized_pnl={loss_stats['daily_realized_pnl_usdc']}"
-                                f"<=-{float(daily_loss_cap)}"
+                                f"DAILY_LOSS_STOP:daily_loss_cap={float(daily_loss_cap)}<=0"
+                                if daily_loss_cap <= Decimal("0")
+                                else (
+                                    f"DAILY_LOSS_STOP:daily_realized_pnl={loss_stats['daily_realized_pnl_usdc']}"
+                                    f"<=-{float(daily_loss_cap)}"
+                                )
                             ),
                             "quota_cap_usd": Decimal("0"),
                             "reserved_stake_usd": Decimal("0"),
@@ -1159,7 +1167,7 @@ class AuditStore:
         if clob_status in ("DELAYED", "LIVE", "MATCHED_PENDING_SETTLEMENT"):
             return "DELAYED", max(spent_val, req_stake)
 
-        if clob_status in ("MATCHED", "SHADOW_MATCHED") and filled_qty > Decimal("0"):
+        if clob_status in FILLED_CLOB_STATUSES and filled_qty > Decimal("0"):
             return "OPEN", spent_val
 
         return "NO_FILL", 0.0
@@ -1632,10 +1640,18 @@ class AuditStore:
                     (market_id,),
                 ).fetchall()
 
-                ratio_map = resolve_verified_payout_ratios(
-                    official_outcome,
-                    settlement_record.get("payout_ratios") or prior_payout_ratios,
-                )
+                incoming_ratios = settlement_record.get("payout_ratios")
+                verified_prior_ratios = resolve_verified_payout_ratios(official_outcome, prior_payout_ratios)
+                candidate_ratios = incoming_ratios if incoming_ratios is not None else prior_payout_ratios
+                ratio_map = resolve_verified_payout_ratios(official_outcome, candidate_ratios)
+                if ratio_map is not None:
+                    for order in orders:
+                        pos_stat = str(order["position_status"])
+                        if pos_stat in ("NO_FILL", *IN_FLIGHT_POSITION_STATUSES):
+                            continue
+                        if _norm_outcome_key(order["outcome"]) not in ratio_map:
+                            ratio_map = None
+                            break
                 if redeem_status == "AWAITING_OFFICIAL_PAYOUT_VECTOR" or ratio_map is None:
                     live_cost_float = round(
                         float(
@@ -1663,7 +1679,11 @@ class AuditStore:
                     rec_to_save["redeemed_usdc_amount"] = cumulative_redeemed_amount
                     rec_to_save["live_cost_usdc"] = live_cost_float
                     rec_to_save["live_realized_pnl_usdc"] = live_realized_pnl
-                    rec_to_save["payout_ratios"] = prior_payout_ratios
+                    rec_to_save["payout_ratios"] = (
+                        {k: float(v) for k, v in verified_prior_ratios.items()}
+                        if verified_prior_ratios is not None
+                        else None
+                    )
                     rec_to_save["redeemed_order_keys"] = sorted(prior_redeemed_keys)
                     rec_to_save["processed_redemption_batches"] = sorted(prior_processed_batches)
                     payload_text = json.dumps(rec_to_save, ensure_ascii=False, allow_nan=False)
@@ -1753,7 +1773,7 @@ class AuditStore:
                     if pos_stat in ("NO_FILL", *IN_FLIGHT_POSITION_STATUSES):
                         continue
                     ord_out = _norm_outcome_key(order["outcome"])
-                    ord_ratio = ratio_map.get(ord_out, Decimal("0"))
+                    ord_ratio = ratio_map[ord_out]
                     qty_dec = to_decimal(order["filled_quantity"] or "0", "filled_quantity")
                     ord_expected_payout = (qty_dec * ord_ratio).quantize(USD_MICRO, rounding=ROUND_DOWN)
                     if ord_ratio > Decimal("0") and ord_expected_payout > Decimal("0"):
@@ -1793,7 +1813,7 @@ class AuditStore:
                     } - {""}
 
                     ord_out = _norm_outcome_key(order["outcome"])
-                    ord_ratio = ratio_map.get(ord_out, Decimal("0"))
+                    ord_ratio = ratio_map[ord_out]
                     qty_dec = to_decimal(order["filled_quantity"] or "0", "filled_quantity")
                     ord_expected_payout = (qty_dec * ord_ratio).quantize(USD_MICRO, rounding=ROUND_DOWN)
 

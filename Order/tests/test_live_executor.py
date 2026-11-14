@@ -18,6 +18,7 @@ from argon4_live.clob_executor import (
 from argon4_live.engine import LiveExecutionEngine, resolve_mode_audit_paths
 from argon4_live.math_utils import (
     align_limit_price,
+    compute_diff_vs_paper,
     compute_live_order_sizing,
 )
 from argon4_live.redeemer import (
@@ -25,6 +26,7 @@ from argon4_live.redeemer import (
     _RelayerExecResponse,
     encode_redeem_positions_calldata,
     encode_v2_router_redeem_calldata,
+    resolve_verified_payout_ratios,
 )
 from argon4_live.safety import (
     OFFICIAL_CTF_COLLATERAL_ADAPTER_ADDRESS,
@@ -6568,6 +6570,700 @@ def test_polygon_rpc_session_pooling_and_429_failover(
         eng.close()
         clob.close()
         redeemer.close()
+
+
+def _make_minimal_order_rec(
+    *,
+    signal_id: str,
+    market_id: str,
+    condition_id: str,
+    outcome: str,
+    clob_status: str = "MATCHED",
+    filled_qty: str = "10.00",
+    spent_usdc: float = 5.0,
+    now_iso: str = "2026-11-10T03:00:05+00:00",
+    protocol: str = "v2",
+) -> dict[str, Any]:
+    return {
+        "timestamp_utc": now_iso,
+        "cohort_id": "2026-11-10T03:00:00+00:00",
+        "stream": "BTC_5m",
+        "rank": 1,
+        "signal_id": signal_id,
+        "paper_order_id": f"paper:{signal_id}",
+        "market_id": market_id,
+        "condition_id": condition_id,
+        "token_id": "0x02" + ("e5" * 30) + ("0001" if outcome == "UP" else "0002"),
+        "outcome": outcome,
+        "market_protocol": protocol,
+        "neg_risk": False,
+        "timing": {
+            "decision_at": now_iso,
+            "paper_fill_at": now_iso,
+            "live_detected_at": now_iso,
+            "live_signed_at": now_iso,
+            "live_http_sent_at": now_iso,
+            "live_http_ack_at": now_iso,
+            "detection_lag_ms": 1.0,
+            "clob_rtt_ms": 5.0,
+        },
+        "paper_benchmark": {
+            "approved_stake_usd": 50.0,
+            "paper_filled_quantity": 100.0,
+            "avg_fill_price": 0.50,
+            "cost_usd": 50.0,
+            "fee_usd": 0.0,
+            "total_spent_usd": 50.0,
+        },
+        "live_execution": {
+            "live_scale_factor": 0.10,
+            "order_type": "FAK",
+            "limit_price": 0.50,
+            "requested_stake_usd": spent_usdc,
+            "requested_quantity": filled_qty,
+            "clob_order_id": f"0x_{signal_id}",
+            "clob_status": clob_status,
+            "error_code": None,
+            "filled_quantity": filled_qty,
+            "avg_fill_price": 0.50,
+            "cost_usdc": spent_usdc,
+            "fee_usdc": 0.0,
+            "total_spent_usdc": spent_usdc,
+            "unfilled_stake_usdc": 0.0,
+            "polygon_tx_hashes": [],
+            "onchain_confirmed": True,
+            "onchain_block_number": 200,
+        },
+        "diff_vs_paper": {},
+    }
+
+
+def test_v14r23_incomplete_payout_ratios_waits_never_marks_missing_side_lost(tmp_path: Path) -> None:
+    """[v14r23 Finding 1] Incomplete payout ratios such as `{"UP": 0.5}` (missing DOWN) or unnormalized
+    partial vectors `{"UP": 0.3, "DOWN": 0.2}` MUST fail closed (`AWAITING_OFFICIAL_PAYOUT_VECTOR`),
+    never defaulting missing outcome DOWN to 0 and never falsely booking a -$5 loss.
+    """
+    assert resolve_verified_payout_ratios("VOID", {"UP": 0.5}) is None
+    assert resolve_verified_payout_ratios("VOID", {"DOWN": 0.5}) is None
+    assert resolve_verified_payout_ratios("VOID", {"UP": 0.3, "DOWN": 0.2}) is None
+    assert resolve_verified_payout_ratios("VOID", {}) is None
+    assert resolve_verified_payout_ratios("VOID", {"UP": 0.5, "DOWN": 0.5}) == {
+        "UP": Decimal("0.5"),
+        "DOWN": Decimal("0.5"),
+    }
+
+    pk = "0x" + ("85" * 32)
+    cands = derive_polymarket_candidate_wallets(pk)
+    upstream_root = tmp_path / "crypto-predict_system"
+    local_root = tmp_path / "Order"
+    state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
+    policy_path = upstream_root / "config/argon4_forward_policy.json"
+    _write_json(state_path, {})
+    _write_json(
+        policy_path,
+        {
+            "initial_capital_usd": 1269.0,
+            "max_order_usd": 240.0,
+            "max_tick_budget_usd": 380.0,
+            "max_active_window_risk_usd": 450.0,
+            "max_open_risk_usd": 650.0,
+            "max_underlying_active_risk_usd": 300.0,
+            "max_underlying_open_risk_usd": 450.0,
+            "min_buy_price": 0.37,
+            "max_buy_price": 0.515,
+            "daily_loss_fraction": 0.15,
+        },
+    )
+
+    observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    observer.fetch_official_market_payout_ratios = lambda *a, **kw: None  # type: ignore[method-assign]
+    audit = AuditStore(
+        local_root / "runtime/live/live_audit.sqlite3",
+        local_root / "runtime/live/live_orders.jsonl",
+        local_root / "runtime/live/live_quota_snapshots.jsonl",
+        local_root / "runtime/live/live_settlements.jsonl",
+        local_root=local_root,
+        upstream_root=upstream_root,
+    )
+    clob = ClobExecutor(
+        mode="live",
+        private_key=pk,
+        api_key="k",
+        api_secret="dGVzdF9zZWNyZXRfYmFzZTY0X3N0cmluZ18xMjM0NTY=",
+        api_passphrase="p",
+        signature_type=3,
+        funder_address=cands["beacon_deposit_wallet"],
+        auto_derive_l2_creds=False,
+    )
+    clob._cached_free_usdc = 95.0
+    clob._cached_allowance_usdc = 100.0
+    clob.balance_verified = True
+    clob._client = None
+    clob._query_onchain_erc20_balance = lambda *a, **kw: None  # type: ignore[method-assign]
+    clob.query_wallet_balance_and_allowance = lambda *a, **kw: (clob._cached_free_usdc, clob._cached_allowance_usdc)  # type: ignore[method-assign]
+    clob._try_refresh_authoritative_balance = lambda *a, **kw: None  # type: ignore[method-assign]
+
+    now_iso = "2026-11-10T03:00:05+00:00"
+    cond = "0x00" + ("e5" * 31)
+    audit.record_order_execution(
+        _make_minimal_order_rec(
+            signal_id="sig_dn_only",
+            market_id="986001",
+            condition_id=cond,
+            outcome="DOWN",
+            clob_status="MATCHED",
+            filled_qty="10.00",
+            spent_usdc=5.0,
+            now_iso=now_iso,
+        ),
+        underlying="BTC",
+        window_start="2026-11-10T03:00:00+00:00",
+        window_end="2026-11-10T03:05:00+00:00",
+    )
+
+    redeem_calls: list[Any] = []
+
+    class _FakeRelayer:
+        def get_nonce(self, address: str, tx_type: str) -> dict[str, Any]:
+            return {"nonce": "1"}
+
+        def execute(self, *, transactions: list[Any], metadata: str = "") -> _RelayerExecResponse:
+            redeem_calls.append(transactions)
+            return _RelayerExecResponse(
+                transaction_id="tx_complete_1",
+                transaction_hash="0x" + ("77" * 32),
+                state="STATE_CONFIRMED",
+            )
+
+        def get_transaction(self, tx_id: str) -> list[dict[str, Any]]:
+            return [{"state": "STATE_CONFIRMED", "transactionHash": "0x" + ("77" * 32)}]
+
+        def poll_until_state(self, **kwargs: Any) -> dict[str, Any]:
+            return {"state": "STATE_CONFIRMED", "transactionHash": "0x" + ("77" * 32)}
+
+    redeemer = AutoRedeemer(
+        mode="live",
+        withdrawal_permission=False,
+        private_key=pk,
+        funder_address=cands["beacon_deposit_wallet"],
+        signature_type=3,
+        relayer_host="https://relayer-v2.polymarket.com",
+        require_onchain_receipt=False,
+    )
+    redeemer.relayer_client = _FakeRelayer()  # type: ignore[assignment]
+    engine = LiveExecutionEngine(
+        config={"capital_and_scaling": {"live_scale_factor": 0.10}, "withdrawal_permission": False},
+        observer=observer,
+        audit_store=audit,
+        clob_executor=clob,
+        redeemer=redeemer,
+    )
+
+    # Holding 10 shares of DOWN (cost $5); incomplete {"UP": 0.5} MUST keep OPEN & wait, NOT book -$5 loss!
+    st_inc = engine._execute_and_record_settlement(
+        market_id="986001",
+        condition_id=cond,
+        official_outcome="VOID",
+        paper_payout_usd=50.0,
+        paper_realized_pnl_usd=0.0,
+        paper_settled_at=now_iso,
+        payout_ratios={"UP": 0.5},
+    )
+    assert st_inc["redeem_status"] == "AWAITING_OFFICIAL_PAYOUT_VECTOR"
+    assert st_inc["live_realized_pnl_usdc"] == 0.0
+    assert audit.is_market_settled("986001") is False
+    open_orders = audit.get_open_live_orders("986001")
+    assert len(open_orders) == 1
+    assert open_orders[0]["position_status"] == "OPEN"
+    assert redeem_calls == []
+
+    # Direct AuditStore call with incomplete {"UP": 0.5} must likewise keep OPEN and $0 realized PnL
+    audit.record_settlement_and_redeem(
+        {
+            "timestamp_utc": now_iso,
+            "market_id": "986001",
+            "condition_id": cond,
+            "official_outcome": "VOID",
+            "paper_payout_usd": 50.0,
+            "paper_realized_pnl_usd": 0.0,
+            "live_expected_payout_usdc": 0.0,
+            "redeem_tx_hash": None,
+            "redeem_status": "LOST_NO_REDEEM",
+            "redeemed_usdc_amount": 0.0,
+            "payout_ratios": {"UP": 0.5},
+        },
+        append_jsonl=False,
+    )
+    saved_inc = audit.get_settlement_record("986001")
+    assert saved_inc is not None and saved_inc["redeem_status"] == "AWAITING_OFFICIAL_PAYOUT_VECTOR"
+    assert saved_inc["live_realized_pnl_usdc"] == 0.0
+    assert audit.is_market_settled("986001") is False
+    assert audit.get_open_live_orders("986001")[0]["position_status"] == "OPEN"
+
+    # Supplying the verified complete binary vector {"UP": 0.5, "DOWN": 0.5} redeems 10 * 0.5 = $5.00 cleanly
+    st_ok = engine._execute_and_record_settlement(
+        market_id="986001",
+        condition_id=cond,
+        official_outcome="VOID",
+        paper_payout_usd=50.0,
+        paper_realized_pnl_usd=0.0,
+        paper_settled_at=now_iso,
+        payout_ratios={"UP": 0.5, "DOWN": 0.5},
+    )
+    assert st_ok["redeem_status"] == "REDEEMED"
+    assert st_ok["redeemed_usdc_amount"] == 5.0
+    assert st_ok["live_realized_pnl_usdc"] == 0.0
+    assert clob._cached_free_usdc == 100.0
+    observer.close()
+
+
+def test_v14r23_disputed_market_and_unverified_outcome_prices_blocked_from_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[v14r23 Finding 2] Verify that a closed market with `umaResolutionStatus='disputed'` and
+    `outcomePrices=['0.7', '0.3']` (or resolved without authoritative payout fields) NEVER enters
+    official VOID settlement or payout calculation, while authoritative `payoutNumerators` succeeds.
+    """
+    import argon4_live.upstream_observer as uo_mod
+
+    pk = "0x" + ("86" * 32)
+    cands = derive_polymarket_candidate_wallets(pk)
+    upstream_root = tmp_path / "crypto-predict_system"
+    local_root = tmp_path / "Order"
+    state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
+    policy_path = upstream_root / "config/argon4_forward_policy.json"
+    _write_json(state_path, {})
+    _write_json(policy_path, {})
+
+    observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.fetch_status = lambda *a, **kw: None  # type: ignore[method-assign]
+    observer.fetch_ledger = lambda *a, **kw: []  # type: ignore[method-assign]
+    audit = AuditStore(
+        local_root / "runtime/live/live_audit.sqlite3",
+        local_root / "runtime/live/live_orders.jsonl",
+        local_root / "runtime/live/live_quota_snapshots.jsonl",
+        local_root / "runtime/live/live_settlements.jsonl",
+        local_root=local_root,
+        upstream_root=upstream_root,
+    )
+    clob = ClobExecutor(
+        mode="shadow",
+        private_key=pk,
+        signature_type=3,
+        funder_address=cands["beacon_deposit_wallet"],
+        auto_derive_l2_creds=False,
+    )
+    redeemer = AutoRedeemer(
+        mode="shadow",
+        withdrawal_permission=False,
+        private_key=pk,
+        funder_address=cands["beacon_deposit_wallet"],
+        signature_type=3,
+    )
+    engine = LiveExecutionEngine(
+        config={"capital_and_scaling": {"live_scale_factor": 0.10}, "withdrawal_permission": False},
+        observer=observer,
+        audit_store=audit,
+        clob_executor=clob,
+        redeemer=redeemer,
+    )
+
+    cond = "0x00" + ("e6" * 31)
+    now_iso = "2026-11-10T03:00:05+00:00"
+    audit.record_order_execution(
+        _make_minimal_order_rec(
+            signal_id="sig_void_disputed",
+            market_id="986002",
+            condition_id=cond,
+            outcome="UP",
+            clob_status="MATCHED",
+            filled_qty="10.00",
+            spent_usdc=5.0,
+            now_iso=now_iso,
+        ),
+        underlying="BTC",
+        window_start="2026-11-10T03:00:00+00:00",
+        window_end="2026-11-10T03:05:00+00:00",
+    )
+
+    class _FakeResp:
+        def __init__(self, status_code: int, body: dict[str, Any]) -> None:
+            self.status_code = status_code
+            self._body = body
+
+        def json(self) -> dict[str, Any]:
+            return self._body
+
+    gamma_payload: dict[str, Any] = {
+        "id": "986002",
+        "closed": True,
+        "umaResolutionStatus": "disputed",
+        "outcomes": '["Up", "Down"]',
+        "outcomePrices": '["0.7", "0.3"]',
+    }
+
+    def _mock_get(url: str, timeout: float = 2.5) -> _FakeResp:
+        if "/markets/986002" in url:
+            return _FakeResp(200, gamma_payload)
+        return _FakeResp(404, {})
+
+    monkeypatch.setattr(uo_mod.requests, "get", _mock_get)
+
+    # 1. Disputed + outcomePrices=[0.7, 0.3] -> blocked everywhere; stays AWAITING_OFFICIAL_PAYOUT_VECTOR!
+    assert observer.fetch_official_market_payout_ratios("986002", cond) is None
+    assert observer.resolve_unsettled_market_fallback("986002", cond, allow_in_critical_window=True) is None
+    st_disp = engine._execute_and_record_settlement(
+        market_id="986002",
+        condition_id=cond,
+        official_outcome="VOID",
+        paper_payout_usd=50.0,
+        paper_realized_pnl_usd=0.0,
+        paper_settled_at=now_iso,
+        payout_ratios=None,
+    )
+    assert st_disp["redeem_status"] == "AWAITING_OFFICIAL_PAYOUT_VECTOR"
+    assert st_disp["live_expected_payout_usdc"] == 0.0
+    assert st_disp["payout_ratios"] is None
+    assert audit.is_market_settled("986002") is False
+
+    # 2. Even with umaResolutionStatus="resolved", raw fractional outcomePrices without payoutNumerators MUST NOT enter VOID settlement!
+    gamma_payload = {
+        "id": "986002",
+        "closed": True,
+        "umaResolutionStatus": "resolved",
+        "outcomes": '["Up", "Down"]',
+        "outcomePrices": '["0.7", "0.3"]',
+    }
+    assert observer.fetch_official_market_payout_ratios("986002", cond) is None
+    assert observer.resolve_unsettled_market_fallback("986002", cond, allow_in_critical_window=True) is None
+
+    # 3. Officially resolved with authoritative payoutNumerators/payoutDenominator -> accepted & settles 10 * 0.7 = $7.00
+    gamma_payload = {
+        "id": "986002",
+        "closed": True,
+        "umaResolutionStatus": "resolved",
+        "outcomes": '["Up", "Down"]',
+        "payoutNumerators": '[7, 3]',
+        "payoutDenominator": "10",
+    }
+    assert observer.fetch_official_market_payout_ratios("986002", cond) == {"UP": 0.7, "DOWN": 0.3}
+    st_auth = engine._execute_and_record_settlement(
+        market_id="986002",
+        condition_id=cond,
+        official_outcome="VOID",
+        paper_payout_usd=70.0,
+        paper_realized_pnl_usd=20.0,
+        paper_settled_at=now_iso,
+        payout_ratios=None,
+    )
+    assert st_auth["redeem_status"] == "REDEEMED"
+    assert st_auth["live_expected_payout_usdc"] == 7.0
+    assert st_auth["live_realized_pnl_usdc"] == 2.0
+    observer.close()
+
+
+def test_v14r23_zero_daily_loss_cap_blocks_reservation_when_auto_equity_disabled(tmp_path: Path) -> None:
+    """[v14r23 Finding 3] When `auto_equity_sizing` is disabled and `daily_loss_cap == 0` (e.g.
+    prior losses wiped `base_live_cap` to `day_start_live_equity == 0`, or explicit `0` budget),
+    new orders MUST abort with `ABORTED_DAILY_LOSS_STOP`; only explicit `None` disables the limit.
+    """
+    upstream_root = tmp_path / "crypto-predict_system"
+    local_root = tmp_path / "Order"
+    state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
+    policy_path = upstream_root / "config/argon4_forward_policy.json"
+    _write_json(state_path, {})
+    _write_json(
+        policy_path,
+        {
+            "initial_capital_usd": 100.0,
+            "max_order_usd": 50.0,
+            "max_tick_budget_usd": 100.0,
+            "max_active_window_risk_usd": 200.0,
+            "max_open_risk_usd": 300.0,
+            "max_underlying_active_risk_usd": 150.0,
+            "max_underlying_open_risk_usd": 200.0,
+            "min_buy_price": 0.37,
+            "max_buy_price": 0.515,
+            "daily_loss_fraction": 0.15,
+        },
+    )
+
+    audit = AuditStore(
+        local_root / "runtime/live/live_audit.sqlite3",
+        local_root / "runtime/live/live_orders.jsonl",
+        local_root / "runtime/live/live_quota_snapshots.jsonl",
+        local_root / "runtime/live/live_settlements.jsonl",
+        local_root=local_root,
+        upstream_root=upstream_root,
+    )
+    caps = {
+        "max_order_usd": 50.0,
+        "max_tick_budget_usd": 100.0,
+        "max_active_window_risk_usd": 200.0,
+        "max_open_risk_usd": 300.0,
+        "max_underlying_active_risk_usd": 150.0,
+        "max_underlying_open_risk_usd": 200.0,
+    }
+    t_now = datetime(2026, 11, 13, 4, 0, tzinfo=timezone.utc)
+
+    # 1. Direct AuditStore contract: Decimal("0") stops trading; None leaves limit disabled
+    res_zero = audit.claim_and_reserve_signal(
+        signal_id="sig_zero_cap",
+        cohort_id="2026-11-13T04:00:00+00:00",
+        stream="BTC_5m",
+        rank=1,
+        paper_order_id="p_zero",
+        market_id="986010",
+        condition_id="0x" + ("10" * 32),
+        token_id="1001",
+        outcome="UP",
+        underlying="BTC",
+        window_start="2026-11-13T04:00:00+00:00",
+        window_end="2026-11-13T04:05:00+00:00",
+        claimed_at_utc=t_now,
+        approved_stake_usd=Decimal("10.0"),
+        live_scale_factor=Decimal("1.0"),
+        paper_caps=caps,
+        proxy_wallet_address="0x" + ("11" * 20),
+        onchain_free_usdc_balance=500.0,
+        clob_allowance_usdc=500.0,
+        balance_verified=True,
+        cohort_single_order_cap_usd=Decimal("50.0"),
+        max_daily_realized_loss_usd=Decimal("0"),
+        valid_until="2026-11-13T04:00:20+00:00",
+        hard_deadline_seconds=20.0,
+        calibrated_now_fn=lambda: t_now,
+    )
+    assert res_zero["claimed"] is True and res_zero["aborted"] is True
+    assert res_zero["abort_status"] == "ABORTED_DAILY_LOSS_STOP"
+    assert res_zero["reserved_stake_usd"] == Decimal("0")
+
+    res_none = audit.claim_and_reserve_signal(
+        signal_id="sig_none_cap",
+        cohort_id="2026-11-13T04:00:00+00:00",
+        stream="BTC_5m",
+        rank=2,
+        paper_order_id="p_none",
+        market_id="986011",
+        condition_id="0x" + ("11" * 32),
+        token_id="1002",
+        outcome="UP",
+        underlying="BTC",
+        window_start="2026-11-13T04:00:00+00:00",
+        window_end="2026-11-13T04:05:00+00:00",
+        claimed_at_utc=t_now,
+        approved_stake_usd=Decimal("10.0"),
+        live_scale_factor=Decimal("1.0"),
+        paper_caps=caps,
+        proxy_wallet_address="0x" + ("11" * 20),
+        onchain_free_usdc_balance=500.0,
+        clob_allowance_usdc=500.0,
+        balance_verified=True,
+        cohort_single_order_cap_usd=Decimal("50.0"),
+        max_daily_realized_loss_usd=None,
+        valid_until="2026-11-13T04:00:20+00:00",
+        hard_deadline_seconds=20.0,
+        calibrated_now_fn=lambda: t_now,
+    )
+    assert res_none["claimed"] is True and res_none["aborted"] is False
+    assert res_none["reserved_stake_usd"] == Decimal("10.000000")
+
+    # 2. Full engine test with auto_equity_sizing disabled and prior-day loss wiping initial capital -> daily_loss_cap=0
+    with audit._connection(immediate=True) as con:
+        con.execute(
+            """
+            INSERT INTO live_settlements (
+                market_id, condition_id, official_outcome, paper_payout_usd,
+                live_expected_payout_usdc, redeem_status, redeemed_usdc_amount,
+                live_cost_usdc, live_realized_pnl_usdc, settled_at_utc, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "mkt-prior-wipeout",
+                "0x" + ("99" * 32),
+                "DOWN",
+                0.0,
+                0.0,
+                "LOST_NO_REDEEM",
+                0.0,
+                150.0,
+                -150.0,
+                "2026-11-12T18:00:00+00:00",
+                "{}",
+            ),
+        )
+
+    pk = "0x" + ("87" * 32)
+    cands = derive_polymarket_candidate_wallets(pk)
+    observer = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+    observer.verify_policy_limits = lambda: None  # type: ignore[method-assign]
+    observer.fetch_status = lambda *a, **kw: None  # type: ignore[method-assign]
+    clob = ClobExecutor(
+        mode="live",
+        private_key=pk,
+        api_key="k",
+        api_secret="dGVzdF9zZWNyZXRfYmFzZTY0X3N0cmluZ18xMjM0NTY=",
+        api_passphrase="p",
+        signature_type=3,
+        funder_address=cands["beacon_deposit_wallet"],
+        auto_derive_l2_creds=False,
+    )
+    clob._cached_free_usdc = 1000.0
+    clob._cached_allowance_usdc = 1000.0
+    clob.balance_verified = True
+    clob.query_wallet_balance_and_allowance = lambda *a, **kw: (1000.0, 1000.0)  # type: ignore[method-assign]
+    clob.check_market_book_for_signal = lambda *a, **kw: {"ask_ok": True, "best_ask": 0.50, "best_bid": 0.49}  # type: ignore[method-assign]
+    submit_calls: list[str] = []
+    clob.submit_buy_order = lambda *a, **kw: submit_calls.append("CALLED")  # type: ignore[method-assign]
+    redeemer = AutoRedeemer(
+        mode="shadow",
+        withdrawal_permission=False,
+        private_key=pk,
+        funder_address=cands["beacon_deposit_wallet"],
+        signature_type=3,
+    )
+    engine = LiveExecutionEngine(
+        config={
+            "capital_and_scaling": {
+                "live_scale_factor": 1.0,
+                "auto_equity_sizing": {"enabled": False},
+            },
+            "withdrawal_permission": False,
+        },
+        observer=observer,
+        audit_store=audit,
+        clob_executor=clob,
+        redeemer=redeemer,
+    )
+    loss_cap, _, _ = engine._live_loss_limits(Decimal("1.0"), now_utc=t_now)
+    assert loss_cap == Decimal("0.000000")
+
+    cohort_iso = "2026-11-13T04:00:00+00:00"
+    t_detect = datetime(2026, 11, 13, 4, 0, 5, tzinfo=timezone.utc)
+    state_payload = {
+        "last_cohort": cohort_iso,
+        "execution": {
+            "cohort": {"cohort_id": cohort_iso, "budget_usd": 100.0},
+            "fills": [
+                {
+                    "signal_id": "sig_eng_zero_cap",
+                    "order_id": "paper_zero_cap",
+                    "stream": "BTC_5m",
+                    "status": "OPEN",
+                    "underlying": "BTC",
+                    "outcome": "UP",
+                    "market_id": "986012",
+                    "fill_at": "2026-11-13T04:00:03+00:00",
+                    "book_observed_at": "2026-11-13T04:00:03+00:00",
+                    "book_snapshot": {"best_ask": 0.50, "observed_at": "2026-11-13T04:00:03+00:00"},
+                    "quantity": "40.00000000",
+                    "cost_usd": 20.0,
+                    "fee_usd": 0.0,
+                    "fee_quote": {"rate": 0.075},
+                    "allocation_authorization": {"rank": 1, "cohort_id": cohort_iso, "approved_stake_usd": 20.0},
+                    "venue_market": {
+                        "asset": "BTC",
+                        "condition_id": "0x" + ("12" * 32),
+                        "window_start": cohort_iso,
+                        "window_end": "2026-11-13T04:05:00+00:00",
+                        "outcome_ids": {"UP": "1003", "DOWN": "1004"},
+                        "best_ask": 0.50,
+                        "best_bid": 0.49,
+                        "protocol": "v2",
+                        "neg_risk": False,
+                    },
+                }
+            ],
+        },
+        "decisions": {
+            "BTC_5m": {
+                "signal": {
+                    "signal_id": "sig_eng_zero_cap",
+                    "market_id": "986012",
+                    "outcome": "UP",
+                    "underlying": "BTC",
+                    "window_start": cohort_iso,
+                    "window_end": "2026-11-13T04:05:00+00:00",
+                    "decision_at": "2026-11-13T04:00:02+00:00",
+                    "valid_until": "2026-11-13T04:00:20+00:00",
+                }
+            }
+        },
+    }
+    records = engine.process_pipeline_state(state_payload, detected_at_local_utc=t_detect)
+    assert len(records) == 1
+    assert records[0]["live_execution"]["clob_status"] == "ABORTED_DAILY_LOSS_STOP"
+    assert submit_calls == []
+    observer.close()
+
+
+def test_v14r23_filled_clob_status_recorded_as_open_position_and_locks_risk(tmp_path: Path) -> None:
+    """[v14r23 Finding 5] Verify `clob_status='FILLED'` with positive filled_quantity and spent USDC
+    is stored as `position_status='OPEN'`, locks risk in `compute_live_quotas`, appears in open/unresolved
+    queries, and aligns with `compute_diff_vs_paper`.
+    """
+    upstream_root = tmp_path / "crypto-predict_system"
+    local_root = tmp_path / "Order"
+    audit = AuditStore(
+        local_root / "runtime/live/live_audit.sqlite3",
+        local_root / "runtime/live/live_orders.jsonl",
+        local_root / "runtime/live/live_quota_snapshots.jsonl",
+        local_root / "runtime/live/live_settlements.jsonl",
+        local_root=local_root,
+        upstream_root=upstream_root,
+    )
+    now_iso = "2026-11-10T03:00:05+00:00"
+    ord_rec = _make_minimal_order_rec(
+        signal_id="sig_filled_compat",
+        market_id="986020",
+        condition_id="0x00" + ("f1" * 31),
+        outcome="UP",
+        clob_status="FILLED",
+        filled_qty="10.00",
+        spent_usdc=5.0,
+        now_iso=now_iso,
+    )
+    audit.record_order_execution(
+        ord_rec,
+        underlying="BTC",
+        window_start="2026-11-10T03:00:00+00:00",
+        window_end="2026-11-10T03:05:00+00:00",
+    )
+
+    open_orders = audit.get_open_live_orders("986020")
+    assert len(open_orders) == 1
+    assert open_orders[0]["position_status"] == "OPEN"
+    assert float(open_orders[0]["total_spent_usdc"]) == 5.0
+    unresolved = audit.get_unresolved_live_markets()
+    assert [m["market_id"] for m in unresolved] == ["986020"]
+
+    quotas = audit.compute_live_quotas(
+        now_utc=datetime(2026, 11, 10, 3, 1, tzinfo=timezone.utc),
+        cohort_id="2026-11-10T03:00:00+00:00",
+        live_scale_factor=1.0,
+        paper_caps={
+            "max_order_usd": 240.0,
+            "max_tick_budget_usd": 380.0,
+            "max_active_window_risk_usd": 450.0,
+            "max_open_risk_usd": 650.0,
+            "max_underlying_active_risk_usd": 300.0,
+            "max_underlying_open_risk_usd": 450.0,
+        },
+        proxy_wallet_address="0x" + ("11" * 20),
+        onchain_free_usdc_balance=95.0,
+        clob_allowance_usdc=100.0,
+    )
+    assert quotas["total_locked_open_risk_usdc"] == 5.0
+    assert quotas["remaining_total_open_risk_quota_usd"] == 645.0
+
+    diff = compute_diff_vs_paper(
+        ord_rec["paper_benchmark"],
+        ord_rec["live_execution"],
+        paper_status="OPEN",
+    )
+    assert diff["status_match"] is True
+
 
 
 
