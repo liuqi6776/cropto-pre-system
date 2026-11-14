@@ -712,19 +712,16 @@ def apply_volatility_regime_guard(
             ):
                 is_counter_15m_streak = True
 
-        if is_counter_15m_streak and delta_z < streak_marginal_dz:
-            if streak_action == "SKIP":
-                res["volatility_regime_guarded"] = True
-                res["volatility_regime_reason"] = "MARGINAL_SIGNAL_AGAINST_15M_STREAK"
-                res["volatility_regime_action"] = action
-                res["selected"] = False
-                return res
-            res["effective_max_buy_price"] = streak_max_buy
-            res["price_tier_reason"] = "MARGINAL_AGAINST_15M_STREAK"
-        elif raw_excess_z < -1e-12:
-            sub_cap = float(tiered_cfg.get("sub_threshold_max_buy_price", 0.485))
-            res["effective_max_buy_price"] = sub_cap
-            res["price_tier_reason"] = "SUB_BASELINE_THRESHOLD_CAP"
+        if is_counter_15m_streak and delta_z < streak_marginal_dz and streak_action == "SKIP":
+            res["volatility_regime_guarded"] = True
+            res["volatility_regime_reason"] = "MARGINAL_SIGNAL_AGAINST_15M_STREAK"
+            res["volatility_regime_action"] = action
+            res["selected"] = False
+            return res
+
+        if raw_excess_z < -1e-12:
+            base_cap = float(tiered_cfg.get("sub_threshold_max_buy_price", 0.485))
+            base_reason = "SUB_BASELINE_THRESHOLD_CAP"
         elif isinstance(tiered_cfg.get("tiers"), list) and tiered_cfg["tiers"]:
             is_15m = str(stream).endswith("_15m")
             sorted_tiers = sorted(
@@ -739,26 +736,31 @@ def apply_volatility_regime_guard(
                         t_item.get("max_15m" if is_15m else "max_5m", t_item.get("max_buy_price", chosen_cap))
                     )
                     chosen_idx = idx_t
+            base_cap = chosen_cap
+            base_reason = f"CONFIDENCE_TIER_{chosen_idx}_{'15M' if is_15m else '5M'}"
             top_map = tiered_cfg.get("stream_top_tiers")
             if isinstance(top_map, dict) and isinstance(top_map.get(stream), dict):
                 top_spec = top_map[stream]
                 if delta_z >= float(top_spec.get("min_delta_z", 1.0)):
-                    chosen_cap = float(top_spec["max_buy_price"])
-                    res["effective_max_buy_price"] = chosen_cap
-                    res["price_tier_reason"] = f"CONFIDENCE_STREAM_TOP_TIER_{stream}"
-                    return res
-            res["effective_max_buy_price"] = chosen_cap
-            res["price_tier_reason"] = f"CONFIDENCE_TIER_{chosen_idx}_{'15M' if is_15m else '5M'}"
+                    base_cap = float(top_spec["max_buy_price"])
+                    base_reason = f"CONFIDENCE_STREAM_TOP_TIER_{stream}"
         else:
             strong_min_dz = float(tiered_cfg.get("strong_signal_min_delta_z", 0.15))
             strong_cap = float(tiered_cfg.get("strong_max_buy_price", 0.515))
             marginal_cap = float(tiered_cfg.get("marginal_max_buy_price", 0.49))
             if delta_z < strong_min_dz:
-                res["effective_max_buy_price"] = marginal_cap
-                res["price_tier_reason"] = "MARGINAL_SIGNAL_CAP"
+                base_cap = marginal_cap
+                base_reason = "MARGINAL_SIGNAL_CAP"
             else:
-                res["effective_max_buy_price"] = strong_cap
-                res["price_tier_reason"] = "STRONG_SIGNAL_CAP"
+                base_cap = strong_cap
+                base_reason = "STRONG_SIGNAL_CAP"
+
+        if is_counter_15m_streak and delta_z < streak_marginal_dz and streak_max_buy <= base_cap:
+            res["effective_max_buy_price"] = streak_max_buy
+            res["price_tier_reason"] = "MARGINAL_AGAINST_15M_STREAK"
+        else:
+            res["effective_max_buy_price"] = base_cap
+            res["price_tier_reason"] = base_reason
 
     return res
 

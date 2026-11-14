@@ -8106,3 +8106,436 @@ def test_settlement_payout_conflict_preserved_and_corrected_across_ledger_and_re
     assert audit2.is_market_settled("987002") is True
     assert len(redeem_calls) == 2
     obs2.close()
+
+
+def test_settlement_latest_credible_overrides_old_up_fallback_heals_stale_conflict_and_preserves_pending_tx_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end regression test covering both Round-6 settlement & redemption recovery fixes:
+    1. Old settlement blocking latest correction & stale ledger conflict blocking fallback query:
+       - 1a: `/api/ledger` contains BOTH an older valid-looking `UP, {UP: 1.0, DOWN: 0.0}` AND a newer
+         `VOID, {UP: 0.5, DOWN: 0.5}` (tested in oldest-first, newest-first, and timestamp-only orders).
+         `poll_settlements_and_redeem` collapses to the latest event per market first and redeems $5.00
+         instead of settling `LOST_NO_REDEEM` on the stale `UP 1/0` event.
+       - 1b: Market first settles as `LOST_NO_REDEEM` (`-5.0` PnL) when only `UP 1/0` was present, and
+         on a later pass receives `VOID 0.5/0.5` -> supersedes `LOST_NO_REDEEM`, redeems $5.00, and heals
+         `live_realized_pnl_usdc` to `0.0` (clearing loss timestamps).
+       - 1c: `/api/ledger` keeps a stale conflicted `UP + {UP: 0.5, DOWN: 0.5}` row while `/api/status`
+         or Gamma has `VOID + {UP: 0.5, DOWN: 0.5}` -> fallback query is NOT skipped by the stale ledger
+         conflict and immediately settles & redeems the market.
+    2. Payout conflict while a redemption transaction is already in-flight (`REDEEM_PENDING`):
+       - Both `redeemer.redeem_settled_market` and `audit_store.record_settlement_and_redeem` pause new
+         redemptions (`AWAITING_OFFICIAL_PAYOUT_VECTOR`) while preserving `redeem_tx_id`, `redeem_tx_hash`
+         (in SQL column and JSON payload), `pending_batch_order_keys`, `pending_batch_shares`,
+         `pending_batch_payout_usdc`, `submit_state`, `redeem_request_id`, `redeem_target_to`, and
+         `redeem_calldata_hex`. Once a valid payout vector arrives, the preserved tx reconciles to
+         `REDEEMED` with zero duplicate Relayer submissions!
+    """
+    local_root = tmp_path / "Order"
+    upstream_root = tmp_path / "crypto-predict_system"
+    state_path = upstream_root / "paper_runtime/argon4_forward_20261105/pipeline_state.json"
+    policy_path = upstream_root / "configs/argon4_locked_policy.json"
+    _write_json(
+        policy_path,
+        {
+            "initial_capital_usd": 1269.0,
+            "max_order_usd": 240.0,
+            "max_tick_budget_usd": 380.0,
+            "max_active_window_risk_usd": 450.0,
+            "max_open_risk_usd": 650.0,
+            "max_underlying_active_risk_usd": 300.0,
+            "max_underlying_open_risk_usd": 450.0,
+            "min_buy_price": 0.46,
+            "max_buy_price": 0.525,
+            "daily_loss_fraction": 0.15,
+        },
+    )
+    _write_json(state_path, {})
+
+    now_iso = "2026-11-14T06:10:00+00:00"
+    ledger_state: list[dict[str, Any]] = []
+    status_state: dict[str, Any] = {}
+    redeem_tx_counter = 0
+
+    class _InstantConfirmRelayer:
+        def execute(self, transactions: list[Any], metadata: str = "") -> _RelayerExecResponse:
+            nonlocal redeem_tx_counter
+            redeem_tx_counter += 1
+            return _RelayerExecResponse(
+                transaction_id=f"tx_r6_{redeem_tx_counter}",
+                transaction_hash=f"0x{redeem_tx_counter:064x}",
+                state="STATE_CONFIRMED",
+            )
+
+        def get_transaction(self, tx_id: str) -> list[dict[str, Any]]:
+            return [{"transactionID": tx_id, "state": "STATE_CONFIRMED", "transactionHash": f"0x{redeem_tx_counter:064x}"}]
+
+    def _build_env() -> tuple[UpstreamObserver, AuditStore, ClobExecutor, LiveExecutionEngine]:
+        obs = UpstreamObserver(state_path, policy_path, upstream_root=upstream_root)
+        obs.is_in_critical_window = lambda now_utc=None: False  # type: ignore[method-assign]
+        obs.fetch_ledger = lambda allow_in_critical_window=False: list(ledger_state)  # type: ignore[method-assign]
+        obs.fetch_status = lambda allow_in_critical_window=False: dict(status_state)  # type: ignore[method-assign]
+        obs.fetch_official_market_payout_ratios = lambda m_id, cond_id=None: None  # type: ignore[method-assign]
+
+        aud = AuditStore(
+            local_root / "runtime/live/live_audit.sqlite3",
+            local_root / "runtime/live/live_orders.jsonl",
+            local_root / "runtime/live/live_quota_snapshots.jsonl",
+            local_root / "runtime/live/live_settlements.jsonl",
+            local_root=local_root,
+            upstream_root=upstream_root,
+        )
+        clb = ClobExecutor(mode="shadow", private_key=None)
+        clb._cached_free_usdc = 100.0
+        red = AutoRedeemer(mode="live", withdrawal_permission=False, require_onchain_receipt=False)
+        red.relayer_client = _InstantConfirmRelayer()  # type: ignore[assignment]
+        red.fetch_onchain_ctf_payout_ratios = lambda cond: None  # type: ignore[method-assign]
+
+        eng = LiveExecutionEngine(
+            config={"capital_and_scaling": {"live_scale_factor": 0.10}, "withdrawal_permission": False},
+            observer=obs,
+            audit_store=aud,
+            clob_executor=clb,
+            redeemer=red,
+        )
+        return obs, aud, clb, eng
+
+    obs, audit, clob, engine = _build_env()
+
+    # --- 1a: Single-pass old UP 1/0 + newer VOID 0.5/0.5 (oldest-first AND timestamp-only without seq) ---
+    for idx_case, ev_list in enumerate(
+        [
+            # Case i: oldest-first with seq
+            [
+                {
+                    "seq": 1,
+                    "utc": "2026-11-14T06:06:00+00:00",
+                    "event_type": "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+                    "payload": {
+                        "market_id": "988001",
+                        "payout_usd": 0.0,
+                        "realized_pnl_usd": -50.0,
+                        "resolution": {"market_id": "988001", "outcome": "UP", "payout_ratios": {"UP": 1.0, "DOWN": 0.0}},
+                    },
+                },
+                {
+                    "seq": 2,
+                    "utc": "2026-11-14T06:07:00+00:00",
+                    "event_type": "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+                    "payload": {
+                        "market_id": "988001",
+                        "payout_usd": 50.0,
+                        "realized_pnl_usd": 0.0,
+                        "resolution": {"market_id": "988001", "outcome": "VOID", "payout_ratios": {"UP": 0.5, "DOWN": 0.5}},
+                    },
+                },
+            ],
+            # Case ii: timestamp-only without seq (oldest-first)
+            [
+                {
+                    "utc": "2026-11-14T06:06:00+00:00",
+                    "event_type": "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+                    "payload": {
+                        "market_id": "988002",
+                        "payout_usd": 0.0,
+                        "realized_pnl_usd": -50.0,
+                        "resolution": {"market_id": "988002", "outcome": "UP", "payout_ratios": {"UP": 1.0, "DOWN": 0.0}},
+                    },
+                },
+                {
+                    "utc": "2026-11-14T06:07:00+00:00",
+                    "event_type": "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+                    "payload": {
+                        "market_id": "988002",
+                        "payout_usd": 50.0,
+                        "realized_pnl_usd": 0.0,
+                        "resolution": {"market_id": "988002", "outcome": "VOID", "payout_ratios": {"UP": 0.5, "DOWN": 0.5}},
+                    },
+                },
+            ],
+        ],
+        start=1,
+    ):
+        mid = f"98800{idx_case}"
+        cond = f"0x{idx_case:02x}" + ("ab" * 31)
+        audit.record_order_execution(
+            _make_minimal_order_rec(
+                signal_id=f"sig_1a_{idx_case}",
+                market_id=mid,
+                condition_id=cond,
+                outcome="DOWN",
+                clob_status="MATCHED",
+                filled_qty="10.00",
+                spent_usdc=5.0,
+                now_iso=now_iso,
+            ),
+            underlying="BTC",
+            window_start="2026-11-14T06:00:00+00:00",
+            window_end="2026-11-14T06:05:00+00:00",
+        )
+        ledger_state[:] = ev_list
+        res_1a = engine.poll_settlements_and_redeem(force=True)
+        assert len(res_1a) == 1
+        assert res_1a[0]["market_id"] == mid
+        assert res_1a[0]["official_outcome"] == "VOID"
+        assert res_1a[0]["redeem_status"] == "REDEEMED"
+        assert res_1a[0]["redeemed_usdc_amount"] == pytest.approx(5.0)
+        assert res_1a[0]["live_realized_pnl_usdc"] == pytest.approx(0.0)
+        assert res_1a[0]["payout_ratios"] == {"UP": 0.5, "DOWN": 0.5}
+
+    # --- 1b: Two-pass correction: Pass 1 settles LOST_NO_REDEEM (-5.0), Pass 2 corrects to VOID 0.5/0.5 (0.0) ---
+    cond_1b = "0x1b" + ("cd" * 31)
+    audit.record_order_execution(
+        _make_minimal_order_rec(
+            signal_id="sig_1b_heal",
+            market_id="988003",
+            condition_id=cond_1b,
+            outcome="DOWN",
+            clob_status="MATCHED",
+            filled_qty="10.00",
+            spent_usdc=5.0,
+            now_iso=now_iso,
+        ),
+        underlying="ETH",
+        window_start="2026-11-14T06:00:00+00:00",
+        window_end="2026-11-14T06:05:00+00:00",
+    )
+    ledger_state[:] = [
+        {
+            "seq": 10,
+            "utc": "2026-11-14T06:06:00+00:00",
+            "event_type": "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+            "payload": {
+                "market_id": "988003",
+                "payout_usd": 0.0,
+                "realized_pnl_usd": -50.0,
+                "resolution": {"market_id": "988003", "outcome": "UP", "payout_ratios": {"UP": 1.0, "DOWN": 0.0}},
+            },
+        }
+    ]
+    res_1b_p1 = engine.poll_settlements_and_redeem(force=True)
+    assert len(res_1b_p1) == 1
+    assert res_1b_p1[0]["redeem_status"] == "LOST_NO_REDEEM"
+    assert res_1b_p1[0]["live_realized_pnl_usdc"] == pytest.approx(-5.0)
+    assert audit.is_market_settled("988003") is True
+
+    # Pass 2: Newer VOID 0.5/0.5 arrives in ledger -> supersedes LOST_NO_REDEEM and redeems $5.00!
+    ledger_state.append(
+        {
+            "seq": 11,
+            "utc": "2026-11-14T06:08:00+00:00",
+            "event_type": "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+            "payload": {
+                "market_id": "988003",
+                "payout_usd": 50.0,
+                "realized_pnl_usd": 0.0,
+                "resolution": {"market_id": "988003", "outcome": "VOID", "payout_ratios": {"UP": 0.5, "DOWN": 0.5}},
+            },
+        }
+    )
+    res_1b_p2 = engine.poll_settlements_and_redeem(force=True)
+    assert len(res_1b_p2) == 1
+    assert res_1b_p2[0]["redeem_status"] == "REDEEMED"
+    assert res_1b_p2[0]["redeemed_usdc_amount"] == pytest.approx(5.0)
+    assert res_1b_p2[0]["live_realized_pnl_usdc"] == pytest.approx(0.0)
+    rec_1b = audit.get_settlement_record("988003")
+    assert rec_1b is not None
+    assert rec_1b["first_loss_confirmed_at_utc"] is None
+    assert rec_1b["last_loss_confirmed_at_utc"] is None
+
+    # --- 1c: Stale conflicted ledger row MUST NOT block fallback resolution query ---
+    cond_1c = "0x1c" + ("ef" * 31)
+    audit.record_order_execution(
+        _make_minimal_order_rec(
+            signal_id="sig_1c_fb",
+            market_id="988004",
+            condition_id=cond_1c,
+            outcome="DOWN",
+            clob_status="MATCHED",
+            filled_qty="10.00",
+            spent_usdc=5.0,
+            now_iso=now_iso,
+        ),
+        underlying="SOL",
+        window_start="2026-11-14T06:00:00+00:00",
+        window_end="2026-11-14T06:05:00+00:00",
+    )
+    ledger_state[:] = [
+        {
+            "seq": 20,
+            "utc": "2026-11-14T06:06:00+00:00",
+            "event_type": "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER",
+            "payload": {
+                "market_id": "988004",
+                "payout_usd": 50.0,
+                "realized_pnl_usd": 0.0,
+                "resolution": {"market_id": "988004", "outcome": "UP", "payout_ratios": {"UP": 0.5, "DOWN": 0.5}},
+            },
+        }
+    ]
+    # `/api/status` has an old conflicted entry AND a newer verified VOID 0.5/0.5 entry
+    status_state.clear()
+    status_state["recent_resolutions"] = [
+        {"seq": 1, "market_id": "988004", "outcome": "UP", "payout_ratios": {"UP": 0.5, "DOWN": 0.5}, "utc": "2026-11-14T06:06:00+00:00"},
+        {"seq": 2, "market_id": "988004", "outcome": "VOID", "payout_ratios": {"UP": 0.5, "DOWN": 0.5}, "payout_usd": 50.0, "utc": "2026-11-14T06:09:00+00:00"},
+    ]
+    res_1c = engine.poll_settlements_and_redeem(force=True)
+    assert len(res_1c) == 1
+    assert res_1c[0]["market_id"] == "988004"
+    assert res_1c[0]["official_outcome"] == "VOID"
+    assert res_1c[0]["redeem_status"] == "REDEEMED"
+    assert res_1c[0]["redeemed_usdc_amount"] == pytest.approx(5.0)
+    assert res_1c[0]["live_realized_pnl_usdc"] == pytest.approx(0.0)
+    obs.close()
+
+    # --- 2: Pending redemption recovery metadata preserved across payout conflict & reconciled cleanly ---
+    ledger_state.clear()
+    status_state.clear()
+    obs_p, audit_p, clob_p, _ = _build_env()
+    cond_p = "0x00" + ("77" * 31)
+    audit_p.record_order_execution(
+        _make_minimal_order_rec(
+            signal_id="sig_pend_901",
+            market_id="988901",
+            condition_id=cond_p,
+            outcome="UP",
+            clob_status="MATCHED",
+            filled_qty="10.00",
+            spent_usdc=5.0,
+            now_iso=now_iso,
+        ),
+        underlying="BTC",
+        window_start="2026-11-14T06:00:00+00:00",
+        window_end="2026-11-14T06:05:00+00:00",
+    )
+
+    relayer_exec_calls = 0
+    relayer_state = "STATE_NEW"
+    tx_hash_901 = "0x" + ("91" * 32)
+
+    class _MockStatefulRelayer:
+        def execute(self, transactions: list[Any], metadata: str = "") -> _RelayerExecResponse:
+            nonlocal relayer_exec_calls
+            relayer_exec_calls += 1
+            return _RelayerExecResponse(transaction_id="tx_rec_901", transaction_hash=tx_hash_901, state=relayer_state)
+
+        def get_transaction(self, transaction_id: str) -> list[dict[str, Any]]:
+            assert transaction_id == "tx_rec_901"
+            return [{"transactionID": "tx_rec_901", "state": relayer_state, "transactionHash": tx_hash_901}]
+
+        def poll_until_state(self, **kwargs: Any) -> dict[str, Any]:
+            return {"transactionID": "tx_rec_901", "state": relayer_state, "transactionHash": tx_hash_901}
+
+    red_p = AutoRedeemer(mode="live", withdrawal_permission=False, require_onchain_receipt=False)
+    red_p.relayer_client = _MockStatefulRelayer()  # type: ignore[assignment]
+    red_p.fetch_onchain_ctf_payout_ratios = lambda cond: None  # type: ignore[method-assign]
+    engine_p = LiveExecutionEngine(
+        config={"capital_and_scaling": {"live_scale_factor": 0.10}, "withdrawal_permission": False},
+        observer=obs_p,
+        audit_store=audit_p,
+        clob_executor=clob_p,
+        redeemer=red_p,
+    )
+
+    # Step 2.1: Submit initial redemption -> enters REDEEM_PENDING with tx_rec_901 & tx_hash_901
+    monkeypatch.setattr("argon4_live.redeemer.time.sleep", lambda _s: None)
+    st_sub = engine_p._execute_and_record_settlement(
+        market_id="988901",
+        condition_id=cond_p,
+        official_outcome="UP",
+        paper_payout_usd=100.0,
+        paper_realized_pnl_usd=50.0,
+        paper_settled_at=now_iso,
+        market_protocol="v2",
+        neg_risk=False,
+        payout_ratios={"UP": 1.0, "DOWN": 0.0},
+    )
+    assert relayer_exec_calls == 1
+    assert st_sub["redeem_status"] == "REDEEM_PENDING"
+    saved_before = audit_p.get_settlement_record("988901")
+    assert saved_before is not None
+    assert saved_before["redeem_tx_id"] == "tx_rec_901"
+    assert saved_before["redeem_tx_hash"] == tx_hash_901
+    assert saved_before["pending_batch_order_keys"] == ["sig_pend_901"]
+    orig_req_id = saved_before.get("redeem_request_id")
+    orig_target_to = saved_before.get("redeem_target_to")
+    orig_calldata = saved_before.get("redeem_calldata_hex")
+    assert orig_req_id and orig_target_to and orig_calldata
+
+    # Step 2.2: Payout conflict arrives via engine AND via direct bare AuditStore update -> MUST preserve ALL recovery fields!
+    st_conf = engine_p._execute_and_record_settlement(
+        market_id="988901",
+        condition_id=cond_p,
+        official_outcome="UP",
+        paper_payout_usd=50.0,
+        paper_realized_pnl_usd=0.0,
+        paper_settled_at=now_iso,
+        market_protocol="v2",
+        neg_risk=False,
+        payout_ratios={"UP": 0.5, "DOWN": 0.5},
+    )
+    assert relayer_exec_calls == 1
+    assert st_conf["redeem_status"] == "AWAITING_OFFICIAL_PAYOUT_VECTOR"
+
+    # Also verify direct AuditStore call where caller passed None/empty tx metadata on conflict
+    audit_p.record_settlement_and_redeem(
+        {
+            "timestamp_utc": now_iso,
+            "market_id": "988901",
+            "condition_id": cond_p,
+            "official_outcome": "UP",
+            "paper_payout_usd": 50.0,
+            "live_expected_payout_usdc": 0.0,
+            "redeem_tx_id": None,
+            "redeem_tx_hash": None,
+            "redeem_status": "AWAITING_OFFICIAL_PAYOUT_VECTOR",
+            "redeemed_usdc_amount": 0.0,
+            "pending_batch_order_keys": [],
+            "pending_batch_payout_usdc": 0.0,
+            "payout_conflict": True,
+            "unverified_payout_ratios": {"UP": 0.5, "DOWN": 0.5},
+        }
+    )
+
+    # Reopen AuditStore from disk to confirm SQLite persistence of every recovery field
+    audit_reopened = AuditStore(
+        local_root / "runtime/live/live_audit.sqlite3",
+        local_root / "runtime/live/live_orders.jsonl",
+        local_root / "runtime/live/live_quota_snapshots.jsonl",
+        local_root / "runtime/live/live_settlements.jsonl",
+        local_root=local_root,
+        upstream_root=upstream_root,
+    )
+    saved_conf = audit_reopened.get_settlement_record("988901")
+    assert saved_conf is not None
+    assert saved_conf["redeem_status"] == "AWAITING_OFFICIAL_PAYOUT_VECTOR"
+    assert saved_conf["payout_conflict"] is True
+    assert saved_conf["redeem_tx_id"] == "tx_rec_901"
+    assert saved_conf["redeem_tx_hash"] == tx_hash_901
+    assert saved_conf["pending_batch_order_keys"] == ["sig_pend_901"]
+    assert saved_conf["pending_batch_payout_usdc"] == pytest.approx(10.0)
+    assert saved_conf["submit_state"] == "SUBMITTED"
+    assert saved_conf["redeem_request_id"] == orig_req_id
+    assert saved_conf["redeem_target_to"] == orig_target_to
+    assert saved_conf["redeem_calldata_hex"] == orig_calldata
+
+    # Step 2.3: Valid payout vector arrives & Relayer confirms tx_rec_901 -> reconciles to REDEEMED with 0 duplicate submits!
+    relayer_state = "STATE_CONFIRMED"
+    engine_p.audit = audit_reopened
+    st_healed = engine_p._execute_and_record_settlement(
+        market_id="988901",
+        condition_id=cond_p,
+        official_outcome="UP",
+        paper_payout_usd=100.0,
+        paper_realized_pnl_usd=50.0,
+        paper_settled_at=now_iso,
+        market_protocol="v2",
+        neg_risk=False,
+        payout_ratios={"UP": 1.0, "DOWN": 0.0},
+    )
+    assert relayer_exec_calls == 1  # Strictly NO duplicate submission!
+    assert st_healed["redeem_status"] == "REDEEMED"
+    assert st_healed["redeemed_usdc_amount"] == pytest.approx(10.0)
+    assert st_healed["live_realized_pnl_usdc"] == pytest.approx(5.0)
+    assert audit_reopened.is_market_settled("988901") is True
+    obs_p.close()

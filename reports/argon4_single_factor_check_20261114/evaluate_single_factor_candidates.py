@@ -758,11 +758,20 @@ def main() -> None:
     parser.add_argument(
         "--policy",
         type=Path,
-        default=ROOT / "config" / "argon4_forward_policy.json",
+        default=None,
+        help=(
+            "Optional policy JSON path (defaults to pinned v15r1 snapshot in baseline_policy_v15r1.py "
+            "for exact historical reproduction; pass --policy config/argon4_forward_policy.json to evaluate head policy)."
+        ),
     )
     args = parser.parse_args()
 
-    policy = json.loads(args.policy.read_text(encoding="utf-8"))
+    if args.policy is not None:
+        policy = json.loads(args.policy.read_text(encoding="utf-8"))
+    else:
+        from reports.argon4_single_factor_check_20261114.baseline_policy_v15r1 import get_v15r1_baseline_policy
+
+        policy = get_v15r1_baseline_policy()
     current_ver = str(policy.get("version") or "")
     local_ev = load_local_sqlite_evidence(args.runtime_dir)
     cloud_ev = (

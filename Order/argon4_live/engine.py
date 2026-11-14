@@ -1799,9 +1799,14 @@ class LiveExecutionEngine:
                     else {"_prior_payout_conflict": True}
                 )
         before_redeemed = float((existing_settlement or {}).get("redeemed_usdc_amount") or 0.0)
+        existing_status_upper = (
+            str(existing_settlement.get("redeem_status") or "").upper()
+            if isinstance(existing_settlement, Mapping)
+            else ""
+        )
         was_pending_redemption = (
             isinstance(existing_settlement, Mapping)
-            and str(existing_settlement.get("redeem_status") or "").upper() in ("REDEEM_PENDING", "REDEEM_SUBMIT_UNKNOWN")
+            and existing_status_upper not in ("REDEEMED", "SHADOW_REDEEMED", "LOST_NO_REDEEM", "NO_LIVE_POSITION")
             and bool(
                 existing_settlement.get("redeem_tx_id")
                 or existing_settlement.get("redeem_tx_hash")
@@ -2000,12 +2005,26 @@ class LiveExecutionEngine:
             (idx, ev.get("seq") if isinstance(ev.get("seq"), int) else ev.get("id"))
             for idx, ev in enumerate(ledger_events)
             if isinstance(ev, Mapping)
+            and not isinstance(ev.get("seq") if ev.get("seq") is not None else ev.get("id"), bool)
             and isinstance(ev.get("seq") if isinstance(ev.get("seq"), int) else ev.get("id"), int)
         ]
-        if len(seq_pairs) >= 2 and seq_pairs[0][1] < seq_pairs[-1][1]:  # type: ignore[operator]
-            ordered_ledger = list(ledger_events)
+        if len(seq_pairs) >= 2 and seq_pairs[0][1] != seq_pairs[-1][1]:  # type: ignore[operator]
+            if seq_pairs[0][1] < seq_pairs[-1][1]:  # type: ignore[operator]
+                ordered_ledger = list(ledger_events)
+        else:
+            ts_pairs: list[tuple[int, datetime]] = []
+            for idx, ev in enumerate(ledger_events):
+                if isinstance(ev, Mapping) and ev.get("utc"):
+                    try:
+                        ts_pairs.append((idx, parse_utc_timestamp(str(ev["utc"]))))
+                    except ValueError:
+                        pass
+            if len(ts_pairs) >= 2 and ts_pairs[0][1] < ts_pairs[-1][1]:
+                ordered_ledger = list(ledger_events)
 
-        settled_idx_by_market: dict[str, int] = {}
+        # Collapse `ordered_ledger` (oldest -> newest) to ONLY the latest resolution event per `market_id`
+        # BEFORE executing any settlement, so an older `UP 1/0` event can NEVER settle and block a newer `VOID 0.5/0.5`!
+        latest_ledger_by_market: dict[str, dict[str, Any]] = {}
         for ev in ordered_ledger:
             if not isinstance(ev, Mapping) or ev.get("event_type") != "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER":
                 continue
@@ -2013,47 +2032,185 @@ class LiveExecutionEngine:
             if not isinstance(payload, Mapping):
                 continue
             market_id = str(payload.get("market_id") or "").strip()
-            if not market_id or self.audit.is_market_settled(market_id):
+            if not market_id:
                 continue
-            if market_id in processed_markets_this_pass:
-                prev_idx = settled_idx_by_market.get(market_id)
-                prev_rec = settled_records[prev_idx] if prev_idx is not None else None
-                if not (
-                    isinstance(prev_rec, Mapping)
-                    and str(prev_rec.get("redeem_status") or "").upper() == "AWAITING_OFFICIAL_PAYOUT_VECTOR"
-                ):
-                    continue
-
             res_obj = payload.get("resolution") if isinstance(payload.get("resolution"), Mapping) else {}
             official_outcome = str(res_obj.get("outcome") or "").upper().strip()
-            if official_outcome not in ("UP", "DOWN", "VOID"):
+            has_explicit_payout = (
+                payload_has_explicit_payout_fields(res_obj) or payload_has_explicit_payout_fields(payload)
+            )
+            if not official_outcome and not has_explicit_payout:
                 continue
-
             extracted_ratios: Mapping[str, Any] | None = (
                 extract_payout_ratios_from_payload(res_obj) or extract_payout_ratios_from_payload(payload)
             )
-            if extracted_ratios is None and (
-                payload_has_explicit_payout_fields(res_obj) or payload_has_explicit_payout_fields(payload)
-            ):
+            if extracted_ratios is None and has_explicit_payout:
                 extracted_ratios = {"_invalid_explicit_payout": True}
+            if market_id in latest_ledger_by_market:
+                del latest_ledger_by_market[market_id]
+            latest_ledger_by_market[market_id] = {
+                "market_id": market_id,
+                "official_outcome": official_outcome,
+                "payout_ratios": extracted_ratios,
+                "paper_payout_usd": float(payload.get("payout_usd") or 0.0),
+                "paper_realized_pnl_usd": float(payload.get("realized_pnl_usd") or 0.0),
+                "paper_settled_at": str(ev.get("utc")) if ev.get("utc") else None,
+            }
 
-            settlement_record = self._execute_and_record_settlement(
-                market_id=market_id,
-                condition_id=market_condition_map.get(market_id, ""),
-                official_outcome=official_outcome,
-                paper_payout_usd=float(payload.get("payout_usd") or 0.0),
-                paper_realized_pnl_usd=float(payload.get("realized_pnl_usd") or 0.0),
-                paper_settled_at=str(ev.get("utc")) if ev.get("utc") else None,
-                market_protocol=market_protocol_map.get(market_id),
-                neg_risk=market_negrisk_map.get(market_id),
-                payout_ratios=extracted_ratios,
+        now_utc = datetime.now(timezone.utc)
+        unresolved = self.audit.get_unresolved_live_markets()
+        unresolved_by_market: dict[str, dict[str, Any]] = {}
+        for u_item in unresolved:
+            u_mid = str(u_item.get("market_id") or "").strip()
+            if u_mid:
+                unresolved_by_market[u_mid] = u_item
+
+        def _can_query_fallback(u_item: Mapping[str, Any]) -> bool:
+            w_end = u_item.get("window_end")
+            if w_end and not force:
+                try:
+                    if parse_utc_timestamp(w_end) > now_utc:
+                        return False
+                except ValueError:
+                    pass
+            return True
+
+        def _verified_ratios_for(outcome_str: str, ratios_in: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+            out_up = str(outcome_str or "").upper().strip()
+            if out_up not in ("UP", "DOWN", "VOID"):
+                return None
+            if ratios_in is not None:
+                return resolve_verified_payout_ratios(out_up, ratios_in)
+            if out_up in ("UP", "DOWN"):
+                return resolve_verified_payout_ratios(out_up, None)
+            return None
+
+        def _should_apply_resolution(m_id: str, out_up: str, verified_dec: Mapping[str, Any] | None) -> bool:
+            if not self.audit.is_market_settled(m_id):
+                return True
+            if verified_dec is None:
+                return False
+            existing_rec = self.audit.get_settlement_record(m_id)
+            if not isinstance(existing_rec, Mapping):
+                return False
+            ex_status = str(existing_rec.get("redeem_status") or "").upper()
+            if ex_status != "LOST_NO_REDEEM":
+                return False
+            ex_out = str(existing_rec.get("official_outcome") or "").upper().strip()
+            ex_ratios = existing_rec.get("payout_ratios")
+            ver_float = {k: float(v) for k, v in verified_dec.items()}
+            return (out_up != ex_out) or (ex_ratios != ver_float)
+
+        staged_targets: list[dict[str, Any]] = []
+        fallback_queried_markets: set[str] = set()
+
+        for market_id, led_item in latest_ledger_by_market.items():
+            led_out = str(led_item.get("official_outcome") or "").upper().strip()
+            led_ratios = led_item.get("payout_ratios")
+            u_item = unresolved_by_market.get(market_id)
+            if u_item is None:
+                m_orders = self.audit.get_live_orders_for_market(market_id)
+                if m_orders:
+                    u_item = {
+                        "market_id": market_id,
+                        "condition_id": str(m_orders[0].get("condition_id") or ""),
+                        "token_id": str(m_orders[0].get("token_id") or ""),
+                        "outcome": str(m_orders[0].get("outcome") or ""),
+                        "window_end": max((str(o.get("window_end") or "") for o in m_orders), default=""),
+                        "market_protocol": m_orders[0].get("market_protocol"),
+                        "neg_risk": m_orders[0].get("neg_risk"),
+                    }
+            cond_id = (
+                market_condition_map.get(market_id)
+                or str((u_item or {}).get("condition_id") or "")
+                or str((self.audit.get_settlement_record(market_id) or {}).get("condition_id") or "")
             )
-            processed_markets_this_pass.add(market_id)
-            if market_id in settled_idx_by_market:
-                settled_records[settled_idx_by_market[market_id]] = settlement_record
+            if led_out == "VOID" and led_ratios is None:
+                fetched_pr = self.observer.fetch_official_market_payout_ratios(market_id, cond_id)
+                if fetched_pr is not None and resolve_verified_payout_ratios("VOID", fetched_pr) is not None:
+                    led_ratios = fetched_pr
+            led_verified = _verified_ratios_for(led_out, led_ratios)
+            if led_verified is not None:
+                if not _should_apply_resolution(market_id, led_out, led_verified):
+                    processed_markets_this_pass.add(market_id)
+                    continue
+                staged_targets.append(
+                    {
+                        "market_id": market_id,
+                        "condition_id": cond_id,
+                        "official_outcome": led_out,
+                        "paper_payout_usd": float(led_item.get("paper_payout_usd") or 0.0),
+                        "paper_realized_pnl_usd": float(led_item.get("paper_realized_pnl_usd") or 0.0),
+                        "paper_settled_at": led_item.get("paper_settled_at"),
+                        "market_protocol": market_protocol_map.get(market_id) or (u_item or {}).get("market_protocol"),
+                        "neg_risk": (
+                            market_negrisk_map[market_id]
+                            if market_id in market_negrisk_map
+                            else ((bool(u_item["neg_risk"]) if u_item and u_item.get("neg_risk") is not None else None))
+                        ),
+                        "payout_ratios": led_ratios,
+                    }
+                )
+                processed_markets_this_pass.add(market_id)
             else:
-                settled_idx_by_market[market_id] = len(settled_records)
-                settled_records.append(settlement_record)
+                # Ledger's latest entry for `market_id` is conflicted/unverified!
+                # Do NOT let a stale conflicted ledger row block fallback correction queries (`resolve_unsettled_market_fallback`).
+                fb_resolved: Mapping[str, Any] | None = None
+                if u_item is not None and _can_query_fallback(u_item):
+                    fallback_queried_markets.add(market_id)
+                    fb_cand = self.observer.resolve_unsettled_market_fallback(
+                        market_id=market_id,
+                        condition_id=cond_id,
+                        token_id=str(u_item.get("token_id") or ""),
+                        expected_outcome=str(u_item.get("outcome") or ""),
+                        allow_in_critical_window=force,
+                    )
+                    if isinstance(fb_cand, Mapping):
+                        fb_out = str(fb_cand.get("official_outcome") or "").upper().strip()
+                        fb_rat = fb_cand.get("payout_ratios") if isinstance(fb_cand.get("payout_ratios"), Mapping) else None
+                        if _verified_ratios_for(fb_out, fb_rat) is not None:
+                            fb_resolved = fb_cand
+                if fb_resolved is not None:
+                    fb_out = str(fb_resolved["official_outcome"]).upper().strip()
+                    fb_rat = fb_resolved.get("payout_ratios") if isinstance(fb_resolved.get("payout_ratios"), Mapping) else None
+                    if _should_apply_resolution(market_id, fb_out, _verified_ratios_for(fb_out, fb_rat)):
+                        staged_targets.append(
+                            {
+                                "market_id": market_id,
+                                "condition_id": str(fb_resolved.get("condition_id") or cond_id),
+                                "official_outcome": fb_out,
+                                "paper_payout_usd": float(fb_resolved.get("paper_payout_usd") or 0.0),
+                                "paper_realized_pnl_usd": float(fb_resolved.get("paper_realized_pnl_usd") or 0.0),
+                                "paper_settled_at": fb_resolved.get("settled_at") or led_item.get("paper_settled_at"),
+                                "market_protocol": market_protocol_map.get(market_id) or (u_item or {}).get("market_protocol"),
+                                "neg_risk": (
+                                    market_negrisk_map[market_id]
+                                    if market_id in market_negrisk_map
+                                    else ((bool(u_item["neg_risk"]) if u_item and u_item.get("neg_risk") is not None else None))
+                                ),
+                                "payout_ratios": fb_rat,
+                            }
+                        )
+                    processed_markets_this_pass.add(market_id)
+                elif not self.audit.is_market_settled(market_id):
+                    staged_targets.append(
+                        {
+                            "market_id": market_id,
+                            "condition_id": cond_id,
+                            "official_outcome": led_out if led_out in ("UP", "DOWN", "VOID") else "VOID",
+                            "paper_payout_usd": float(led_item.get("paper_payout_usd") or 0.0),
+                            "paper_realized_pnl_usd": float(led_item.get("paper_realized_pnl_usd") or 0.0),
+                            "paper_settled_at": led_item.get("paper_settled_at"),
+                            "market_protocol": market_protocol_map.get(market_id) or (u_item or {}).get("market_protocol"),
+                            "neg_risk": (
+                                market_negrisk_map[market_id]
+                                if market_id in market_negrisk_map
+                                else ((bool(u_item["neg_risk"]) if u_item and u_item.get("neg_risk") is not None else None))
+                            ),
+                            "payout_ratios": led_ratios if led_ratios is not None else {"_invalid_explicit_payout": True},
+                        }
+                    )
+                    processed_markets_this_pass.add(market_id)
 
         if max_seq_seen is not None:
             self.audit.set_kv("last_ledger_seq", str(max_seq_seen))
@@ -2072,34 +2229,34 @@ class LiveExecutionEngine:
             out = str(pend.get("official_outcome") or "").upper().strip()
             if out not in ("UP", "DOWN", "VOID"):
                 continue
-            settlement_record = self._execute_and_record_settlement(
-                market_id=mid,
-                condition_id=str(pend.get("condition_id") or market_condition_map.get(mid, "")),
-                official_outcome=out,
-                paper_payout_usd=float(pend.get("paper_payout_usd") or 0.0),
-                paper_realized_pnl_usd=float(pend.get("paper_realized_pnl_usd") or 0.0),
-                paper_settled_at=pend.get("paper_settled_at") or pend.get("settled_at_utc"),
-                market_protocol=pend.get("market_protocol") or market_protocol_map.get(mid),
-                neg_risk=pend.get("neg_risk") if pend.get("neg_risk") is not None else market_negrisk_map.get(mid),
-                payout_ratios=pend.get("payout_ratios") if isinstance(pend.get("payout_ratios"), Mapping) else None,
+            staged_targets.append(
+                {
+                    "market_id": mid,
+                    "condition_id": str(pend.get("condition_id") or market_condition_map.get(mid, "")),
+                    "official_outcome": out,
+                    "paper_payout_usd": float(pend.get("paper_payout_usd") or 0.0),
+                    "paper_realized_pnl_usd": float(pend.get("paper_realized_pnl_usd") or 0.0),
+                    "paper_settled_at": pend.get("paper_settled_at") or pend.get("settled_at_utc"),
+                    "market_protocol": pend.get("market_protocol") or market_protocol_map.get(mid),
+                    "neg_risk": pend.get("neg_risk") if pend.get("neg_risk") is not None else market_negrisk_map.get(mid),
+                    "payout_ratios": pend.get("payout_ratios") if isinstance(pend.get("payout_ratios"), Mapping) else None,
+                }
             )
             processed_markets_this_pass.add(mid)
-            settled_records.append(settlement_record)
 
-        # Design Gap #3: Catch up any unresolved local live markets that aged out of /api/ledger during downtime
-        now_utc = datetime.now(timezone.utc)
-        unresolved = self.audit.get_unresolved_live_markets()
+        # Design Gap #3: Catch up any unresolved local live markets that aged out of /api/ledger (or remained conflicted)
         for item in unresolved:
             mid = str(item.get("market_id") or "").strip()
-            if not mid or mid in processed_markets_this_pass or self.audit.is_market_settled(mid):
+            if (
+                not mid
+                or mid in processed_markets_this_pass
+                or mid in fallback_queried_markets
+                or self.audit.is_market_settled(mid)
+            ):
                 continue
-            w_end = item.get("window_end")
-            if w_end and not force:
-                try:
-                    if parse_utc_timestamp(w_end) > now_utc:
-                        continue
-                except ValueError:
-                    pass
+            if not _can_query_fallback(item):
+                continue
+            fallback_queried_markets.add(mid)
             fallback = self.observer.resolve_unsettled_market_fallback(
                 market_id=mid,
                 condition_id=str(item.get("condition_id") or ""),
@@ -2108,19 +2265,34 @@ class LiveExecutionEngine:
                 allow_in_critical_window=force,
             )
             if isinstance(fallback, Mapping) and fallback.get("official_outcome") in ("UP", "DOWN", "VOID"):
-                settlement_record = self._execute_and_record_settlement(
-                    market_id=mid,
-                    condition_id=str(fallback.get("condition_id") or item.get("condition_id") or ""),
-                    official_outcome=str(fallback["official_outcome"]),
-                    paper_payout_usd=float(fallback.get("paper_payout_usd") or 0.0),
-                    paper_realized_pnl_usd=float(fallback.get("paper_realized_pnl_usd") or 0.0),
-                    paper_settled_at=fallback.get("settled_at"),
-                    market_protocol=item.get("market_protocol"),
-                    neg_risk=bool(item.get("neg_risk")) if item.get("neg_risk") is not None else None,
-                    payout_ratios=fallback.get("payout_ratios") if isinstance(fallback.get("payout_ratios"), Mapping) else None,
+                staged_targets.append(
+                    {
+                        "market_id": mid,
+                        "condition_id": str(fallback.get("condition_id") or item.get("condition_id") or ""),
+                        "official_outcome": str(fallback["official_outcome"]),
+                        "paper_payout_usd": float(fallback.get("paper_payout_usd") or 0.0),
+                        "paper_realized_pnl_usd": float(fallback.get("paper_realized_pnl_usd") or 0.0),
+                        "paper_settled_at": fallback.get("settled_at"),
+                        "market_protocol": item.get("market_protocol"),
+                        "neg_risk": bool(item["neg_risk"]) if item.get("neg_risk") is not None else None,
+                        "payout_ratios": fallback.get("payout_ratios") if isinstance(fallback.get("payout_ratios"), Mapping) else None,
+                    }
                 )
                 processed_markets_this_pass.add(mid)
-                settled_records.append(settlement_record)
+
+        for target in staged_targets:
+            settlement_record = self._execute_and_record_settlement(
+                market_id=target["market_id"],
+                condition_id=target["condition_id"],
+                official_outcome=target["official_outcome"],
+                paper_payout_usd=target["paper_payout_usd"],
+                paper_realized_pnl_usd=target["paper_realized_pnl_usd"],
+                paper_settled_at=target["paper_settled_at"],
+                market_protocol=target["market_protocol"],
+                neg_risk=target["neg_risk"],
+                payout_ratios=target["payout_ratios"],
+            )
+            settled_records.append(settlement_record)
 
         return settled_records
 

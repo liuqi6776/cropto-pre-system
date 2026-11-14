@@ -17,6 +17,10 @@
   - **ZH**: 在严格单参数对照下（`B \ A` 共解锁 `N = 963` 笔 `10:00–12:00 ET` 信号），Binance 永续点位真实胜率仅为 `49.74%`（按各信号自身价档上限计 ROI 为 `-3.88%`，按 `0.485` 均价计为 `-1.01%`），每窗口取 `rank=1` 下界（`N = 675`）时进一步降至 `48.00%`。虽然现货 `1m OHLC4` 代理胜率表面为 `55.35%`，但其中 `605/963` 笔为 `handicap_bps < -1.0` 的深度实值开局（真实盘口开盘买一价往往高于限价帽无法成交），剔除后（`N = 358`）代理胜率回落至 `53.35%`（永续点位 `52.51%`）且尚未计入真实盘口逆向选择折损。因此生产环境维持 `12:00 ET` 不放宽。
 
 ## Usage / 运行方式
+- **EN**: Defaults to the pinned `v15r1` baseline snapshot ([baseline_policy_v15r1.py](file:///c:/Users/liuqi/crypto-predict_system/reports/argon4_single_factor_check_20261114/baseline_policy_v15r1.py), extracted verbatim from `commit bb2eacd`) so the historical `v15r1` single-factor A/B metrics above remain 100% deterministically reproducible even after `config/argon4_forward_policy.json` advances to `v15r2-Calibrated` (see `reports/argon4_v15r2_calibration_20261114/` for the `v15r2-Calibrated` multi-parameter calibration report). Pass `--policy config/argon4_forward_policy.json` to inspect against current head policy. Historical evaluation helper only; not a live trading authorization gate (`AGENTS.md`).
+- **ZH**: 默认读取锁定的 `v15r1` 基线配置快照（`baseline_policy_v15r1.py`，原样提取自 `commit bb2eacd`），确保在主配置升级至 `v15r2-Calibrated` 后仍能 100% 原样复现上述单因子对照结果（`v15r2-Calibrated` 多参数联合校准报告详见 `reports/argon4_v15r2_calibration_20261114/`）。如需对当前最新主配置运行对照，可显式传入 `--policy config/argon4_forward_policy.json`。本脚本仅作离线评估复现辅助，不代表实盘部署授权门禁（遵循 `AGENTS.md`）。
+
 ```powershell
 python -B reports/argon4_single_factor_check_20261114/evaluate_single_factor_candidates.py
+python -B reports/argon4_single_factor_check_20261114/evaluate_single_factor_candidates.py --policy config/argon4_forward_policy.json
 ```

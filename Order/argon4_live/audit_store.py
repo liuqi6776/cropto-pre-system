@@ -1370,6 +1370,8 @@ class AuditStore:
             rows = con.execute(
                 f"""
                 SELECT market_id, condition_id,
+                       MIN(token_id) AS token_id,
+                       MIN(outcome) AS outcome,
                        MIN(window_start) AS window_start,
                        MAX(window_end) AS window_end,
                        MAX(market_protocol) AS market_protocol,
@@ -1528,9 +1530,11 @@ class AuditStore:
         with self._lock:
             with self._connection(immediate=True) as con:
                 existing_settle = con.execute(
-                    "SELECT redeemed_usdc_amount, live_realized_pnl_usdc, settled_at_utc, redeem_tx_hash, payload_json FROM live_settlements WHERE market_id=?",
+                    "SELECT redeem_status, live_expected_payout_usdc, redeemed_usdc_amount, live_realized_pnl_usdc, settled_at_utc, redeem_tx_hash, payload_json FROM live_settlements WHERE market_id=?",
                     (market_id,),
                 ).fetchone()
+                prior_redeem_status = ""
+                prior_expected_payout = 0.0
                 prior_redeemed_amount = 0.0
                 prior_pnl = 0.0
                 prior_settled_at: str | None = None
@@ -1548,6 +1552,9 @@ class AuditStore:
                 prior_redeem_request_id: str | None = None
                 prior_redeem_target_to: str | None = None
                 prior_redeem_calldata_hex: str | None = None
+                prior_has_remaining_unredeemed: bool = False
+                prior_remaining_unredeemed_keys: list[str] | None = None
+                prior_remaining_unredeemed_payout: float | None = None
                 prior_first_settled_at: str | None = None
                 prior_first_loss_at: str | None = None
                 prior_last_loss_at: str | None = None
@@ -1559,6 +1566,8 @@ class AuditStore:
                 prior_unverified_payout_ratios: Any = None
 
                 if existing_settle is not None:
+                    prior_redeem_status = str(existing_settle["redeem_status"] or "").upper()
+                    prior_expected_payout = float(existing_settle["live_expected_payout_usdc"] or 0.0)
                     prior_redeemed_amount = float(existing_settle["redeemed_usdc_amount"] or 0.0)
                     prior_pnl = float(existing_settle["live_realized_pnl_usdc"] or 0.0)
                     prior_settled_at = (
@@ -1618,6 +1627,16 @@ class AuditStore:
                                     prior_redeem_target_to = str(parsed_pj["redeem_target_to"])
                                 if parsed_pj.get("redeem_calldata_hex"):
                                     prior_redeem_calldata_hex = str(parsed_pj["redeem_calldata_hex"])
+                                if parsed_pj.get("has_remaining_unredeemed"):
+                                    prior_has_remaining_unredeemed = True
+                                if isinstance(parsed_pj.get("remaining_unredeemed_order_keys"), list):
+                                    prior_remaining_unredeemed_keys = [
+                                        str(k) for k in parsed_pj["remaining_unredeemed_order_keys"] if k is not None
+                                    ]
+                                if parsed_pj.get("remaining_unredeemed_payout_usdc") is not None:
+                                    prior_remaining_unredeemed_payout = float(
+                                        parsed_pj.get("remaining_unredeemed_payout_usdc") or 0.0
+                                    )
                                 if parsed_pj.get("first_settled_at_utc"):
                                     prior_first_settled_at = str(parsed_pj["first_settled_at_utc"])
                                 if parsed_pj.get("first_loss_confirmed_at_utc"):
@@ -1719,6 +1738,51 @@ class AuditStore:
                     )
                     rec_to_save["redeemed_order_keys"] = sorted(prior_redeemed_keys)
                     rec_to_save["processed_redemption_batches"] = sorted(prior_processed_batches)
+
+                    if (
+                        prior_redeem_status not in TERMINAL_SETTLED_REDEEM_STATUSES
+                        and str(prior_submit_state or "").upper() != "SUBMIT_HTTP_400_REJECTED"
+                    ):
+                        if not rec_to_save.get("redeem_tx_id") and prior_tx_id:
+                            rec_to_save["redeem_tx_id"] = prior_tx_id
+                        if not rec_to_save.get("redeem_tx_hash") and prior_tx_hash:
+                            rec_to_save["redeem_tx_hash"] = prior_tx_hash
+                        if not rec_to_save.get("pending_batch_order_keys") and prior_pending_keys:
+                            rec_to_save["pending_batch_order_keys"] = prior_pending_keys
+                        if not rec_to_save.get("pending_batch_shares") and prior_pending_shares:
+                            rec_to_save["pending_batch_shares"] = prior_pending_shares
+                        if not float(rec_to_save.get("pending_batch_payout_usdc") or 0.0) and prior_pending_payout > 0:
+                            rec_to_save["pending_batch_payout_usdc"] = prior_pending_payout
+                        if not rec_to_save.get("submit_state") and prior_submit_state:
+                            rec_to_save["submit_state"] = prior_submit_state
+                        if not rec_to_save.get("redeem_request_id") and prior_redeem_request_id:
+                            rec_to_save["redeem_request_id"] = prior_redeem_request_id
+                        if not rec_to_save.get("redeem_target_to") and prior_redeem_target_to:
+                            rec_to_save["redeem_target_to"] = prior_redeem_target_to
+                        if not rec_to_save.get("redeem_calldata_hex") and prior_redeem_calldata_hex:
+                            rec_to_save["redeem_calldata_hex"] = prior_redeem_calldata_hex
+                        if not rec_to_save.get("tx_submitted_at_utc") and prior_tx_submitted_at:
+                            rec_to_save["tx_submitted_at_utc"] = prior_tx_submitted_at
+                        if not rec_to_save.get("submit_boot_id") and prior_submit_boot_id:
+                            rec_to_save["submit_boot_id"] = prior_submit_boot_id
+                        if rec_to_save.get("balance_snapshot_seq_at_submit") is None and prior_balance_seq is not None:
+                            rec_to_save["balance_snapshot_seq_at_submit"] = prior_balance_seq
+                        if rec_to_save.get("free_usdc_at_submit") is None and prior_free_usdc_at_submit is not None:
+                            rec_to_save["free_usdc_at_submit"] = prior_free_usdc_at_submit
+                        if rec_to_save.get("local_spent_at_submit") is None and prior_local_spent_at_submit is not None:
+                            rec_to_save["local_spent_at_submit"] = prior_local_spent_at_submit
+                        if not float(rec_to_save.get("live_expected_payout_usdc") or 0.0) and prior_expected_payout > 0:
+                            rec_to_save["live_expected_payout_usdc"] = prior_expected_payout
+                        if not rec_to_save.get("has_remaining_unredeemed") and prior_has_remaining_unredeemed:
+                            rec_to_save["has_remaining_unredeemed"] = True
+                        if not rec_to_save.get("remaining_unredeemed_order_keys") and prior_remaining_unredeemed_keys:
+                            rec_to_save["remaining_unredeemed_order_keys"] = prior_remaining_unredeemed_keys
+                        if (
+                            rec_to_save.get("remaining_unredeemed_payout_usdc") is None
+                            and prior_remaining_unredeemed_payout is not None
+                        ):
+                            rec_to_save["remaining_unredeemed_payout_usdc"] = prior_remaining_unredeemed_payout
+
                     payload_text = json.dumps(rec_to_save, ensure_ascii=False, allow_nan=False)
                     con.execute(
                         """
@@ -1734,8 +1798,8 @@ class AuditStore:
                             str(settlement_record.get("condition_id") or ""),
                             official_outcome,
                             float(settlement_record.get("paper_payout_usd") or 0.0),
-                            float(settlement_record.get("live_expected_payout_usdc") or 0.0),
-                            None,
+                            float(rec_to_save.get("live_expected_payout_usdc") or 0.0),
+                            rec_to_save.get("redeem_tx_hash"),
                             "AWAITING_OFFICIAL_PAYOUT_VECTOR",
                             cumulative_redeemed_amount,
                             live_cost_float,
@@ -1931,6 +1995,9 @@ class AuditStore:
                         if not first_loss_at:
                             first_loss_at = incoming_ts
                         last_loss_at = incoming_ts
+                    elif confirmed_lost_cost == Decimal("0") and live_realized_pnl >= -1e-9:
+                        first_loss_at = None
+                        last_loss_at = None
                 else:
                     settled_at = prior_settled_at or incoming_ts
                     if live_realized_pnl < -1e-9 and not first_loss_at:
@@ -1968,7 +2035,7 @@ class AuditStore:
                     rec_to_save["free_usdc_at_submit"] = None
                     rec_to_save["local_spent_at_submit"] = None
                     rec_to_save["tx_submitted_at_utc"] = None
-                elif effective_redeem_status == "REDEEM_PENDING" and str(rec_to_save.get("submit_state") or "").upper() != "SUBMIT_HTTP_400_REJECTED":
+                elif effective_redeem_status in ("REDEEM_PENDING", "REDEEM_SUBMIT_UNKNOWN") and str(rec_to_save.get("submit_state") or "").upper() != "SUBMIT_HTTP_400_REJECTED":
                     # [P1-R4-3] & [P1-R5-3]: Never lose an already-persisted pending `redeem_tx_id` /
                     # `redeem_tx_hash`, `submit_state`, `redeem_request_id`, or batch metadata if a
                     # subsequent progress update lacks them!

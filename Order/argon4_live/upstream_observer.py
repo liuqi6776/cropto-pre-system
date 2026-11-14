@@ -613,36 +613,71 @@ class UpstreamObserver:
         if not allow_in_critical_window and self.is_in_critical_window():
             return None
 
+        from .redeemer import resolve_verified_payout_ratios
+
+        first_unverified_candidate: dict[str, Any] | None = None
+
+        def _accept_or_defer(cand: dict[str, Any]) -> dict[str, Any] | None:
+            nonlocal first_unverified_candidate
+            c_out = str(cand.get("official_outcome") or "").upper().strip()
+            c_rat = cand.get("payout_ratios")
+            if c_out in ("UP", "DOWN", "VOID") and (
+                (isinstance(c_rat, Mapping) and resolve_verified_payout_ratios(c_out, c_rat) is not None)
+                or (c_rat is None and c_out in ("UP", "DOWN"))
+            ):
+                return cand
+            if first_unverified_candidate is None:
+                first_unverified_candidate = cand
+            return None
+
         # 1. Check cached or fresh upstream /api/status if it lists resolved markets
         status_data = self.fetch_status(allow_in_critical_window=allow_in_critical_window)
         if isinstance(status_data, Mapping):
             for key in ("recent_resolutions", "resolutions", "settled_markets"):
                 items = status_data.get(key)
                 if isinstance(items, list):
-                    for item in items:
-                        if isinstance(item, Mapping) and str(item.get("market_id") or "") == str(market_id):
-                            out = str(
-                                item.get("official_outcome")
-                                or (item.get("resolution") or {}).get("outcome")
-                                or item.get("outcome")
-                                or ""
-                            ).upper().strip()
-                            if out in ("UP", "DOWN", "VOID"):
-                                res_sub = item.get("resolution") if isinstance(item.get("resolution"), Mapping) else None
-                                has_explicit_payout = payload_has_explicit_payout_fields(item) or payload_has_explicit_payout_fields(res_sub)
-                                ratios: Mapping[str, Any] | None = extract_payout_ratios_from_payload(item)
-                                if ratios is None and res_sub is not None:
-                                    ratios = extract_payout_ratios_from_payload(res_sub)
-                                if ratios is None and has_explicit_payout:
-                                    ratios = {"_invalid_explicit_payout": True}
-                                elif ratios is None and out in ("UP", "DOWN"):
-                                    ratios = {"UP": 1.0, "DOWN": 0.0} if out == "UP" else {"UP": 0.0, "DOWN": 1.0}
-                                if ratios is None and out == "VOID":
-                                    ratios = self.fetch_official_market_payout_ratios(
-                                        str(market_id),
-                                        str(condition_id or item.get("condition_id") or ""),
-                                    )
-                                return {
+                    matched_items = [
+                        it for it in items if isinstance(it, Mapping) and str(it.get("market_id") or "") == str(market_id)
+                    ]
+                    if len(matched_items) >= 2:
+                        s_first = matched_items[0].get("seq") if isinstance(matched_items[0].get("seq"), int) else matched_items[0].get("id")
+                        s_last = matched_items[-1].get("seq") if isinstance(matched_items[-1].get("seq"), int) else matched_items[-1].get("id")
+                        if isinstance(s_first, int) and isinstance(s_last, int) and s_first != s_last:
+                            if s_first < s_last:
+                                matched_items = list(reversed(matched_items))
+                        else:
+                            t_first = matched_items[0].get("utc") or matched_items[0].get("settled_at")
+                            t_last = matched_items[-1].get("utc") or matched_items[-1].get("settled_at")
+                            if t_first and t_last:
+                                try:
+                                    if parse_utc_timestamp(str(t_first)) < parse_utc_timestamp(str(t_last)):
+                                        matched_items = list(reversed(matched_items))
+                                except ValueError:
+                                    pass
+                    for item in matched_items:
+                        out = str(
+                            item.get("official_outcome")
+                            or (item.get("resolution") or {}).get("outcome")
+                            or item.get("outcome")
+                            or ""
+                        ).upper().strip()
+                        if out in ("UP", "DOWN", "VOID"):
+                            res_sub = item.get("resolution") if isinstance(item.get("resolution"), Mapping) else None
+                            has_explicit_payout = payload_has_explicit_payout_fields(item) or payload_has_explicit_payout_fields(res_sub)
+                            ratios: Mapping[str, Any] | None = extract_payout_ratios_from_payload(item)
+                            if ratios is None and res_sub is not None:
+                                ratios = extract_payout_ratios_from_payload(res_sub)
+                            if ratios is None and has_explicit_payout:
+                                ratios = {"_invalid_explicit_payout": True}
+                            elif ratios is None and out in ("UP", "DOWN"):
+                                ratios = {"UP": 1.0, "DOWN": 0.0} if out == "UP" else {"UP": 0.0, "DOWN": 1.0}
+                            if ratios is None and out == "VOID":
+                                ratios = self.fetch_official_market_payout_ratios(
+                                    str(market_id),
+                                    str(condition_id or item.get("condition_id") or ""),
+                                )
+                            accepted = _accept_or_defer(
+                                {
                                     "market_id": str(market_id),
                                     "condition_id": str(condition_id or item.get("condition_id") or ""),
                                     "official_outcome": out,
@@ -652,6 +687,10 @@ class UpstreamObserver:
                                     "settled_at": item.get("utc") or item.get("settled_at"),
                                     "source": "upstream_status",
                                 }
+                            )
+                            if accepted is not None:
+                                return accepted
+                            break
 
         # 2. Check Polymarket CLOB `/markets/{condition_id}`
         if condition_id and str(condition_id).startswith("0x"):
@@ -684,27 +723,35 @@ class UpstreamObserver:
                                         clob_ratios = {"_invalid_explicit_payout": True}
                                     elif clob_ratios is None and winner in ("UP", "DOWN"):
                                         clob_ratios = {"UP": 1.0, "DOWN": 0.0} if winner == "UP" else {"UP": 0.0, "DOWN": 1.0}
-                                    return {
-                                        "market_id": str(market_id),
-                                        "condition_id": str(condition_id),
-                                        "official_outcome": winner,
-                                        "payout_ratios": clob_ratios,
-                                        "paper_payout_usd": 0.0,
-                                        "paper_realized_pnl_usd": 0.0,
-                                        "settled_at": None,
-                                        "source": "polymarket_clob",
-                                    }
+                                    accepted = _accept_or_defer(
+                                        {
+                                            "market_id": str(market_id),
+                                            "condition_id": str(condition_id),
+                                            "official_outcome": winner,
+                                            "payout_ratios": clob_ratios,
+                                            "paper_payout_usd": 0.0,
+                                            "paper_realized_pnl_usd": 0.0,
+                                            "settled_at": None,
+                                            "source": "polymarket_clob",
+                                        }
+                                    )
+                                    if accepted is not None:
+                                        return accepted
                         if clob_ratios is not None and any(0.0 < float(v) < 1.0 for v in clob_ratios.values()):
-                            return {
-                                "market_id": str(market_id),
-                                "condition_id": str(condition_id),
-                                "official_outcome": "VOID",
-                                "payout_ratios": clob_ratios,
-                                "paper_payout_usd": 0.0,
-                                "paper_realized_pnl_usd": 0.0,
-                                "settled_at": None,
-                                "source": "polymarket_clob",
-                            }
+                            accepted = _accept_or_defer(
+                                {
+                                    "market_id": str(market_id),
+                                    "condition_id": str(condition_id),
+                                    "official_outcome": "VOID",
+                                    "payout_ratios": clob_ratios,
+                                    "paper_payout_usd": 0.0,
+                                    "paper_realized_pnl_usd": 0.0,
+                                    "settled_at": None,
+                                    "source": "polymarket_clob",
+                                }
+                            )
+                            if accepted is not None:
+                                return accepted
             except Exception:
                 pass
 
@@ -739,16 +786,20 @@ class UpstreamObserver:
                                 gamma_ratios = {"_invalid_explicit_payout": True}
                             elif gamma_ratios is None and winner in ("UP", "DOWN"):
                                 gamma_ratios = {"UP": 1.0, "DOWN": 0.0} if winner == "UP" else {"UP": 0.0, "DOWN": 1.0}
-                            return {
-                                "market_id": str(market_id),
-                                "condition_id": str(condition_id or gm.get("conditionId") or ""),
-                                "official_outcome": winner,
-                                "payout_ratios": gamma_ratios,
-                                "paper_payout_usd": 0.0,
-                                "paper_realized_pnl_usd": 0.0,
-                                "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
-                                "source": "polymarket_gamma",
-                            }
+                            accepted = _accept_or_defer(
+                                {
+                                    "market_id": str(market_id),
+                                    "condition_id": str(condition_id or gm.get("conditionId") or ""),
+                                    "official_outcome": winner,
+                                    "payout_ratios": gamma_ratios,
+                                    "paper_payout_usd": 0.0,
+                                    "paper_realized_pnl_usd": 0.0,
+                                    "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
+                                    "source": "polymarket_gamma",
+                                }
+                            )
+                            if accepted is not None:
+                                return accepted
 
                         # 3b. Check exact settled authoritative payout vector ([1, 0], [0, 1], or split VOID),
                         # OR exact binary `outcomePrices` ([1, 0] / [0, 1]) ONLY when finalized and binary.
@@ -759,27 +810,35 @@ class UpstreamObserver:
                             if len(exact_winners) == 1 and len(exact_losers) == len(gamma_ratios) - 1:
                                 winner = _normalize_outcome_key(exact_winners[0])
                                 if winner in ("UP", "DOWN", "VOID"):
-                                    return {
+                                    accepted = _accept_or_defer(
+                                        {
+                                            "market_id": str(market_id),
+                                            "condition_id": str(condition_id or gm.get("conditionId") or ""),
+                                            "official_outcome": winner,
+                                            "payout_ratios": gamma_ratios,
+                                            "paper_payout_usd": 0.0,
+                                            "paper_realized_pnl_usd": 0.0,
+                                            "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
+                                            "source": "polymarket_gamma",
+                                        }
+                                    )
+                                    if accepted is not None:
+                                        return accepted
+                            elif sum(gamma_ratios.values()) > 0.0:
+                                accepted = _accept_or_defer(
+                                    {
                                         "market_id": str(market_id),
                                         "condition_id": str(condition_id or gm.get("conditionId") or ""),
-                                        "official_outcome": winner,
+                                        "official_outcome": "VOID",
                                         "payout_ratios": gamma_ratios,
                                         "paper_payout_usd": 0.0,
                                         "paper_realized_pnl_usd": 0.0,
                                         "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
                                         "source": "polymarket_gamma",
                                     }
-                            elif sum(gamma_ratios.values()) > 0.0:
-                                return {
-                                    "market_id": str(market_id),
-                                    "condition_id": str(condition_id or gm.get("conditionId") or ""),
-                                    "official_outcome": "VOID",
-                                    "payout_ratios": gamma_ratios,
-                                    "paper_payout_usd": 0.0,
-                                    "paper_realized_pnl_usd": 0.0,
-                                    "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
-                                    "source": "polymarket_gamma",
-                                }
+                                )
+                                if accepted is not None:
+                                    return accepted
                         else:
                             price_ratios = extract_payout_ratios_from_payload(gm, allow_outcome_prices=True)
                             if price_ratios is not None:
@@ -788,20 +847,24 @@ class UpstreamObserver:
                                 if len(exact_winners) == 1 and len(exact_losers) == len(price_ratios) - 1:
                                     winner = _normalize_outcome_key(exact_winners[0])
                                     if winner in ("UP", "DOWN"):
-                                        return {
-                                            "market_id": str(market_id),
-                                            "condition_id": str(condition_id or gm.get("conditionId") or ""),
-                                            "official_outcome": winner,
-                                            "payout_ratios": price_ratios,
-                                            "paper_payout_usd": 0.0,
-                                            "paper_realized_pnl_usd": 0.0,
-                                            "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
-                                            "source": "polymarket_gamma",
-                                        }
+                                        accepted = _accept_or_defer(
+                                            {
+                                                "market_id": str(market_id),
+                                                "condition_id": str(condition_id or gm.get("conditionId") or ""),
+                                                "official_outcome": winner,
+                                                "payout_ratios": price_ratios,
+                                                "paper_payout_usd": 0.0,
+                                                "paper_realized_pnl_usd": 0.0,
+                                                "settled_at": gm.get("resolvedAt") or gm.get("closedTime"),
+                                                "source": "polymarket_gamma",
+                                            }
+                                        )
+                                        if accepted is not None:
+                                            return accepted
             except Exception:
                 pass
 
-        return None
+        return first_unverified_candidate
 
     def fetch_official_market_payout_ratios(
         self,

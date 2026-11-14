@@ -1201,22 +1201,87 @@ class AutoRedeemer:
             if isinstance(raw_red_keys, list):
                 already_redeemed_keys.update(str(k) for k in raw_red_keys if k is not None)
 
-        if payout_ratios is not None and resolve_verified_payout_ratios(winner, payout_ratios) is None:
-            return {
-                "live_expected_payout_usdc": 0.0,
-                "redeem_tx_hash": None,
+        def _awaiting_payout_vector_result(err_code: str) -> dict[str, Any]:
+            preserved_tx_id: str | None = None
+            preserved_tx_hash: str | None = None
+            preserved_pending_keys: list[str] = []
+            preserved_pending_shares: str | None = None
+            preserved_pending_payout = 0.0
+            preserved_submit_state: str | None = None
+            preserved_request_id: str | None = None
+            preserved_target_to: str | None = None
+            preserved_calldata_hex: str | None = None
+            preserved_redeemed_usdc = 0.0
+            preserved_expected_payout = 0.0
+            preserved_has_rem = False
+            preserved_rem_keys: list[str] | None = None
+            preserved_rem_payout: float | None = None
+            if isinstance(existing_settlement, Mapping):
+                if existing_settlement.get("redeemed_usdc_amount") is not None:
+                    preserved_redeemed_usdc = float(existing_settlement.get("redeemed_usdc_amount") or 0.0)
+                prior_st = str(existing_settlement.get("redeem_status") or "").upper()
+                prior_sub_st = str(existing_settlement.get("submit_state") or "").upper()
+                if (
+                    prior_st not in ("REDEEMED", "SHADOW_REDEEMED", "LOST_NO_REDEEM", "NO_LIVE_POSITION")
+                    and prior_sub_st != "SUBMIT_HTTP_400_REJECTED"
+                ):
+                    if existing_settlement.get("redeem_tx_id"):
+                        preserved_tx_id = str(existing_settlement["redeem_tx_id"])
+                    if existing_settlement.get("redeem_tx_hash"):
+                        preserved_tx_hash = str(existing_settlement["redeem_tx_hash"])
+                    raw_pk = existing_settlement.get("pending_batch_order_keys")
+                    if isinstance(raw_pk, list):
+                        preserved_pending_keys = [str(k) for k in raw_pk if k is not None]
+                    if existing_settlement.get("pending_batch_shares") is not None:
+                        preserved_pending_shares = str(existing_settlement["pending_batch_shares"])
+                    if existing_settlement.get("pending_batch_payout_usdc") is not None:
+                        preserved_pending_payout = float(existing_settlement.get("pending_batch_payout_usdc") or 0.0)
+                    if existing_settlement.get("submit_state"):
+                        preserved_submit_state = str(existing_settlement["submit_state"])
+                    if existing_settlement.get("redeem_request_id"):
+                        preserved_request_id = str(existing_settlement["redeem_request_id"])
+                    if existing_settlement.get("redeem_target_to"):
+                        preserved_target_to = str(existing_settlement["redeem_target_to"])
+                    if existing_settlement.get("redeem_calldata_hex"):
+                        preserved_calldata_hex = str(existing_settlement["redeem_calldata_hex"])
+                    if existing_settlement.get("live_expected_payout_usdc") is not None:
+                        preserved_expected_payout = float(existing_settlement.get("live_expected_payout_usdc") or 0.0)
+                    preserved_has_rem = bool(existing_settlement.get("has_remaining_unredeemed"))
+                    if isinstance(existing_settlement.get("remaining_unredeemed_order_keys"), list):
+                        preserved_rem_keys = [
+                            str(k) for k in existing_settlement["remaining_unredeemed_order_keys"] if k is not None
+                        ]
+                    if existing_settlement.get("remaining_unredeemed_payout_usdc") is not None:
+                        preserved_rem_payout = float(existing_settlement.get("remaining_unredeemed_payout_usdc") or 0.0)
+            out_res: dict[str, Any] = {
+                "live_expected_payout_usdc": preserved_expected_payout,
+                "redeem_tx_id": preserved_tx_id,
+                "redeem_tx_hash": preserved_tx_hash,
                 "redeem_status": "AWAITING_OFFICIAL_PAYOUT_VECTOR",
-                "redeemed_usdc_amount": 0.0,
+                "submit_state": preserved_submit_state,
+                "redeem_request_id": preserved_request_id,
+                "redeem_target_to": preserved_target_to,
+                "redeem_calldata_hex": preserved_calldata_hex,
+                "redeemed_usdc_amount": preserved_redeemed_usdc,
                 "newly_redeemed_usdc_amount": 0.0,
                 "redeem_latency_seconds": 0.0,
-                "error": f"UNVERIFIED_PAYOUT_VECTOR:{winner}",
+                "error": err_code,
                 "payout_ratios": None,
                 "redeemed_order_keys": sorted(already_redeemed_keys),
                 "newly_redeemed_order_keys": [],
-                "pending_batch_order_keys": [],
-                "pending_batch_payout_usdc": 0.0,
-                "has_remaining_unredeemed": False,
+                "pending_batch_order_keys": preserved_pending_keys,
+                "pending_batch_shares": preserved_pending_shares,
+                "pending_batch_payout_usdc": preserved_pending_payout,
+                "has_remaining_unredeemed": preserved_has_rem,
             }
+            if preserved_rem_keys is not None:
+                out_res["remaining_unredeemed_order_keys"] = preserved_rem_keys
+            if preserved_rem_payout is not None:
+                out_res["remaining_unredeemed_payout_usdc"] = preserved_rem_payout
+            return out_res
+
+        if payout_ratios is not None and resolve_verified_payout_ratios(winner, payout_ratios) is None:
+            return _awaiting_payout_vector_result(f"UNVERIFIED_PAYOUT_VECTOR:{winner}")
 
         if not live_orders:
             return {
@@ -1241,21 +1306,7 @@ class AutoRedeemer:
                 ratio_map = resolve_verified_payout_ratios(winner, rpc_ratios)
 
         if ratio_map is None:
-            return {
-                "live_expected_payout_usdc": 0.0,
-                "redeem_tx_hash": None,
-                "redeem_status": "AWAITING_OFFICIAL_PAYOUT_VECTOR",
-                "redeemed_usdc_amount": 0.0,
-                "newly_redeemed_usdc_amount": 0.0,
-                "redeem_latency_seconds": 0.0,
-                "error": f"UNVERIFIED_PAYOUT_VECTOR:{winner}",
-                "payout_ratios": None,
-                "redeemed_order_keys": sorted(already_redeemed_keys),
-                "newly_redeemed_order_keys": [],
-                "pending_batch_order_keys": [],
-                "pending_batch_payout_usdc": 0.0,
-                "has_remaining_unredeemed": False,
-            }
+            return _awaiting_payout_vector_result(f"UNVERIFIED_PAYOUT_VECTOR:{winner}")
 
         float_ratios = {k: float(v) for k, v in ratio_map.items()}
         unredeemed_orders: list[tuple[str, Mapping[str, Any], Decimal, Decimal, str]] = []
@@ -1274,21 +1325,7 @@ class AutoRedeemer:
                 continue
             ord_out = _norm_outcome_key(order.get("outcome", ""))
             if ord_out not in ratio_map:
-                return {
-                    "live_expected_payout_usdc": 0.0,
-                    "redeem_tx_hash": None,
-                    "redeem_status": "AWAITING_OFFICIAL_PAYOUT_VECTOR",
-                    "redeemed_usdc_amount": 0.0,
-                    "newly_redeemed_usdc_amount": 0.0,
-                    "redeem_latency_seconds": 0.0,
-                    "error": f"INCOMPLETE_PAYOUT_VECTOR_MISSING_{ord_out or 'UNKNOWN'}",
-                    "payout_ratios": None,
-                    "redeemed_order_keys": sorted(already_redeemed_keys),
-                    "newly_redeemed_order_keys": [],
-                    "pending_batch_order_keys": [],
-                    "pending_batch_payout_usdc": 0.0,
-                    "has_remaining_unredeemed": False,
-                }
+                return _awaiting_payout_vector_result(f"INCOMPLETE_PAYOUT_VECTOR_MISSING_{ord_out or 'UNKNOWN'}")
             ord_ratio = ratio_map[ord_out]
             if ord_ratio > Decimal("0"):
                 qty = to_decimal(order.get("filled_quantity", "0"), "filled_quantity")
@@ -1309,11 +1346,31 @@ class AutoRedeemer:
         t0 = time.perf_counter()
 
         # [P1-E], [P1-R3-1], & [P1-R5-3]: If an existing pending redemption transaction or an
-        # un-reconciled submission (`REDEEM_SUBMIT_UNKNOWN` / `pending_batch_order_keys` without ID)
+        # un-reconciled submission (`REDEEM_SUBMIT_UNKNOWN` / `pending_batch_order_keys` without ID,
+        # including one temporarily paused under `AWAITING_OFFICIAL_PAYOUT_VECTOR` during a payout conflict)
         # exists, recover/reconcile it first and NEVER auto-submit a duplicate transaction!
-        if (
+        existing_status_upper = (
+            str(existing_settlement.get("redeem_status") or "").upper()
+            if isinstance(existing_settlement, Mapping)
+            else ""
+        )
+        has_recoverable_pending_tx = (
             isinstance(existing_settlement, Mapping)
-            and str(existing_settlement.get("redeem_status") or "").upper() in ("REDEEM_PENDING", "REDEEM_SUBMIT_UNKNOWN")
+            and existing_status_upper not in ("REDEEMED", "SHADOW_REDEEMED", "LOST_NO_REDEEM", "NO_LIVE_POSITION")
+            and (
+                existing_status_upper in ("REDEEM_PENDING", "REDEEM_SUBMIT_UNKNOWN")
+                or bool(
+                    existing_settlement.get("redeem_tx_id")
+                    or existing_settlement.get("redeem_tx_hash")
+                    or existing_settlement.get("pending_batch_order_keys")
+                    or existing_settlement.get("redeem_request_id")
+                    or existing_settlement.get("submit_state")
+                )
+            )
+        )
+        if (
+            has_recoverable_pending_tx
+            and isinstance(existing_settlement, Mapping)
             and self.mode != "shadow"
             and self.relayer_client is not None
         ):

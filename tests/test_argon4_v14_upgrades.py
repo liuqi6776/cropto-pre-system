@@ -3794,6 +3794,45 @@ def test_v15r2_paper_live_max_buy_price_consistency_and_threshold_override_tier_
     assert res_sub["effective_max_buy_price"] == pytest.approx(0.485)
     assert res_sub["price_tier_reason"] == "SUB_BASELINE_THRESHOLD_CAP"
 
+    # Sub-baseline marginal signal ALSO meeting counter-15m streak (0.490 vs 0.485) -> MUST take min(0.490, 0.485) = 0.485!
+    res_sub_counter = model_v14.predict_stream_v14(
+        "BTC_15m",
+        None,
+        None,
+        BOUNDARY,
+        threshold_override=0.92,
+        ex_ante_rv12_bps=10.0,
+        volatility_regime_guard=vg,
+        cohort_time="2026-11-14T06:00:00+00:00",
+        own_ret_15m_bps=-60.0,
+        own_streak_3bar=-3,
+        spot_twap60_t=90000.0,
+        spot_close_t=90000.0,
+    )
+    assert res_sub_counter["selected"] is True
+    assert res_sub_counter["effective_max_buy_price"] == pytest.approx(0.485)
+    assert res_sub_counter["price_tier_reason"] == "SUB_BASELINE_THRESHOLD_CAP"
+
+    vg_high_sub = deepcopy(vg)
+    vg_high_sub["confidence_tiered_max_buy_price"]["sub_threshold_max_buy_price"] = 0.495
+    res_sub_counter_rev = model_v14.predict_stream_v14(
+        "BTC_15m",
+        None,
+        None,
+        BOUNDARY,
+        threshold_override=0.92,
+        ex_ante_rv12_bps=10.0,
+        volatility_regime_guard=vg_high_sub,
+        cohort_time="2026-11-14T06:00:00+00:00",
+        own_ret_15m_bps=-60.0,
+        own_streak_3bar=-3,
+        spot_twap60_t=90000.0,
+        spot_close_t=90000.0,
+    )
+    assert res_sub_counter_rev["selected"] is True
+    assert res_sub_counter_rev["effective_max_buy_price"] == pytest.approx(0.490)
+    assert res_sub_counter_rev["price_tier_reason"] == "MARGINAL_AGAINST_15M_STREAK"
+
     # --- Part B: Tightened global max_buy_price=0.490 clamps signal effective_max_buy_price=0.510 in Paper ---
     tight_pol = {
         **v5_policy(),
