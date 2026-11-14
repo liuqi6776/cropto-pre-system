@@ -594,6 +594,54 @@ class AuditStore:
                     prior_sum += to_decimal(s_row["live_realized_pnl_usdc"] or 0.0, "live_realized_pnl_usdc")
         return prior_sum.quantize(USD_MICRO, rounding=ROUND_DOWN)
 
+    def get_live_equity_and_today_pnl(
+        self,
+        onchain_free_usdc_balance: float | Decimal,
+        now_utc: datetime | None = None,
+    ) -> dict[str, Decimal]:
+        """Compute double-count-free true on-chain portfolio equity and today's realized PnL.
+
+        ``true_live_equity = max(0, onchain_free - in_flight_reserved) + total_locked_open_risk``
+        so open positions and in-flight reservations are neither lost nor double-counted.
+        """
+        stamp = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        free_dec = max(
+            Decimal("0"),
+            to_decimal(onchain_free_usdc_balance or 0.0, "onchain_free_usdc_balance").quantize(
+                USD_MICRO, rounding=ROUND_DOWN
+            ),
+        )
+        if not self.sqlite_path.is_file():
+            return {
+                "true_live_equity_dec": free_dec,
+                "day_start_true_equity_dec": free_dec,
+                "today_realized_pnl_dec": Decimal("0"),
+            }
+        placeholders = ",".join("?" for _ in RISK_LOCKING_POSITION_STATUSES)
+        in_flight = Decimal("0")
+        total_locked = Decimal("0")
+        with self._connection() as con:
+            rows = con.execute(
+                f"SELECT position_status, total_spent_usdc FROM live_orders WHERE position_status IN ({placeholders})",
+                RISK_LOCKING_POSITION_STATUSES,
+            ).fetchall()
+            for r in rows:
+                spent = to_decimal(r["total_spent_usdc"] or 0.0, "total_spent_usdc")
+                pos_st = str(r["position_status"] or "OPEN")
+                if pos_st in IN_FLIGHT_POSITION_STATUSES:
+                    in_flight += spent
+                total_locked += spent
+            loss_stats = self._compute_loss_guard_in_tx(con, stamp)
+        avail_free = max(Decimal("0"), free_dec - in_flight)
+        true_eq = (avail_free + total_locked).quantize(USD_MICRO, rounding=ROUND_DOWN)
+        today_pnl = loss_stats["daily_realized_pnl_dec"]
+        day_start_eq = max(Decimal("0"), (true_eq - today_pnl).quantize(USD_MICRO, rounding=ROUND_DOWN))
+        return {
+            "true_live_equity_dec": true_eq,
+            "day_start_true_equity_dec": day_start_eq,
+            "today_realized_pnl_dec": today_pnl,
+        }
+
     def claim_and_reserve_signal(
         self,
         *,

@@ -37,7 +37,98 @@
     "paper_max_daily_realized_loss_usd": 190.35,
     "max_consecutive_losses": 4,
     "cooldown_minutes_after_consecutive_losses": 30,
-    "switch_to_full_deployment_note": "Unified $1,269 portfolio: use --scale 1.0 for 1:1 with $1,269 paper ($240 max order, $380 window budget, $650 open risk, -$190.35 daily loss stop)."
+    "switch_to_full_deployment_note": "Unified $1,269 portfolio: use --scale 1.0 for 1:1 with $1,269 paper ($240 max order, $380 window budget, $650 open risk, -$190.35 daily loss stop).",
+    "auto_equity_sizing": {
+      "enabled": true,
+      "apply_in_shadow": false,
+      "note": "Automatically scales bet size, window budget, daily stop, and stream orderbook caps from verified on-chain true equity (free pUSD + locked open cost). Zero manual config needed on deposits, withdrawals, or compounding across $200 -> $2,500 -> $10,000+.",
+      "tiers": [
+        {
+          "name": "TIER_1_SEED_UNDER_800",
+          "min_equity_usd": 0.0,
+          "single_stream_equity_fraction": 0.08,
+          "tick_equity_fraction": 0.16,
+          "daily_loss_fraction": 0.16,
+          "max_order_usd": 65.0,
+          "max_tick_budget_usd": 130.0,
+          "max_active_window_risk_usd": 180.0,
+          "max_open_risk_usd": 260.0,
+          "max_underlying_active_risk_usd": 130.0,
+          "max_underlying_open_risk_usd": 180.0,
+          "stream_max_order_usd": {
+            "BTC_15m": 65.0,
+            "BTC_5m": 65.0,
+            "ETH_15m": 65.0,
+            "ETH_5m": 65.0,
+            "SOL_15m": 45.0,
+            "SOL_5m": 45.0
+          }
+        },
+        {
+          "name": "TIER_2_GROWTH_800_TO_2500",
+          "min_equity_usd": 800.0,
+          "single_stream_equity_fraction": 0.08,
+          "tick_equity_fraction": 0.15,
+          "daily_loss_fraction": 0.15,
+          "max_order_usd": 240.0,
+          "max_tick_budget_usd": 380.0,
+          "max_active_window_risk_usd": 450.0,
+          "max_open_risk_usd": 650.0,
+          "max_underlying_active_risk_usd": 300.0,
+          "max_underlying_open_risk_usd": 450.0,
+          "stream_max_order_usd": {
+            "BTC_15m": 240.0,
+            "BTC_5m": 220.0,
+            "ETH_15m": 180.0,
+            "ETH_5m": 180.0,
+            "SOL_15m": 50.0,
+            "SOL_5m": 45.0
+          }
+        },
+        {
+          "name": "TIER_3_SCALE_2500_TO_7500",
+          "min_equity_usd": 2500.0,
+          "single_stream_equity_fraction": 0.05,
+          "tick_equity_fraction": 0.095,
+          "daily_loss_fraction": 0.10,
+          "max_order_usd": 320.0,
+          "max_tick_budget_usd": 520.0,
+          "max_active_window_risk_usd": 750.0,
+          "max_open_risk_usd": 1100.0,
+          "max_underlying_active_risk_usd": 480.0,
+          "max_underlying_open_risk_usd": 700.0,
+          "stream_max_order_usd": {
+            "BTC_15m": 320.0,
+            "BTC_5m": 280.0,
+            "ETH_15m": 200.0,
+            "ETH_5m": 190.0,
+            "SOL_15m": 50.0,
+            "SOL_5m": 45.0
+          }
+        },
+        {
+          "name": "TIER_4_INSTITUTIONAL_7500_PLUS",
+          "min_equity_usd": 7500.0,
+          "single_stream_equity_fraction": 0.035,
+          "tick_equity_fraction": 0.065,
+          "daily_loss_fraction": 0.07,
+          "max_order_usd": 400.0,
+          "max_tick_budget_usd": 650.0,
+          "max_active_window_risk_usd": 1100.0,
+          "max_open_risk_usd": 1600.0,
+          "max_underlying_active_risk_usd": 650.0,
+          "max_underlying_open_risk_usd": 950.0,
+          "stream_max_order_usd": {
+            "BTC_15m": 400.0,
+            "BTC_5m": 350.0,
+            "ETH_15m": 220.0,
+            "ETH_5m": 200.0,
+            "SOL_15m": 50.0,
+            "SOL_5m": 45.0
+          }
+        }
+      ]
+    }
   },
   "order_execution": {
     "order_type": "FAK",

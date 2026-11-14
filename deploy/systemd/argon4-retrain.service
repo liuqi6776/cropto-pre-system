@@ -1,0 +1,19 @@
+[Unit]
+Description=ARGON-4 Autonomous Rolling TWAP60 Model Retrainer & Gatekeeper
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+
+[Service]
+Type=oneshot
+User=liuqi
+Group=liuqi
+WorkingDirectory=/data/crypto-predict_system
+Nice=19
+IOSchedulingClass=idle
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="OMP_NUM_THREADS=1"
+Environment="OPENBLAS_NUM_THREADS=1"
+Environment="MKL_NUM_THREADS=1"
+ExecStart=/data/crypto-predict_system/.venv/bin/python -B /data/crypto-predict_system/scripts/auto_retrain_twap60.py --threads 2

@@ -5193,6 +5193,74 @@ def test_policy_hot_reload_and_dynamic_daily_loss_cap(tmp_path: Path) -> None:
         Decimal("1.0"), now_utc=datetime(2026, 11, 13, 2, 0, tzinfo=timezone.utc)
     )
     assert loss_cap_compounded == Decimal("360.000000")
+
+    # Verify 4-tier true on-chain auto_equity_sizing across deposits, open positions, and $10k institutional tier
+    live_cfg_full = json.loads((Path(__file__).resolve().parents[1] / "config/live_config.json").read_text(encoding="utf-8"))
+    auto_cfg = {**live_cfg_full["capital_and_scaling"]["auto_equity_sizing"], "apply_in_shadow": True}
+    engine.config["capital_and_scaling"]["auto_equity_sizing"] = auto_cfg
+    t_now = datetime(2026, 11, 13, 4, 0, tzinfo=timezone.utc)
+
+    # 1) $500 wallet -> TIER_1_SEED_UNDER_800 (8% = $40.00 order, $80.00 cohort budget)
+    sz_500 = engine.resolve_auto_equity_sizing(
+        onchain_free_usdc=500.0, balance_verified=True, stream="BTC_15m", scale_dec=Decimal("1.0"), now_utc=t_now
+    )
+    assert sz_500 is not None
+    assert sz_500["tier_name"] == "TIER_1_SEED_UNDER_800"
+    assert sz_500["target_stake_dec"] == Decimal("40.000000")
+
+    # 2) $1,600 wallet -> TIER_2_GROWTH_800_TO_2500 (8% = $128.00 order)
+    sz_1600 = engine.resolve_auto_equity_sizing(
+        onchain_free_usdc=1600.0, balance_verified=True, stream="BTC_15m", scale_dec=Decimal("1.0"), now_utc=t_now
+    )
+    assert sz_1600 is not None
+    assert sz_1600["tier_name"] == "TIER_2_GROWTH_800_TO_2500"
+    assert sz_1600["target_stake_dec"] == Decimal("128.000000")
+
+    # 3) $10,000 deposit -> TIER_4_INSTITUTIONAL_7500_PLUS (3.5% = $350.00 on BTC_15m, capped at $50.00 on SOL_15m!)
+    sz_10k_btc = engine.resolve_auto_equity_sizing(
+        onchain_free_usdc=10000.0, balance_verified=True, stream="BTC_15m", scale_dec=Decimal("1.0"), now_utc=t_now
+    )
+    sz_10k_sol = engine.resolve_auto_equity_sizing(
+        onchain_free_usdc=10000.0, balance_verified=True, stream="SOL_15m", scale_dec=Decimal("1.0"), now_utc=t_now
+    )
+    assert sz_10k_btc is not None and sz_10k_sol is not None
+    assert sz_10k_btc["tier_name"] == "TIER_4_INSTITUTIONAL_7500_PLUS"
+    assert sz_10k_btc["target_stake_dec"] == Decimal("350.000000")
+    assert sz_10k_sol["target_stake_dec"] == Decimal("50.000000")
+    assert sz_10k_btc["caps_override"]["max_open_risk_usd"] == 1600.0
+    assert sz_10k_btc["caps_override"]["max_active_window_risk_usd"] == 1100.0
+    assert sz_10k_btc["caps_override"]["max_underlying_active_risk_usd"] == 650.0
+
+    # Verify AuditStore.claim_and_reserve_signal honors TIER_4 expanded active/underlying caps ($350 not clamped to $300)
+    res_10k = audit.claim_and_reserve_signal(
+        signal_id="sig-tier4-10k-btc15",
+        cohort_id="2026-11-13T04:00:00+00:00",
+        stream="BTC_15m",
+        rank=1,
+        paper_order_id="paper-tier4-10k",
+        market_id="9991000",
+        condition_id="0x" + ("cd" * 32),
+        token_id="1234567890",
+        outcome="UP",
+        underlying="BTC",
+        window_start="2026-11-13T04:00:00+00:00",
+        window_end="2026-11-13T04:15:00+00:00",
+        claimed_at_utc=t_now,
+        approved_stake_usd=sz_10k_btc["target_stake_dec"],
+        live_scale_factor=Decimal("1.0"),
+        paper_caps={**caps_new, **sz_10k_btc["caps_override"]},
+        proxy_wallet_address="0x" + ("11" * 20),
+        onchain_free_usdc_balance=10000.0,
+        clob_allowance_usdc=10000.0,
+        balance_verified=True,
+        cohort_single_order_cap_usd=sz_10k_btc["cohort_budget_usd"],
+        max_daily_realized_loss_usd=sz_10k_btc["daily_loss_cap_dec"],
+        valid_until="2026-11-13T04:00:20+00:00",
+        hard_deadline_seconds=20.0,
+        calibrated_now_fn=lambda: t_now,
+    )
+    assert res_10k["claimed"] is True and res_10k["aborted"] is False
+    assert res_10k["reserved_stake_usd"] == Decimal("350.000000")
     observer.close()
 
 

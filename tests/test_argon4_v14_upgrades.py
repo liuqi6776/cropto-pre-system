@@ -3197,6 +3197,111 @@ def test_v14r20_audit_p1_5_large_33mib_observations_interior_tamper_and_delete_d
     assert revisions._is_valid_observations_prefix(live_db, snap_db) is False
 
 
+def test_v14r20_autonomous_retrain_gatekeeper_promotion_and_systemd_hygiene(tmp_path):
+    """Verify v14r20 full autonomous model retrainer + systemd & dashboard safety fixes:
+    1. build_rolling_fold dynamically extends valid_until (+95d) and isolates train/validation windows.
+    2. sync_runtime_raw_to_training_root merges hot-runtime parquets without duplicates.
+    3. evaluate_retrain_gatekeeper rejects degraded models and approves healthy models.
+    4. atomic_promote_and_pin_policy backs up old artifacts, promotes staged bundles, and pins policy.json.
+    5. systemd units use Wants= (no SIGTERM cascade on argon4-order), --no-janitor on archive sync,
+       and include argon4-retrain.{service,timer}; argon4_forward_server.py has no +800 balance distortion.
+    """
+    from scripts import auto_retrain_twap60 as ar
+    import joblib
+
+    # 1. Verify systemd & dashboard hygiene
+    order_unit = Path("deploy/systemd/argon4-order.service").read_text(encoding="utf-8")
+    assert "Wants=argon4-forward.service" in order_unit
+    assert "Requires=argon4-forward.service" not in order_unit
+
+    sync_unit = Path("deploy/systemd/argon4-archive-sync.service").read_text(encoding="utf-8")
+    assert "--no-janitor" in sync_unit
+    assert "IOSchedulingClass=idle" in sync_unit
+
+    retrain_unit = Path("deploy/systemd/argon4-retrain.service").read_text(encoding="utf-8")
+    retrain_timer = Path("deploy/systemd/argon4-retrain.timer").read_text(encoding="utf-8")
+    assert "auto_retrain_twap60.py" in retrain_unit
+    assert "OnCalendar=" in retrain_timer
+
+    server_src = Path("scripts/argon4_forward_server.py").read_text(encoding="utf-8")
+    assert "old_bal + 800.0" not in server_src
+
+    # 2. Verify build_rolling_fold dynamic horizon
+    fold = ar.build_rolling_fold("2027-02-15T10:00:00Z", validation_days=60, valid_horizon_days=95)
+    assert pd.Timestamp(fold["train_end"]) < pd.Timestamp(fold["validation_start"])
+    assert pd.Timestamp(fold["validation_start"]) < pd.Timestamp(fold["validation_end"])
+    assert pd.Timestamp(fold["valid_until"]) >= pd.Timestamp("2027-05-20T00:00:00Z")
+    assert fold["label_mode"] == "SPOT_TWAP60_BLEND"
+    assert fold["half_life_days"] == pytest.approx(270.0)
+
+    # 3. Verify incremental runtime -> training parquet sync
+    rt_raw = tmp_path / "rt_raw"
+    tr_raw = tmp_path / "tr_raw"
+    (rt_raw / "intraday").mkdir(parents=True)
+    (tr_raw / "intraday").mkdir(parents=True)
+    t_idx_old = pd.date_range("2026-11-01T00:00:00Z", periods=4, freq="5min")
+    t_idx_new = pd.date_range("2026-11-01T00:10:00Z", periods=4, freq="5min")
+    for s in model.SYMBOLS:
+        pd.DataFrame({
+            "date": t_idx_old, "open_time": t_idx_old, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5,
+            "volume": 10.0, "quote_volume": 1000.0, "count": 5.0, "taker_buy_base_volume": 5.0, "taker_buy_quote_volume": 500.0,
+        }).to_parquet(tr_raw / "intraday" / f"{s}_5m_futures.parquet", index=False)
+        pd.DataFrame({
+            "date": t_idx_new, "open_time": t_idx_new, "open": 102.0, "high": 103.0, "low": 101.0, "close": 102.5,
+            "volume": 12.0, "quote_volume": 1200.0, "count": 6.0, "taker_buy_base_volume": 6.0, "taker_buy_quote_volume": 600.0,
+        }).to_parquet(rt_raw / "intraday" / f"{s}_5m_futures.parquet", index=False)
+    counts = ar.sync_runtime_raw_to_training_root(rt_raw, tr_raw, fetch_network_gaps=False)
+    assert counts["BTCUSDT:5m"] == 6
+
+    # 4. Verify gatekeeper & atomic promotion
+    enabled = ["BTC_15m", "ETH_5m"]
+    bad_summary = {
+        "status": "COMPLETED",
+        "completed": [
+            {"stream": "BTC_15m", "saved_model_parity": "PASS", "validation_twap_accuracy": 0.560},
+            {"stream": "ETH_5m", "saved_model_parity": "PASS", "validation_twap_accuracy": 0.495},
+        ],
+    }
+    ok_bad, rsn_bad, _ = ar.evaluate_retrain_gatekeeper(bad_summary, enabled)
+    assert ok_bad is False and "STREAM_VAL_ACCURACY_BELOW_FLOOR" in rsn_bad
+
+    good_summary = {
+        "status": "COMPLETED",
+        "completed": [
+            {"stream": "BTC_15m", "saved_model_parity": "PASS", "validation_twap_accuracy": 0.572},
+            {"stream": "ETH_5m", "saved_model_parity": "PASS", "validation_twap_accuracy": 0.564},
+        ],
+    }
+    ok_good, rsn_good, stats_good = ar.evaluate_retrain_gatekeeper(good_summary, enabled)
+    assert ok_good is True and rsn_good == "GATEKEEPER_PASSED"
+    assert stats_good["mean_accuracy"] == pytest.approx(0.568)
+
+    stg = tmp_path / "staging_models"
+    live_m = tmp_path / "live_models"
+    (stg / "deployment_q4").mkdir(parents=True)
+    (live_m / "deployment_q4").mkdir(parents=True)
+    pol_p = tmp_path / "policy.json"
+    pol_p.write_text(json.dumps({"deployment_manifest_sha256": {"BTC_15m": "old_sha_1", "ETH_5m": "old_sha_2"}}), encoding="utf-8")
+
+    (live_m / "deployment_q4/BTC_15m.manifest.json").write_text('{"old": true}', encoding="utf-8")
+    for st in enabled:
+        jb = stg / f"deployment_q4/{st}.joblib"
+        joblib.dump({"dummy": st}, jb)
+        j_sha = model.sha256(jb)
+        mf = stg / f"deployment_q4/{st}.manifest.json"
+        mf.write_text(json.dumps({"stream": st, "model_sha256": j_sha}), encoding="utf-8")
+        m_sha = model.sha256(mf)
+        (stg / f"deployment_q4/{st}.manifest.json.sha256").write_text(m_sha + "\n", encoding="ascii")
+
+    promo = ar.atomic_promote_and_pin_policy(
+        staging_model_root=stg, live_model_root=live_m, policy_path=pol_p, wait_for_safe_window=False
+    )
+    updated_pol = json.loads(pol_p.read_text(encoding="utf-8"))
+    assert updated_pol["previous_deployment_manifest_sha256"]["BTC_15m"] == "old_sha_1"
+    assert updated_pol["deployment_manifest_sha256"] == promo["deployment_manifest_sha256"]
+    assert Path(promo["backup_dir"], "BTC_15m.manifest.json").is_file()
+
+
 
 
 

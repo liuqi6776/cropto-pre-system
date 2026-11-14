@@ -1,0 +1,10 @@
+[Unit]
+Description=Run ARGON-4 Autonomous Rolling TWAP60 Model Retrain Biweekly (1st & 3rd Sunday UTC)
+
+[Timer]
+OnCalendar=Sun *-*-01..07,15..21 03:20:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

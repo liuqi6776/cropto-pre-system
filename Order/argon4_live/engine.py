@@ -352,6 +352,107 @@ class LiveExecutionEngine:
                 )
         return daily_loss_cap, self.max_consecutive_losses, self.cooldown_minutes_after_consecutive_losses
 
+    def resolve_auto_equity_sizing(
+        self,
+        *,
+        onchain_free_usdc: float | Decimal | None,
+        balance_verified: bool,
+        stream: str,
+        scale_dec: Decimal,
+        now_utc: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Compute true-wallet-driven tiered order sizing and risk caps when enabled."""
+        cap_cfg = self.config.get("capital_and_scaling") or {}
+        auto_cfg = cap_cfg.get("auto_equity_sizing") if isinstance(cap_cfg, Mapping) else None
+        if not (isinstance(auto_cfg, Mapping) and auto_cfg.get("enabled") is True):
+            return None
+        clob_mode = str(getattr(self.clob, "mode", "live") or "live").lower()
+        if clob_mode != "live" and not bool(auto_cfg.get("apply_in_shadow", False)):
+            return None
+        if not balance_verified or onchain_free_usdc is None or not hasattr(self.audit, "get_live_equity_and_today_pnl"):
+            return None
+        tiers = auto_cfg.get("tiers")
+        if not isinstance(tiers, list) or not tiers:
+            return None
+
+        eq_info = self.audit.get_live_equity_and_today_pnl(onchain_free_usdc, now_utc=now_utc)
+        eff_eq = (eq_info["true_live_equity_dec"] * scale_dec).quantize(USD_MICRO, rounding=ROUND_DOWN)
+        eff_day_start = (eq_info["day_start_true_equity_dec"] * scale_dec).quantize(USD_MICRO, rounding=ROUND_DOWN)
+        if eff_eq <= Decimal("0"):
+            return None
+
+        ordered_tiers = sorted(
+            (t for t in tiers if isinstance(t, Mapping) and t.get("min_equity_usd") is not None),
+            key=lambda t: float(t["min_equity_usd"]),
+        )
+        if not ordered_tiers:
+            return None
+        selected_tier = ordered_tiers[0]
+        for t in ordered_tiers:
+            if eff_eq >= to_decimal(t["min_equity_usd"], "min_equity_usd"):
+                selected_tier = t
+
+        single_frac = to_decimal(selected_tier["single_stream_equity_fraction"], "single_stream_equity_fraction")
+        tick_frac = to_decimal(selected_tier["tick_equity_fraction"], "tick_equity_fraction")
+        loss_frac = to_decimal(selected_tier["daily_loss_fraction"], "daily_loss_fraction")
+        max_ord = to_decimal(selected_tier["max_order_usd"], "max_order_usd")
+        max_tick = to_decimal(selected_tier["max_tick_budget_usd"], "max_tick_budget_usd")
+        max_open = to_decimal(selected_tier["max_open_risk_usd"], "max_open_risk_usd")
+        max_und = to_decimal(selected_tier["max_underlying_open_risk_usd"], "max_underlying_open_risk_usd")
+        s_map = selected_tier.get("stream_max_order_usd")
+        stream_cap = (
+            min(max_ord, to_decimal(s_map[stream], "stream_max_order_usd"))
+            if isinstance(s_map, Mapping) and stream in s_map and s_map[stream] is not None
+            else max_ord
+        )
+        max_active = (
+            to_decimal(selected_tier["max_active_window_risk_usd"], "max_active_window_risk_usd")
+            if selected_tier.get("max_active_window_risk_usd") is not None
+            else max(max_tick, min(max_open, (max_open * Decimal("0.70")).quantize(Decimal("1"), rounding=ROUND_DOWN)))
+        )
+        max_und_active = (
+            to_decimal(selected_tier["max_underlying_active_risk_usd"], "max_underlying_active_risk_usd")
+            if selected_tier.get("max_underlying_active_risk_usd") is not None
+            else max(stream_cap, min(max_und, (max_und * Decimal("0.68")).quantize(Decimal("1"), rounding=ROUND_DOWN)))
+        )
+
+        daily_loss_cap = (
+            to_decimal(self.max_daily_loss_usd_override, "max_daily_realized_loss_usd")
+            if self.max_daily_loss_usd_override is not None
+            else (eff_day_start * loss_frac).quantize(USD_MICRO, rounding=ROUND_DOWN)
+        )
+        today_pnl = eq_info["today_realized_pnl_dec"]
+        rem_loss_room = (
+            max(Decimal("0"), (daily_loss_cap + today_pnl).quantize(USD_MICRO, rounding=ROUND_DOWN))
+            if today_pnl < Decimal("0")
+            else Decimal("1000000000")
+        )
+        target_stake = min(
+            (eff_eq * single_frac).quantize(USD_MICRO, rounding=ROUND_DOWN),
+            stream_cap,
+            rem_loss_room,
+        )
+        cohort_budget = min(
+            (eff_eq * tick_frac).quantize(USD_MICRO, rounding=ROUND_DOWN),
+            max_tick,
+            rem_loss_room,
+        )
+        return {
+            "tier_name": str(selected_tier.get("name") or "AUTO_TIER"),
+            "true_live_equity_usdc": float(eff_eq),
+            "target_stake_dec": max(Decimal("0"), target_stake),
+            "cohort_budget_usd": float(max(Decimal("0"), cohort_budget)),
+            "daily_loss_cap_dec": daily_loss_cap,
+            "caps_override": {
+                "max_order_usd": float(stream_cap),
+                "max_tick_budget_usd": float(max_tick),
+                "max_active_window_risk_usd": float(max_active),
+                "max_open_risk_usd": float(max_open),
+                "max_underlying_active_risk_usd": float(max_und_active),
+                "max_underlying_open_risk_usd": float(max_und),
+            },
+        }
+
     def _wait_retry_interval(self, seconds: float) -> bool:
         """Sleep up to `seconds` between bounded FAK retries; returns True if `stop_event` interrupted."""
         return bool(self.stop_event.wait(max(0.0, float(seconds))))
@@ -712,6 +813,25 @@ class LiveExecutionEngine:
             )
             effective_paper_caps = {**paper_caps, "max_order_usd": effective_stream_max_order}
 
+            eff_approved_stake = approved_stake_usd
+            eff_scale_dec = scale_dec
+            eff_cohort_budget = paper_cohort_budget
+            eff_daily_loss_cap = daily_loss_cap
+            auto_sz = self.resolve_auto_equity_sizing(
+                onchain_free_usdc=free_usdc,
+                balance_verified=bool(self.clob.balance_verified),
+                stream=stream,
+                scale_dec=scale_dec,
+                now_utc=live_detected_cal,
+            )
+            if auto_sz is not None:
+                eff_approved_stake = auto_sz["target_stake_dec"]
+                eff_scale_dec = Decimal("1.0")
+                desired_stake_usd = eff_approved_stake
+                effective_paper_caps = {**effective_paper_caps, **auto_sz["caps_override"]}
+                eff_cohort_budget = auto_sz["cohort_budget_usd"]
+                eff_daily_loss_cap = auto_sz["daily_loss_cap_dec"]
+
             reservation = self.audit.claim_and_reserve_signal(
                 signal_id=signal_id,
                 cohort_id=cohort_id,
@@ -726,15 +846,15 @@ class LiveExecutionEngine:
                 window_start=window_start,
                 window_end=window_end,
                 claimed_at_utc=live_detected_cal,
-                approved_stake_usd=approved_stake_usd,
-                live_scale_factor=scale_dec,
+                approved_stake_usd=eff_approved_stake,
+                live_scale_factor=eff_scale_dec,
                 paper_caps=effective_paper_caps,
                 proxy_wallet_address=self.clob.funder_address,
                 onchain_free_usdc_balance=free_usdc,
                 clob_allowance_usdc=allowance_usdc,
                 balance_verified=bool(self.clob.balance_verified),
-                cohort_single_order_cap_usd=paper_cohort_budget,
-                max_daily_realized_loss_usd=daily_loss_cap,
+                cohort_single_order_cap_usd=eff_cohort_budget,
+                max_daily_realized_loss_usd=eff_daily_loss_cap,
                 max_consecutive_losses=max_consec_losses,
                 cooldown_minutes_after_consecutive_losses=cooldown_mins,
                 market_protocol=market_protocol,
@@ -765,7 +885,7 @@ class LiveExecutionEngine:
                 reason = str(reservation.get("abort_status") or "ABORTED_RISK_GUARD")
                 now_iso = format_utc_iso(live_detected_cal)
                 live_exec = {
-                    "live_scale_factor": float(scale_dec),
+                    "live_scale_factor": float(eff_scale_dec),
                     "order_type": "FAK",
                     "limit_price": 0.51,
                     "requested_stake_usd": float(desired_stake_usd),
@@ -893,8 +1013,8 @@ class LiveExecutionEngine:
             try:
                 exec_bundle = self.clob.sign_and_execute_fak(
                     token_id=token_id,
-                    approved_stake_usd=approved_stake_usd,
-                    live_scale_factor=scale_dec,
+                    approved_stake_usd=eff_approved_stake,
+                    live_scale_factor=eff_scale_dec,
                     fee_rate=fee_rate,
                     clock_projection=eff_clock_proj,
                     quota_cap_usd=quota_cap,
@@ -923,7 +1043,7 @@ class LiveExecutionEngine:
                         "live_http_ack_at": now_abort_iso,
                         "clob_rtt_ms": 0.0,
                         "live_execution": {
-                            "live_scale_factor": float(scale_dec),
+                            "live_scale_factor": float(eff_scale_dec),
                             "order_type": "FAK",
                             "limit_price": 0.51,
                             "requested_stake_usd": float(quota_cap),
@@ -963,7 +1083,8 @@ class LiveExecutionEngine:
                 "market_protocol": market_protocol,
                 "neg_risk": neg_risk,
                 "fee_rate": fee_rate,
-                "approved_stake_usd": approved_stake_usd,
+                "approved_stake_usd": eff_approved_stake,
+                "eff_scale_dec": eff_scale_dec,
                 "quota_cap": quota_cap,
                 "clock_proj": eff_clock_proj,
                 "valid_until_str": valid_until_str,
@@ -1120,7 +1241,7 @@ class LiveExecutionEngine:
                     retry_bundle = self.clob.sign_and_execute_fak(
                         token_id=tid_raw,
                         approved_stake_usd=r_ctx["approved_stake_usd"],
-                        live_scale_factor=scale_dec,
+                        live_scale_factor=r_ctx["eff_scale_dec"],
                         fee_rate=r_ctx["fee_rate"],
                         clock_projection=r_ctx["clock_proj"],
                         quota_cap_usd=r_ctx["quota_cap"],
