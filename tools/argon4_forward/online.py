@@ -1163,7 +1163,7 @@ class OnlineInputs:
             "receipt_sha256": receipt.get("sha256"),
         }
 
-    def capture_spot_1m_twap60(self, symbol, boundary_utc=None, *, cohort_id=None, deadline_monotonic=None):
+    def capture_spot_1m_twap60(self, symbol, boundary_utc=None, *, cohort_id=None, deadline_monotonic=None, retry_delay_seconds=0.3):
         """Capture closed [T-1m, T) Binance spot 1m bar for Chainlink TWAP60 start-handicap guard."""
         if symbol not in ALL_SYMBOLS:
             raise ValueError("Unsupported symbol")
@@ -1179,30 +1179,39 @@ class OnlineInputs:
             "endTime": _ms(bound_ts),
             "limit": 2,
         }
-        if isinstance(self.client, PublicInputsHTTP):
-            payload, receipt = self.client.get(
-                "spot",
-                params,
-                deadline_monotonic=deadline_monotonic,
-                cohort_id=cohort_id,
-                receipt_clock=self.clock,
-                receipt_time_basis=self.time_basis,
-                receipt_clock_evidence=self.clock_evidence_sha256,
-            )
-        else:
-            payload, receipt = self.client.get("spot", params)
-        rows = payload if isinstance(payload, list) else []
         target_ms = _ms(bar_open)
         matched = None
-        for row in rows:
-            if isinstance(row, (list, tuple)) and len(row) >= 5:
-                try:
-                    open_ms = int(row[0])
-                except (TypeError, ValueError):
-                    continue
-                if open_ms == target_ms:
-                    matched = row
-                    break
+        receipt = {}
+        attempts = 0
+        for attempt in range(2):
+            attempts = attempt + 1
+            if isinstance(self.client, PublicInputsHTTP):
+                payload, receipt = self.client.get(
+                    "spot",
+                    params,
+                    deadline_monotonic=deadline_monotonic,
+                    cohort_id=cohort_id,
+                    receipt_clock=self.clock,
+                    receipt_time_basis=self.time_basis,
+                    receipt_clock_evidence=self.clock_evidence_sha256,
+                )
+            else:
+                payload, receipt = self.client.get("spot", params)
+            rows = payload if isinstance(payload, list) else []
+            for row in rows:
+                if isinstance(row, (list, tuple)) and len(row) >= 5:
+                    try:
+                        open_ms = int(row[0])
+                    except (TypeError, ValueError):
+                        continue
+                    if open_ms == target_ms:
+                        matched = row
+                        break
+            if matched is not None or attempt >= 1 or retry_delay_seconds <= 0:
+                break
+            if deadline_monotonic is not None and (deadline_monotonic - time.monotonic()) < (retry_delay_seconds + 0.15):
+                break
+            time.sleep(retry_delay_seconds)
         if matched is None:
             return {
                 "status": "MISSING_BAR",
@@ -1210,6 +1219,7 @@ class OnlineInputs:
                 "bar_open": _iso(bar_open),
                 "bound_ts": _iso(bound_ts),
                 "cohort_id": cohort_id,
+                "attempts": attempts,
                 "receipt_sha256": receipt.get("sha256"),
                 "received_at": receipt.get("received_at"),
             }

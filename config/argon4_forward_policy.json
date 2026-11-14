@@ -1,6 +1,6 @@
 {
   "status": "CONFIRMED",
-  "version": "argon4-local311-independent65-20261114-v15r1",
+  "version": "argon4-local311-independent65-20261114-v15r2-calibrated",
   "venue": "polymarket",
   "ranking_source": "USER_CONFIRMED_STAGE2_LOCAL_FROZEN_RAW_WIN_RATE; same saved local models; historical research evidence remains exploratory",
   "ranking_label": "第二阶段：本地原始胜率 BTC15 → ETH5 → ETH15 → BTC5 → SOL15 → SOL5",
@@ -27,14 +27,14 @@
   "max_underlying_active_risk_usd": 300,
   "max_underlying_open_risk_usd": 450,
   "max_buy_price": 0.525,
-  "min_buy_price": 0.47,
+  "min_buy_price": 0.46,
   "stream_min_buy_price": {
     "BTC_5m": 0.47,
     "ETH_5m": 0.47,
     "SOL_5m": 0.47,
-    "BTC_15m": 0.47,
-    "ETH_15m": 0.47,
-    "SOL_15m": 0.47
+    "BTC_15m": 0.46,
+    "ETH_15m": 0.46,
+    "SOL_15m": 0.46
   },
   "stream_max_order_usd": {
     "BTC_15m": 240,
@@ -266,13 +266,13 @@
       }
     ]
   },
-  "min_decision_delay_seconds": 0.8,
+  "min_decision_delay_seconds": 1.5,
   "input_http_min_spacing_seconds": 0.05,
   "engineering": {
     "enabled": true,
     "profile": "argon4-latency-v12",
     "window_poll_interval_seconds": 0.1,
-    "minimum_decision_delay_seconds": 0.8,
+    "minimum_decision_delay_seconds": 1.5,
     "input_deadline_after_boundary_seconds": 16.5,
     "input_ready_retry_interval_seconds": 0.15,
     "auxiliary_prefetch": true,
@@ -460,15 +460,15 @@
         {
           "min_delta_z": 0.0,
           "max_5m": 0.49,
-          "max_15m": 0.498
+          "max_15m": 0.5
         },
         {
-          "min_delta_z": 0.35,
-          "max_5m": 0.502,
+          "min_delta_z": 0.25,
+          "max_5m": 0.5,
           "max_15m": 0.51
         },
         {
-          "min_delta_z": 0.8,
+          "min_delta_z": 0.6,
           "max_5m": 0.51,
           "max_15m": 0.52
         }
@@ -484,14 +484,15 @@
       "marginal_max_buy_price": 0.49,
       "counter_15m_streak_min_bps": 45.0,
       "counter_15m_marginal_delta_z": 0.12,
-      "counter_15m_marginal_max_buy_price": 0.475,
+      "counter_15m_marginal_max_buy_price": 0.49,
       "counter_15m_marginal_action": "CAP_OR_SKIP"
     },
     "twap60_handicap_guard": {
       "enabled": true,
-      "max_5m_handicap_bps": 1.0,
-      "max_15m_handicap_bps": 2.0,
-      "timeout_seconds": 1.2,
+      "min_handicap_bps": -0.5,
+      "max_5m_handicap_bps": 2.2,
+      "max_15m_handicap_bps": 4.0,
+      "timeout_seconds": 1.5,
       "on_unavailable": "FAIL_CLOSED"
     },
     "action": "SKIP_OR_HALF_STAKE"

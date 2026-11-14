@@ -1555,6 +1555,8 @@ class AuditStore:
                 prior_redeemed_keys: set[str] = set()
                 prior_processed_batches: set[str] = set()
                 prior_payout_ratios: Mapping[str, Any] | None = None
+                prior_payout_conflict: bool = False
+                prior_unverified_payout_ratios: Any = None
 
                 if existing_settle is not None:
                     prior_redeemed_amount = float(existing_settle["redeemed_usdc_amount"] or 0.0)
@@ -1582,6 +1584,10 @@ class AuditStore:
                                         prior_processed_batches.add(str(b))
                                 if isinstance(parsed_pj.get("payout_ratios"), Mapping):
                                     prior_payout_ratios = dict(parsed_pj["payout_ratios"])
+                                if parsed_pj.get("payout_conflict") is True:
+                                    prior_payout_conflict = True
+                                if parsed_pj.get("unverified_payout_ratios") is not None:
+                                    prior_unverified_payout_ratios = parsed_pj.get("unverified_payout_ratios")
                                 if parsed_pj.get("redeem_tx_id"):
                                     prior_tx_id = str(parsed_pj["redeem_tx_id"])
                                 if not prior_tx_hash and parsed_pj.get("redeem_tx_hash"):
@@ -1641,9 +1647,29 @@ class AuditStore:
                 ).fetchall()
 
                 incoming_ratios = settlement_record.get("payout_ratios")
-                verified_prior_ratios = resolve_verified_payout_ratios(official_outcome, prior_payout_ratios)
-                candidate_ratios = incoming_ratios if incoming_ratios is not None else prior_payout_ratios
-                ratio_map = resolve_verified_payout_ratios(official_outcome, candidate_ratios)
+                incoming_conflict = bool(settlement_record.get("payout_conflict")) or (
+                    incoming_ratios is not None
+                    and resolve_verified_payout_ratios(official_outcome, incoming_ratios) is None
+                )
+                incoming_unverified = settlement_record.get("unverified_payout_ratios")
+                if incoming_unverified is None and incoming_conflict and incoming_ratios is not None:
+                    incoming_unverified = (
+                        dict(incoming_ratios) if isinstance(incoming_ratios, Mapping) else incoming_ratios
+                    )
+                verified_prior_ratios = (
+                    resolve_verified_payout_ratios(official_outcome, prior_payout_ratios)
+                    if prior_payout_ratios is not None
+                    else None
+                )
+                if incoming_conflict:
+                    ratio_map = None
+                elif incoming_ratios is not None:
+                    ratio_map = resolve_verified_payout_ratios(official_outcome, incoming_ratios)
+                elif prior_payout_conflict:
+                    ratio_map = None
+                else:
+                    candidate_ratios = prior_payout_ratios
+                    ratio_map = resolve_verified_payout_ratios(official_outcome, candidate_ratios)
                 if ratio_map is not None:
                     for order in orders:
                         pos_stat = str(order["position_status"])
@@ -1669,6 +1695,7 @@ class AuditStore:
                     cumulative_redeemed_amount = round(prior_redeemed_amount, 6)
                     live_realized_pnl = round(prior_pnl, 6)
                     settled_at = prior_settled_at or incoming_ts
+                    effective_conflict = bool(incoming_conflict or (incoming_ratios is None and prior_payout_conflict))
                     rec_to_save = dict(settlement_record)
                     rec_to_save["timestamp_utc"] = settled_at
                     rec_to_save["first_settled_at_utc"] = prior_first_settled_at or settled_at
@@ -1679,9 +1706,15 @@ class AuditStore:
                     rec_to_save["redeemed_usdc_amount"] = cumulative_redeemed_amount
                     rec_to_save["live_cost_usdc"] = live_cost_float
                     rec_to_save["live_realized_pnl_usdc"] = live_realized_pnl
+                    rec_to_save["payout_conflict"] = effective_conflict
+                    rec_to_save["unverified_payout_ratios"] = (
+                        incoming_unverified
+                        if incoming_unverified is not None
+                        else (prior_unverified_payout_ratios if effective_conflict else None)
+                    )
                     rec_to_save["payout_ratios"] = (
                         {k: float(v) for k, v in verified_prior_ratios.items()}
-                        if verified_prior_ratios is not None
+                        if (verified_prior_ratios is not None and not effective_conflict)
                         else None
                     )
                     rec_to_save["redeemed_order_keys"] = sorted(prior_redeemed_keys)
@@ -1916,6 +1949,8 @@ class AuditStore:
                 rec_to_save["live_cost_usdc"] = live_cost_float
                 rec_to_save["live_realized_pnl_usdc"] = live_realized_pnl
                 rec_to_save["payout_ratios"] = float_ratios
+                rec_to_save["payout_conflict"] = False
+                rec_to_save["unverified_payout_ratios"] = None
                 rec_to_save["redeemed_order_keys"] = sorted(redeemed_order_keys)
                 rec_to_save["processed_redemption_batches"] = sorted(processed_batches)
 

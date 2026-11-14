@@ -215,6 +215,22 @@ def _validate_complete_binary_payout_map(raw: Mapping[str, float]) -> dict[str, 
     return {"UP": round(up_val, 8), "DOWN": round(down_val, 8)}
 
 
+def payload_has_explicit_payout_fields(payload: Mapping[str, Any] | None) -> bool:
+    """Return True if payload explicitly carries any settlement payout vector field (valid or malformed)."""
+    if not isinstance(payload, Mapping):
+        return False
+    if payload.get("payout_ratios") is not None or payload.get("payoutRatios") is not None:
+        return True
+    if payload.get("payoutNumerators") is not None or payload.get("payout_numerators") is not None:
+        return True
+    tokens = payload.get("tokens")
+    if isinstance(tokens, list):
+        for tok in tokens:
+            if isinstance(tok, Mapping) and (tok.get("payout_ratio") is not None or tok.get("payout") is not None):
+                return True
+    return False
+
+
 def extract_payout_ratios_from_payload(
     payload: Mapping[str, Any] | None,
     *,
@@ -612,10 +628,14 @@ class UpstreamObserver:
                                 or ""
                             ).upper().strip()
                             if out in ("UP", "DOWN", "VOID"):
-                                ratios = extract_payout_ratios_from_payload(item)
-                                if ratios is None and isinstance(item.get("resolution"), Mapping):
-                                    ratios = extract_payout_ratios_from_payload(item["resolution"])
-                                if ratios is None and out in ("UP", "DOWN"):
+                                res_sub = item.get("resolution") if isinstance(item.get("resolution"), Mapping) else None
+                                has_explicit_payout = payload_has_explicit_payout_fields(item) or payload_has_explicit_payout_fields(res_sub)
+                                ratios: Mapping[str, Any] | None = extract_payout_ratios_from_payload(item)
+                                if ratios is None and res_sub is not None:
+                                    ratios = extract_payout_ratios_from_payload(res_sub)
+                                if ratios is None and has_explicit_payout:
+                                    ratios = {"_invalid_explicit_payout": True}
+                                elif ratios is None and out in ("UP", "DOWN"):
                                     ratios = {"UP": 1.0, "DOWN": 0.0} if out == "UP" else {"UP": 0.0, "DOWN": 1.0}
                                 if ratios is None and out == "VOID":
                                     ratios = self.fetch_official_market_payout_ratios(
@@ -640,7 +660,8 @@ class UpstreamObserver:
                 if resp.status_code == 200:
                     mkt = resp.json()
                     if _is_market_officially_finalized(mkt):
-                        clob_ratios = extract_payout_ratios_from_payload(mkt, allow_outcome_prices=False)
+                        has_explicit_clob_payout = payload_has_explicit_payout_fields(mkt)
+                        clob_ratios: Mapping[str, Any] | None = extract_payout_ratios_from_payload(mkt, allow_outcome_prices=False)
                         tokens = mkt.get("tokens")
                         if isinstance(tokens, list):
                             winning_tokens = [
@@ -659,7 +680,9 @@ class UpstreamObserver:
                                 else:
                                     winner = raw_out
                                 if winner in ("UP", "DOWN", "VOID"):
-                                    if clob_ratios is None and winner in ("UP", "DOWN"):
+                                    if clob_ratios is None and has_explicit_clob_payout:
+                                        clob_ratios = {"_invalid_explicit_payout": True}
+                                    elif clob_ratios is None and winner in ("UP", "DOWN"):
                                         clob_ratios = {"UP": 1.0, "DOWN": 0.0} if winner == "UP" else {"UP": 0.0, "DOWN": 1.0}
                                     return {
                                         "market_id": str(market_id),
@@ -693,7 +716,8 @@ class UpstreamObserver:
                     gm = resp.json()
                     if _is_market_officially_finalized(gm):
                         res_block = gm.get("resolution") if isinstance(gm.get("resolution"), Mapping) else {}
-                        gamma_ratios = extract_payout_ratios_from_payload(gm, allow_outcome_prices=False)
+                        has_explicit_gamma_payout = payload_has_explicit_payout_fields(gm) or payload_has_explicit_payout_fields(res_block)
+                        gamma_ratios: Mapping[str, Any] | None = extract_payout_ratios_from_payload(gm, allow_outcome_prices=False)
                         if gamma_ratios is None and res_block:
                             gamma_ratios = extract_payout_ratios_from_payload(res_block, allow_outcome_prices=False)
 
@@ -711,7 +735,9 @@ class UpstreamObserver:
                                 if explicit_out in ("UP", "YES")
                                 else ("DOWN" if explicit_out in ("DOWN", "NO") else explicit_out)
                             )
-                            if gamma_ratios is None and winner in ("UP", "DOWN"):
+                            if gamma_ratios is None and has_explicit_gamma_payout:
+                                gamma_ratios = {"_invalid_explicit_payout": True}
+                            elif gamma_ratios is None and winner in ("UP", "DOWN"):
                                 gamma_ratios = {"UP": 1.0, "DOWN": 0.0} if winner == "UP" else {"UP": 0.0, "DOWN": 1.0}
                             return {
                                 "market_id": str(market_id),

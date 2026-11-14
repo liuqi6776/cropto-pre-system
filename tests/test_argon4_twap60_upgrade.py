@@ -160,8 +160,10 @@ def test_policy_twap60_handicap_guard_and_manifest_pins():
     policy = json.loads(policy_path.read_text(encoding="utf-8"))
     hcap_cfg = policy["volatility_regime_guard"]["twap60_handicap_guard"]
     assert hcap_cfg["enabled"] is True
-    assert hcap_cfg["max_5m_handicap_bps"] == 1.0
-    assert hcap_cfg["max_15m_handicap_bps"] == 2.0
+    assert hcap_cfg["min_handicap_bps"] == -0.5
+    assert hcap_cfg["max_5m_handicap_bps"] == 2.2
+    assert hcap_cfg["max_15m_handicap_bps"] == 4.0
+    assert hcap_cfg["timeout_seconds"] == 1.5
     assert hcap_cfg["on_unavailable"] == "FAIL_CLOSED"
     pins = policy["deployment_manifest_sha256"]
     assert len(pins) == 7
@@ -171,13 +173,18 @@ def test_policy_twap60_handicap_guard_and_manifest_pins():
         pytest.skip("source-only checkout without local model binaries")
 
     for stream, expected_sha in pins.items():
-        bundle = model.load_model_bundle(stream, "deployment_q4", expected_manifest_sha256=expected_sha)
-        assert bundle["manifest_sha256"] == expected_sha
-        fold_meta = bundle["manifest"]["fold"]
+        manifest_path = q4 / f"{stream}.manifest.json"
+        assert model.sha256(manifest_path) == expected_sha
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("sklearn_version") == model.sklearn.__version__:
+            bundle = model.load_model_bundle(stream, "deployment_q4", expected_manifest_sha256=expected_sha)
+            assert bundle["manifest_sha256"] == expected_sha
+            manifest = bundle["manifest"]
+        fold_meta = manifest["fold"]
         assert pd.Timestamp(fold_meta["valid_until"]) >= pd.Timestamp("2027-02-01T00:00:00Z")
         assert fold_meta["label_mode"] == "SPOT_TO_TWAP60_PURE"
         assert fold_meta["half_life_days"] == 270.0
-        assert bundle["manifest"]["sample_weight_policy"] == "exponential_decay_half_life_270.0d"
+        assert manifest["sample_weight_policy"] == "exponential_decay_half_life_270.0d"
 
 
 def test_twap60_handicap_guard_fail_closed_on_unavailable_and_pipeline_pass2(tmp_path, monkeypatch):
@@ -303,5 +310,172 @@ def test_twap60_handicap_guard_fail_closed_on_unavailable_and_pipeline_pass2(tmp
         assert d_ok["BTC_5m"]["prediction"]["spot_1m_receipt_sha256"] == "c" * 64
     finally:
         pipe.close()
+
+
+def test_v15r2_calibrated_min_handicap_spot1m_retry_and_post_feature_recovery(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    import time as time_mod
+    from types import SimpleNamespace
+    from tools.argon4_forward import account, online, pipeline
+
+    policy = json.loads((model.ROOT / "config" / "argon4_forward_policy.json").read_text(encoding="utf-8"))
+    vg = policy["volatility_regime_guard"]
+    pred_up = {"stream": "BTC_5m", "side": "UP", "selected": True, "z_v4": 2.00, "threshold_frozen": 1.70}
+
+    # 1) Bull-trap tailwind guard: handicap < -0.5 bps is blocked by TWAP60_MIN_HANDICAP_GUARD
+    #    For UP: handicap_bps = 10000 * (twap60 - spot_close) / spot_close
+    #    twap60 = 89991.0, spot_close = 90000.0 -> handicap_bps = -1.0 bps < -0.5 bps -> BLOCKED
+    res_tailwind_trap = model_v14.apply_volatility_regime_guard(
+        "BTC_5m",
+        pred_up,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-14T06:00:00+00:00",
+        spot_twap60_t=89991.0,
+        spot_close_t=90000.0,
+    )
+    assert res_tailwind_trap["selected"] is False
+    assert res_tailwind_trap["volatility_regime_reason"] == "TWAP60_MIN_HANDICAP_GUARD"
+    assert res_tailwind_trap["ex_ante_twap60_handicap_bps"] == pytest.approx(-1.0)
+
+    # Mild flat/tailwind -0.3 bps (>= -0.5) and sweet-spot +2.0 bps (<= 2.2 on 5m) & +3.8 bps (<= 4.0 on 15m) pass!
+    res_flat_ok = model_v14.apply_volatility_regime_guard(
+        "BTC_5m",
+        pred_up,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-14T06:00:00+00:00",
+        spot_twap60_t=89997.3,
+        spot_close_t=90000.0,
+    )
+    assert res_flat_ok["selected"] is True
+
+    res_5m_sweet = model_v14.apply_volatility_regime_guard(
+        "BTC_5m",
+        pred_up,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-14T06:00:00+00:00",
+        spot_twap60_t=90018.0,  # +2.0 bps <= 2.2 bps
+        spot_close_t=90000.0,
+    )
+    assert res_5m_sweet["selected"] is True
+
+    res_5m_over = model_v14.apply_volatility_regime_guard(
+        "BTC_5m",
+        pred_up,
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-14T06:00:00+00:00",
+        spot_twap60_t=90027.0,  # +3.0 bps > 2.2 bps on 5m
+        spot_close_t=90000.0,
+    )
+    assert res_5m_over["selected"] is False
+    assert res_5m_over["volatility_regime_reason"] == "TWAP60_START_HANDICAP_GUARD"
+
+    res_15m_sweet = model_v14.apply_volatility_regime_guard(
+        "BTC_15m",
+        {**pred_up, "stream": "BTC_15m"},
+        ex_ante_rv12_bps=10.0,
+        guard_config=vg,
+        cohort_time="2026-11-14T06:00:00+00:00",
+        spot_twap60_t=90027.0,  # +3.0 bps <= 4.0 bps on 15m!
+        spot_close_t=90000.0,
+    )
+    assert res_15m_sweet["selected"] is True
+
+    # 2) OnlineInputs.capture_spot_1m_twap60 retries once when first GET misses the closed 1m bar
+    bound = pd.Timestamp("2026-11-14T06:00:00Z")
+    bar_open_ms = int((bound - pd.Timedelta(minutes=1)).timestamp() * 1000)
+    calls = []
+
+    class _LaggingSpotClient:
+        def get(self, kind, params=None):
+            calls.append(kind)
+            if len(calls) == 1:
+                return [], {"sha256": "1" * 64, "received_at": "2026-11-14T06:00:01Z"}
+            return [
+                [bar_open_ms, "90000.0", "90020.0", "89990.0", "90002.0", "12.0"]
+            ], {"sha256": "2" * 64, "received_at": "2026-11-14T06:00:01.35Z"}
+
+    inp = online.OnlineInputs(tmp_path / "rt_spot_retry", client=_LaggingSpotClient(), clock=lambda: bound + pd.Timedelta(seconds=1.5))
+    obs_retry = inp.capture_spot_1m_twap60(
+        "BTCUSDT",
+        bound,
+        cohort_id=bound.isoformat(),
+        deadline_monotonic=time_mod.monotonic() + 2.0,
+        retry_delay_seconds=0.01,
+    )
+    assert len(calls) == 2
+    assert obs_retry["status"] == "OBSERVED"
+    assert obs_retry["spot_close"] == pytest.approx(90002.0)
+    assert obs_retry["receipt_sha256"] == "2" * 64
+
+    # 3) ForwardPipeline._score_decisions recovers when pre-feature spot_1m returned MISSING_BAR
+    cohort = datetime(2026, 11, 14, 6, 0, 0, tzinfo=timezone.utc)
+    now_t = cohort + pd.Timedelta(seconds=2.5)
+    rt = tmp_path / "rt_post_feat_recover"
+    rt.mkdir(parents=True, exist_ok=True)
+    acc = account.Account(rt / "paper.sqlite3", initial_capital=1000, started_at=cohort - pd.Timedelta(minutes=5))
+    obs_store = SimpleNamespace(save=lambda *_a, **_k: None, path=str(rt / "obs.sqlite3"))
+    pipe = pipeline.ForwardPipeline(acc, rt, obs_store)
+    try:
+        pipe.clock = {
+            "status": "CALIBRATED",
+            "uncertainty_seconds": 0.05,
+            "server_minus_local_seconds": 0.0,
+            "calibrated_monotonic": 1e9,
+            "observed_at": cohort.isoformat(),
+            "receipt_sha256": "a" * 64,
+        }
+        monkeypatch.setattr(pipeline, "calibrated_now", lambda _c, upper=True: now_t)
+        idx_bar = pd.DatetimeIndex([cohort - pd.Timedelta(minutes=5)])
+        fake_frames = {
+            "BTCUSDT": {
+                "base": pd.DataFrame({"open": [90000.0], "close": [90005.0]}, index=idx_bar),
+                "expert": pd.DataFrame({"x": [1.0]}, index=idx_bar),
+            }
+        }
+        pipe.bundles = {"BTC_5m": {"bundle": "stub"}}
+        spot_seq = [
+            {"status": "MISSING_BAR", "symbol": "BTCUSDT"},
+            {"status": "OBSERVED", "twap60": 90009.0, "spot_close": 90000.0, "receipt_sha256": "f" * 64},
+        ]
+        spot_calls = []
+
+        def _fake_capture(sym, *_a, **_kw):
+            spot_calls.append(sym)
+            return dict(spot_seq[min(len(spot_calls) - 1, len(spot_seq) - 1)])
+
+        pipe.inputs = SimpleNamespace(capture_spot_1m_twap60=_fake_capture)
+        fake_snap = SimpleNamespace(build=lambda sym, **_kw: fake_frames[sym])
+        scored = pipe._score_decisions(
+            {"order": ["BTC_5m"], "volatility_regime_guard": vg},
+            {"data_root": None},
+            cohort,
+            {"disabled_streams": set()},
+            now_t,
+            now_t,
+            {},
+            {},
+            fake_snap,
+            None,
+            lambda s, *_a, **_kw: {
+                "stream": s,
+                "side": "UP",
+                "selected": True,
+                "z_v4": 2.0,
+                "threshold_frozen": 1.7,
+                "model_version": "m_v15r2_cal",
+                "model_sha256": "b" * 64,
+            },
+        )
+        assert len(spot_calls) == 2
+        assert scored["BTC_5m"]["status"] == "SIGNAL"
+        assert scored["BTC_5m"]["prediction"]["spot_1m_receipt_sha256"] == "f" * 64
+        assert scored["BTC_5m"]["prediction"]["ex_ante_twap60_handicap_bps"] == pytest.approx(1.0)
+    finally:
+        pipe.close()
+
 
 

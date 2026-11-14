@@ -728,7 +728,7 @@ def test_v14r4_snapshots_only_large_observations_hardlink_chained_delta_and_acti
 
     # Verify production policy has both empirical guards enabled and MonitorAuditLogger formats both
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == 0.47
+    assert policy["min_buy_price"] == 0.46
     assert policy["volatility_regime_guard"]["enabled"] is True
     assert policy["volatility_regime_guard"]["min_rv12_bps"]["BTC_5m"] == 3.0
 
@@ -777,7 +777,7 @@ def test_v14r5_multilevel_orderbook_adverse_selection_guard_and_immediate_skip_w
     from tools.argon4_forward.execution import PaperExecutor
 
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == 0.47
+    assert policy["min_buy_price"] == 0.46
     assert policy["max_buy_price"] == 0.525
     assert policy["execution"]["multi_look_ioc"] is False
 
@@ -1446,9 +1446,9 @@ def test_v14r11_us_open_blackout_macro_trend_guard_and_stream_min_buy_0425(tmp_p
         "BTC_5m": 0.47,
         "ETH_5m": 0.47,
         "SOL_5m": 0.47,
-        "BTC_15m": 0.47,
-        "ETH_15m": 0.47,
-        "SOL_15m": 0.47,
+        "BTC_15m": 0.46,
+        "ETH_15m": 0.46,
+        "SOL_15m": 0.46,
     }
     vg = policy["volatility_regime_guard"]
     assert vg["us_open_blackout"]["enabled"] is True
@@ -1618,9 +1618,9 @@ def test_v14r12_audit_remediations_bleed_cap_stream_max_order_1h_retry_and_fast_
     from tools.argon4_forward.runtime_profile import engineering_profile
 
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == pytest.approx(0.47)
-    assert policy["stream_min_buy_price"]["BTC_15m"] == pytest.approx(0.47)
-    assert policy["stream_min_buy_price"]["SOL_15m"] == pytest.approx(0.47)
+    assert policy["min_buy_price"] == pytest.approx(0.46)
+    assert policy["stream_min_buy_price"]["BTC_15m"] == pytest.approx(0.46)
+    assert policy["stream_min_buy_price"]["SOL_15m"] == pytest.approx(0.46)
     assert policy["stream_max_order_usd"] == {
         "BTC_15m": 240,
         "BTC_5m": 220,
@@ -1632,9 +1632,9 @@ def test_v14r12_audit_remediations_bleed_cap_stream_max_order_1h_retry_and_fast_
     eng = engineering_profile(policy)
     assert eng["enabled"] is True
     assert policy["input_http_min_spacing_seconds"] == pytest.approx(0.05)
-    assert policy["min_decision_delay_seconds"] == pytest.approx(0.8)
+    assert policy["min_decision_delay_seconds"] == pytest.approx(1.5)
     assert eng["window_poll_interval_seconds"] == pytest.approx(0.1)
-    assert eng["minimum_decision_delay_seconds"] == pytest.approx(0.8)
+    assert eng["minimum_decision_delay_seconds"] == pytest.approx(1.5)
     assert eng["input_deadline_after_boundary_seconds"] == pytest.approx(16.5)
     assert eng["input_ready_retry_interval_seconds"] == pytest.approx(0.15)
     assert eng["prefetch_lead_seconds"] == pytest.approx(9.5)
@@ -1917,7 +1917,7 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         own_streak_3bar=-3,
     )
     assert res_sol_prod["selected"] is True
-    assert res_sol_prod["effective_max_buy_price"] == pytest.approx(0.475)
+    assert res_sol_prod["effective_max_buy_price"] == pytest.approx(0.49)
     assert res_sol_prod["price_tier_reason"] == "MARGINAL_AGAINST_15M_STREAK"
 
     # True black-swan liquidation waterfall on SOL (-4.25% 1h or -260 bps 15m) is blocked by production vg
@@ -2003,7 +2003,7 @@ def test_v14r14_own_asset_guard_min_depth_recheck_and_tiered_buy_price(tmp_path)
         own_streak_3bar=3,
     )
     assert res_eth5_marginal["selected"] is True
-    assert res_eth5_marginal["effective_max_buy_price"] == pytest.approx(0.475)
+    assert res_eth5_marginal["effective_max_buy_price"] == pytest.approx(0.49)
     assert res_eth5_marginal["price_tier_reason"] == "MARGINAL_AGAINST_15M_STREAK"
 
     eth_strong = {
@@ -2711,7 +2711,7 @@ def test_v14r18_precision_guards_nyse_holiday_and_policy_hygiene():
         return seen
 
     policy = json.loads(raw_policy_text, object_pairs_hook=_reject_dup_keys)
-    assert policy["min_decision_delay_seconds"] == pytest.approx(0.8)
+    assert policy["min_decision_delay_seconds"] == pytest.approx(1.5)
     vg = policy["volatility_regime_guard"]
     assert vg["max_rv12_bps"]["SOL_15m"] == pytest.approx(42.0)
     assert vg["max_rv12_bps"]["SOL_5m"] == pytest.approx(42.0)
@@ -3348,18 +3348,22 @@ def test_v14r24_four_structural_alpha_laws_and_midwindow_settle_reconciler(tmp_p
 
     # 1. Policy assertions: all 4 structural laws + anti-overfitting non-changes
     policy = json.loads(Path("config/argon4_forward_policy.json").read_text(encoding="utf-8"))
-    assert policy["min_buy_price"] == pytest.approx(0.47)
+    assert policy["min_buy_price"] == pytest.approx(0.46)
     assert policy["max_buy_price"] == pytest.approx(0.525)
     assert all(
         policy["stream_min_buy_price"][st] == pytest.approx(0.47)
-        for st in ("BTC_15m", "ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m")
+        for st in ("BTC_5m", "ETH_5m", "SOL_5m")
+    )
+    assert all(
+        policy["stream_min_buy_price"][st] == pytest.approx(0.46)
+        for st in ("BTC_15m", "ETH_15m", "SOL_15m")
     )
     assert policy["execution_stage"]["enabled_streams"] == [
         "BTC_15m", "ETH_5m", "ETH_15m", "BTC_5m", "SOL_15m", "SOL_5m"
     ]
     assert policy["execution"]["multi_look_ioc"] is False
-    assert policy["min_decision_delay_seconds"] == pytest.approx(0.8)
-    assert policy["engineering"]["minimum_decision_delay_seconds"] == pytest.approx(0.8)
+    assert policy["min_decision_delay_seconds"] == pytest.approx(1.5)
+    assert policy["engineering"]["minimum_decision_delay_seconds"] == pytest.approx(1.5)
     vg = policy["volatility_regime_guard"]
     assert vg["twap60_handicap_guard"]["on_unavailable"] == "FAIL_CLOSED"
     assert vg["us_open_blackout"]["enabled"] is True
@@ -3571,14 +3575,14 @@ def test_v15_confidence_tiers_freshness_veto_and_lookback_parity(tmp_path, monke
     assert policy["live_enabled"] is False
     assert policy["execution_freshness_guard"]["enabled"] is True
 
-    # 1. Verify 3-tier delta_z + BTC_15m top tier 0.525
+    # 1. Verify 3-tier delta_z ($0.01 tick-aligned) + BTC_15m top tier 0.525
     cases = [
-        ("ETH_5m", 1.80, 1.70, 0.490, "CONFIDENCE_TIER_1_5M"),    # delta_z = 0.10
-        ("ETH_5m", 2.15, 1.70, 0.502, "CONFIDENCE_TIER_2_5M"),    # delta_z = 0.45
-        ("ETH_5m", 2.60, 1.70, 0.510, "CONFIDENCE_TIER_3_5M"),    # delta_z = 0.90
-        ("BTC_15m", 1.80, 1.70, 0.498, "CONFIDENCE_TIER_1_15M"),  # delta_z = 0.10
-        ("BTC_15m", 2.20, 1.70, 0.510, "CONFIDENCE_TIER_2_15M"),  # delta_z = 0.50
-        ("BTC_15m", 2.55, 1.70, 0.520, "CONFIDENCE_TIER_3_15M"),  # delta_z = 0.85
+        ("ETH_5m", 1.80, 1.70, 0.490, "CONFIDENCE_TIER_1_5M"),    # delta_z = 0.10 (< 0.25)
+        ("ETH_5m", 2.05, 1.70, 0.500, "CONFIDENCE_TIER_2_5M"),    # delta_z = 0.35 (>= 0.25)
+        ("ETH_5m", 2.40, 1.70, 0.510, "CONFIDENCE_TIER_3_5M"),    # delta_z = 0.70 (>= 0.60)
+        ("BTC_15m", 1.80, 1.70, 0.500, "CONFIDENCE_TIER_1_15M"),  # delta_z = 0.10 (< 0.25)
+        ("BTC_15m", 2.05, 1.70, 0.510, "CONFIDENCE_TIER_2_15M"),  # delta_z = 0.35 (>= 0.25)
+        ("BTC_15m", 2.40, 1.70, 0.520, "CONFIDENCE_TIER_3_15M"),  # delta_z = 0.70 (>= 0.60)
         ("BTC_15m", 2.85, 1.70, 0.525, "CONFIDENCE_STREAM_TOP_TIER_BTC_15m"),  # delta_z = 1.15 >= 1.00
     ]
     for st, zv, th, exp_cap, exp_reason in cases:
@@ -3739,7 +3743,7 @@ def test_v15r2_paper_live_max_buy_price_consistency_and_threshold_override_tier_
             "model_sha256": "a" * 64,
         },
     )
-    z_holder = {"z": 1.30}  # Above base_th=1.00 by +0.30 (< 0.35 Tier 2 cutoff!), so baseline is Tier 1 (0.498 on 15m)
+    z_holder = {"z": 1.20}  # Above base_th=1.00 by +0.20 (< 0.25 Tier 2 cutoff!), so baseline is Tier 1 (0.500 on 15m)
     res_base = model_v14.predict_stream_v14(
         "BTC_15m",
         None,
@@ -3756,18 +3760,18 @@ def test_v15r2_paper_live_max_buy_price_consistency_and_threshold_override_tier_
         None,
         None,
         BOUNDARY,
-        threshold_override=0.92,  # Without base_threshold_frozen isolation, 1.30 - 0.92 = 0.38 >= 0.35 would jump to 0.510!
+        threshold_override=0.92,  # Without base_threshold_frozen isolation, 1.20 - 0.92 = 0.28 >= 0.25 would jump to 0.510!
         ex_ante_rv12_bps=10.0,
         volatility_regime_guard=vg,
         cohort_time="2026-11-14T06:00:00+00:00",
         spot_twap60_t=90000.0,
         spot_close_t=90000.0,
     )
-    assert res_base["effective_max_buy_price"] == pytest.approx(0.498)
+    assert res_base["effective_max_buy_price"] == pytest.approx(0.500)
     assert res_lowered["base_threshold_frozen"] == pytest.approx(1.00)
     assert res_lowered["threshold_frozen"] == pytest.approx(0.92)
-    assert res_lowered["signal_excess_z"] == pytest.approx(0.30)
-    assert res_lowered["effective_max_buy_price"] == pytest.approx(0.498)
+    assert res_lowered["signal_excess_z"] == pytest.approx(0.20)
+    assert res_lowered["effective_max_buy_price"] == pytest.approx(0.500)
     assert res_lowered["price_tier_reason"] == "CONFIDENCE_TIER_1_15M"
 
     # Sub-baseline marginal signal (0.92 <= 0.95 < 1.00) admitted via threshold_override -> capped at 0.485!

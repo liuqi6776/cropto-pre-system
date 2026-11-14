@@ -821,7 +821,9 @@ class ForwardPipeline:
         if hcap_guard_enabled and hasattr(self.inputs, "capture_spot_1m_twap60"):
             needed_s1_syms = []
             for _st, _und, _dur, sym, _raw_sc, sc in staged:
-                if sc.get("selected") is True and sym not in needed_s1_syms and sym not in spot_1m_cache:
+                cached_s1 = spot_1m_cache.get(sym)
+                needs_s1 = cached_s1 is None or (isinstance(cached_s1, dict) and cached_s1.get("status") == "MISSING_BAR")
+                if sc.get("selected") is True and sym not in needed_s1_syms and needs_s1:
                     needed_s1_syms.append(sym)
             if needed_s1_syms:
                 if len(needed_s1_syms) == 1:

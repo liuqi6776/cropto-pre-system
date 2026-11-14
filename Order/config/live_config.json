@@ -135,7 +135,7 @@
     "allow_resting_orders": false,
     "protocol_version_default": "v2",
     "max_buy_price": 0.525,
-    "min_buy_price": 0.47,
+    "min_buy_price": 0.46,
     "default_tick_size": "0.01",
     "tick_size_limit_prices": {
       "0.01": 0.52,

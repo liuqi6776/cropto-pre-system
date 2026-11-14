@@ -59,6 +59,7 @@ from .upstream_observer import (
     PolicyVerificationError,
     UpstreamObserver,
     extract_payout_ratios_from_payload,
+    payload_has_explicit_payout_fields,
 )
 
 logger = logging.getLogger("argon4_live.engine")
@@ -1739,19 +1740,64 @@ class LiveExecutionEngine:
             else any(bool(o.get("neg_risk")) for o in live_orders)
         )
         existing_settlement = self.audit.get_settlement_record(market_id)
+        prior_payout_conflict = bool(
+            isinstance(existing_settlement, Mapping) and existing_settlement.get("payout_conflict")
+        )
+        prior_unverified_ratios = (
+            existing_settlement.get("unverified_payout_ratios")
+            if isinstance(existing_settlement, Mapping)
+            else None
+        )
         eff_payout_ratios: Mapping[str, Any] | None = None
+        redeem_payout_ratios: Mapping[str, Any] | None = None
+        payout_conflict = False
+        unverified_payout_ratios: Any = None
         if payout_ratios is not None:
-            if resolve_verified_payout_ratios(official_outcome, payout_ratios) is not None:
-                eff_payout_ratios = payout_ratios
+            verified_in = resolve_verified_payout_ratios(official_outcome, payout_ratios)
+            if verified_in is not None:
+                eff_payout_ratios = {k: float(v) for k, v in verified_in.items()}
+                redeem_payout_ratios = eff_payout_ratios
+            else:
+                payout_conflict = True
+                unverified_payout_ratios = (
+                    dict(payout_ratios) if isinstance(payout_ratios, Mapping) else payout_ratios
+                )
+                redeem_payout_ratios = (
+                    payout_ratios
+                    if (isinstance(payout_ratios, Mapping) and bool(payout_ratios))
+                    else {"_unverified_payout_ratios": True}
+                )
         else:
-            if isinstance(existing_settlement, Mapping):
+            if isinstance(existing_settlement, Mapping) and not prior_payout_conflict:
                 existing_pr = existing_settlement.get("payout_ratios")
-                if resolve_verified_payout_ratios(official_outcome, existing_pr) is not None:
-                    eff_payout_ratios = existing_pr
-            if eff_payout_ratios is None and str(official_outcome).upper().strip() not in ("UP", "DOWN"):
+                verified_existing = (
+                    resolve_verified_payout_ratios(official_outcome, existing_pr)
+                    if existing_pr is not None
+                    else None
+                )
+                if verified_existing is not None:
+                    eff_payout_ratios = {k: float(v) for k, v in verified_existing.items()}
+                    redeem_payout_ratios = eff_payout_ratios
+            if eff_payout_ratios is None and (
+                str(official_outcome).upper().strip() not in ("UP", "DOWN") or prior_payout_conflict
+            ):
                 fetched_pr = self.observer.fetch_official_market_payout_ratios(market_id, resolved_cond)
-                if resolve_verified_payout_ratios(official_outcome, fetched_pr) is not None:
-                    eff_payout_ratios = fetched_pr
+                verified_fetched = (
+                    resolve_verified_payout_ratios(official_outcome, fetched_pr)
+                    if fetched_pr is not None
+                    else None
+                )
+                if verified_fetched is not None:
+                    eff_payout_ratios = {k: float(v) for k, v in verified_fetched.items()}
+                    redeem_payout_ratios = eff_payout_ratios
+            if eff_payout_ratios is None and prior_payout_conflict:
+                payout_conflict = True
+                unverified_payout_ratios = prior_unverified_ratios
+                redeem_payout_ratios = (
+                    prior_unverified_ratios
+                    if (isinstance(prior_unverified_ratios, Mapping) and bool(prior_unverified_ratios))
+                    else {"_prior_payout_conflict": True}
+                )
         before_redeemed = float((existing_settlement or {}).get("redeemed_usdc_amount") or 0.0)
         was_pending_redemption = (
             isinstance(existing_settlement, Mapping)
@@ -1835,6 +1881,8 @@ class LiveExecutionEngine:
                 "local_spent_at_submit": submit_local_spent,
                 "tx_submitted_at_utc": submit_ts_utc,
                 "payout_ratios": res_dict.get("payout_ratios") if res_dict.get("payout_ratios") is not None else eff_payout_ratios,
+                "payout_conflict": payout_conflict,
+                "unverified_payout_ratios": unverified_payout_ratios if payout_conflict else None,
                 "error": res_dict.get("error"),
             }
 
@@ -1852,7 +1900,7 @@ class LiveExecutionEngine:
             neg_risk=resolved_neg_risk,
             existing_settlement=existing_settlement,
             on_progress_callback=_on_redeem_progress,
-            payout_ratios=eff_payout_ratios,
+            payout_ratios=redeem_payout_ratios,
         )
 
         now_utc = datetime.now(timezone.utc)
@@ -1869,6 +1917,8 @@ class LiveExecutionEngine:
             )
             after_redeemed = float(settlement_record["redeemed_usdc_amount"] or 0.0)
             settlement_record["live_realized_pnl_usdc"] = float(saved_settlement.get("live_realized_pnl_usdc") or 0.0)
+            settlement_record["payout_ratios"] = saved_settlement.get("payout_ratios")
+            settlement_record["payout_conflict"] = bool(saved_settlement.get("payout_conflict"))
 
         # [P1-4] / [P1-E] / [P1-R3-1] / [P2-R4-4] Only credit newly redeemed pUSD for the batch confirmed in this pass,
         # deduplicated against any wallet balance refresh and idempotent against replay in `audit_store`.
@@ -1945,20 +1995,47 @@ class LiveExecutionEngine:
                         if vm.get("neg_risk") is not None:
                             market_negrisk_map[mid] = bool(vm["neg_risk"])
 
-        for ev in reversed(ledger_events):
+        ordered_ledger = list(reversed(ledger_events))
+        seq_pairs = [
+            (idx, ev.get("seq") if isinstance(ev.get("seq"), int) else ev.get("id"))
+            for idx, ev in enumerate(ledger_events)
+            if isinstance(ev, Mapping)
+            and isinstance(ev.get("seq") if isinstance(ev.get("seq"), int) else ev.get("id"), int)
+        ]
+        if len(seq_pairs) >= 2 and seq_pairs[0][1] < seq_pairs[-1][1]:  # type: ignore[operator]
+            ordered_ledger = list(ledger_events)
+
+        settled_idx_by_market: dict[str, int] = {}
+        for ev in ordered_ledger:
             if not isinstance(ev, Mapping) or ev.get("event_type") != "OFFICIAL_RESOLUTION_APPLIED_TO_PAPER":
                 continue
             payload = ev.get("payload")
             if not isinstance(payload, Mapping):
                 continue
             market_id = str(payload.get("market_id") or "").strip()
-            if not market_id or market_id in processed_markets_this_pass or self.audit.is_market_settled(market_id):
+            if not market_id or self.audit.is_market_settled(market_id):
                 continue
+            if market_id in processed_markets_this_pass:
+                prev_idx = settled_idx_by_market.get(market_id)
+                prev_rec = settled_records[prev_idx] if prev_idx is not None else None
+                if not (
+                    isinstance(prev_rec, Mapping)
+                    and str(prev_rec.get("redeem_status") or "").upper() == "AWAITING_OFFICIAL_PAYOUT_VECTOR"
+                ):
+                    continue
 
             res_obj = payload.get("resolution") if isinstance(payload.get("resolution"), Mapping) else {}
             official_outcome = str(res_obj.get("outcome") or "").upper().strip()
             if official_outcome not in ("UP", "DOWN", "VOID"):
                 continue
+
+            extracted_ratios: Mapping[str, Any] | None = (
+                extract_payout_ratios_from_payload(res_obj) or extract_payout_ratios_from_payload(payload)
+            )
+            if extracted_ratios is None and (
+                payload_has_explicit_payout_fields(res_obj) or payload_has_explicit_payout_fields(payload)
+            ):
+                extracted_ratios = {"_invalid_explicit_payout": True}
 
             settlement_record = self._execute_and_record_settlement(
                 market_id=market_id,
@@ -1969,10 +2046,14 @@ class LiveExecutionEngine:
                 paper_settled_at=str(ev.get("utc")) if ev.get("utc") else None,
                 market_protocol=market_protocol_map.get(market_id),
                 neg_risk=market_negrisk_map.get(market_id),
-                payout_ratios=extract_payout_ratios_from_payload(res_obj) or extract_payout_ratios_from_payload(payload),
+                payout_ratios=extracted_ratios,
             )
             processed_markets_this_pass.add(market_id)
-            settled_records.append(settlement_record)
+            if market_id in settled_idx_by_market:
+                settled_records[settled_idx_by_market[market_id]] = settlement_record
+            else:
+                settled_idx_by_market[market_id] = len(settled_records)
+                settled_records.append(settlement_record)
 
         if max_seq_seen is not None:
             self.audit.set_kv("last_ledger_seq", str(max_seq_seen))
@@ -1981,6 +2062,12 @@ class LiveExecutionEngine:
         for pend in self.audit.get_pending_settlements():
             mid = str(pend.get("market_id") or "").strip()
             if not mid or mid in processed_markets_this_pass or self.audit.is_market_settled(mid):
+                continue
+            if (
+                str(pend.get("redeem_status") or "").upper() == "AWAITING_OFFICIAL_PAYOUT_VECTOR"
+                and bool(pend.get("payout_conflict"))
+            ):
+                # Do not replay stale conflicted official_outcome; allow fallback resolution check below.
                 continue
             out = str(pend.get("official_outcome") or "").upper().strip()
             if out not in ("UP", "DOWN", "VOID"):

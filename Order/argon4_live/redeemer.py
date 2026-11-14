@@ -1195,6 +1195,29 @@ class AutoRedeemer:
         failing closed with `AWAITING_OFFICIAL_PAYOUT_VECTOR` whenever special outcome ratios are unconfirmed.
         """
         winner = str(official_outcome).upper().strip()
+        already_redeemed_keys: set[str] = set()
+        if isinstance(existing_settlement, Mapping):
+            raw_red_keys = existing_settlement.get("redeemed_order_keys")
+            if isinstance(raw_red_keys, list):
+                already_redeemed_keys.update(str(k) for k in raw_red_keys if k is not None)
+
+        if payout_ratios is not None and resolve_verified_payout_ratios(winner, payout_ratios) is None:
+            return {
+                "live_expected_payout_usdc": 0.0,
+                "redeem_tx_hash": None,
+                "redeem_status": "AWAITING_OFFICIAL_PAYOUT_VECTOR",
+                "redeemed_usdc_amount": 0.0,
+                "newly_redeemed_usdc_amount": 0.0,
+                "redeem_latency_seconds": 0.0,
+                "error": f"UNVERIFIED_PAYOUT_VECTOR:{winner}",
+                "payout_ratios": None,
+                "redeemed_order_keys": sorted(already_redeemed_keys),
+                "newly_redeemed_order_keys": [],
+                "pending_batch_order_keys": [],
+                "pending_batch_payout_usdc": 0.0,
+                "has_remaining_unredeemed": False,
+            }
+
         if not live_orders:
             return {
                 "live_expected_payout_usdc": 0.0,
@@ -1211,14 +1234,8 @@ class AutoRedeemer:
                 "has_remaining_unredeemed": False,
             }
 
-        already_redeemed_keys: set[str] = set()
-        if isinstance(existing_settlement, Mapping):
-            raw_red_keys = existing_settlement.get("redeemed_order_keys")
-            if isinstance(raw_red_keys, list):
-                already_redeemed_keys.update(str(k) for k in raw_red_keys if k is not None)
-
         ratio_map = resolve_verified_payout_ratios(winner, payout_ratios)
-        if ratio_map is None and self.mode != "shadow" and condition_id:
+        if ratio_map is None and payout_ratios is None and self.mode != "shadow" and condition_id:
             rpc_ratios = self.fetch_onchain_ctf_payout_ratios(condition_id)
             if rpc_ratios is not None:
                 ratio_map = resolve_verified_payout_ratios(winner, rpc_ratios)

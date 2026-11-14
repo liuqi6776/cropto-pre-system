@@ -215,6 +215,12 @@ def _classify_stream_guard(stream_name, info):
             tag = "【风控·宏观4h破位熔断】"
         elif "BTC_1H_MOMENTUM_CHASE" in ntr:
             tag = "【风控·1h顺势追单拦截】"
+        elif "TWAP60_MIN_HANDICAP_GUARD" in ntr:
+            tag = "【风控·起点顺风诱多拦截】"
+        elif "TWAP60_START_HANDICAP_GUARD" in ntr:
+            tag = "【风控·起点TWAP60逆风拦截】"
+        elif "TWAP60_SPOT_1M_UNAVAILABLE" in ntr:
+            tag = "【风控·现货1m未就绪闭锁】"
         else:
             tag = "【风控·波动率过滤】"
         return {

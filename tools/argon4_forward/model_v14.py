@@ -641,6 +641,18 @@ def apply_volatility_regime_guard(
 
     hcap_guard = guard_config.get("twap60_handicap_guard")
     if isinstance(hcap_guard, dict) and hcap_guard.get("enabled") is True and res.get("selected") is True:
+        min_cfg = hcap_guard.get("min_handicap_bps")
+        min_hcap = None
+        if isinstance(min_cfg, dict):
+            if min_cfg.get(stream) is not None:
+                min_hcap = float(min_cfg[stream])
+        elif isinstance(min_cfg, (int, float)) and not isinstance(min_cfg, bool):
+            min_hcap = float(min_cfg)
+        if min_hcap is None:
+            if str(stream).endswith("_5m") and hcap_guard.get("min_5m_handicap_bps") is not None:
+                min_hcap = float(hcap_guard["min_5m_handicap_bps"])
+            elif str(stream).endswith("_15m") and hcap_guard.get("min_15m_handicap_bps") is not None:
+                min_hcap = float(hcap_guard["min_15m_handicap_bps"])
         max_map = hcap_guard.get("max_handicap_bps")
         max_hcap = max_map.get(stream) if isinstance(max_map, dict) else None
         if max_hcap is None:
@@ -648,8 +660,16 @@ def apply_volatility_regime_guard(
                 max_hcap = float(hcap_guard["max_5m_handicap_bps"])
             elif str(stream).endswith("_15m") and hcap_guard.get("max_15m_handicap_bps") is not None:
                 max_hcap = float(hcap_guard["max_15m_handicap_bps"])
-        if max_hcap is not None and ex_ante_twap60_handicap_bps is not None:
-            if float(ex_ante_twap60_handicap_bps) > float(max_hcap):
+        if ex_ante_twap60_handicap_bps is not None:
+            if min_hcap is not None and float(ex_ante_twap60_handicap_bps) < float(min_hcap):
+                res["volatility_regime_guarded"] = True
+                res["volatility_regime_reason"] = "TWAP60_MIN_HANDICAP_GUARD"
+                res["volatility_regime_action"] = action
+                res["twap60_min_handicap_bps"] = float(min_hcap)
+                if action in ("SKIP", "SKIP_OR_HALF_STAKE"):
+                    res["selected"] = False
+                return res
+            if max_hcap is not None and float(ex_ante_twap60_handicap_bps) > float(max_hcap):
                 res["volatility_regime_guarded"] = True
                 res["volatility_regime_reason"] = "TWAP60_START_HANDICAP_GUARD"
                 res["volatility_regime_action"] = action
